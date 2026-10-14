@@ -2153,6 +2153,64 @@ mod tests {
         });
     }
 
+    #[test]
+    fn model_switched_without_model_in_prompt_emits_no_context_update() {
+        smol::block_on(async {
+            let mock = MockProvider::new(vec![
+                tool_call_response("glob", "t1"),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&mock.requests);
+            let provider: Arc<dyn Provider> = Arc::new(mock);
+            let start = Model {
+                thinking_override: Some(ThinkingSupport::No),
+                ..default_model()
+            };
+            let switched = Model {
+                id: "claude-opus-4-1-20250805".into(),
+                provider: Arc::clone(&start.provider),
+                thinking_override: Some(ThinkingSupport::No),
+                ..start.clone()
+            };
+            let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: start.clone(),
+                provider: Arc::clone(&provider),
+            }));
+            let picker = Arc::new(ModelPicker {
+                slot: Arc::clone(&slot),
+                provider: Arc::clone(&provider),
+                model: switched.clone(),
+            });
+            let build = move |model: &Model, _: bool| RunContext {
+                system: "system".into(),
+                tools: RequestTools::assembled(
+                    serde_json::json!([{ "name": "glob" }]),
+                    &AgentConfig::default(),
+                    model,
+                ),
+                facts: Some(PromptFacts::default()),
+                authored: String::new(),
+            };
+
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) =
+                make_agent_with(Arc::clone(&provider), start.clone(), &mut history);
+            let mut agent = agent.with_model_sync(slot).with_interrupt_source(picker);
+            agent.context = Arc::new(build);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0].model, start.id);
+            assert_eq!(requests[1].model, switched.id);
+            assert_append_only(&requests[0], &requests[1]);
+            assert!(
+                updates(&history).is_empty(),
+                "no context updates emitted when model is untracked"
+            );
+        });
+    }
+
     const NEXT_DATE: &str = "2026-10-03";
     const MEMORY_HINT: &str = "memory/after_instructions";
     const PLAN_FILE: &str = "/plans/p.md";
