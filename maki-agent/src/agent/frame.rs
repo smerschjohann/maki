@@ -339,11 +339,11 @@ mod tests {
     fn empty_model_tells_nothing() {
         let mut now = facts();
         prompt(&mut now).model.clear();
-        assert!(context_update(&facts(), &now).is_none());
+        assert!(context_update(&facts(), &now, &ResolvedPrompts::default()).is_none());
 
         let mut told = facts();
         prompt(&mut told).model.clear();
-        assert!(context_update(&told, &now).is_none());
+        assert!(context_update(&told, &now, &ResolvedPrompts::default()).is_none());
     }
 
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]

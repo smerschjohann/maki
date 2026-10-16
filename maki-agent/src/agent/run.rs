@@ -1458,7 +1458,7 @@ mod tests {
                     make_agent_with(Arc::clone(&provider), default_model(), &mut history);
                 agent.prompt_slots = Arc::clone(&prompts);
                 agent.context = Arc::new(move |model, _| {
-                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default(), true)
                 });
                 agent.run(default_input()).await.unwrap();
                 drop(agent);
@@ -1507,7 +1507,7 @@ mod tests {
             let prompts = Arc::new(prompts);
             let model = default_model();
             let context =
-                RunContext::render(&Vars::new(), "", &prompts, &model, RequestTools::default());
+                RunContext::render(&Vars::new(), "", &prompts, &model, RequestTools::default(), true);
             let mut history = History::new(Vec::new());
             fit_frame(&mut history, context, None, &model);
             let mut stored = history.frame().unwrap().as_ref().clone();
@@ -1518,7 +1518,7 @@ mod tests {
                 &mut history,
             );
             agent.context = Arc::new(move |model, _| {
-                RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default(), true)
             });
             agent.run(default_input()).await.unwrap();
             drop(agent);
@@ -1564,7 +1564,7 @@ mod tests {
                     make_agent_with(Arc::clone(&provider), default_model(), &mut history);
                 agent.prompt_slots = Arc::clone(&prompts);
                 agent.context = Arc::new(move |model, _| {
-                    RunContext::render(&vars, instructions, &slots, model, RequestTools::default())
+                    RunContext::render(&vars, instructions, &slots, model, RequestTools::default(), true)
                 });
                 agent.run(default_input()).await.unwrap();
                 drop(agent);
@@ -1611,7 +1611,7 @@ mod tests {
                     make_agent_with(Arc::clone(&provider), default_model(), &mut history);
                 agent.prompt_slots = Arc::clone(&prompts);
                 agent.context = Arc::new(move |model, _| {
-                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default(), true)
                 });
                 agent.run(default_input()).await.unwrap();
             }
@@ -1653,7 +1653,7 @@ mod tests {
                     make_agent_with(Arc::clone(&provider), default_model(), &mut history);
                 agent.prompt_slots = Arc::clone(&prompts);
                 agent.context = Arc::new(move |model, _| {
-                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+                    RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default(), true)
                 });
                 agent
                     .run(AgentInput {

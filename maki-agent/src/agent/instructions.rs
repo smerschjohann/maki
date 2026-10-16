@@ -300,7 +300,7 @@ mod tests {
     #[test_case(false ; "model_excluded")]
     fn build_system_prompt_honors_model_in_prompt(model_in_prompt: bool) {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
-        let slots = crate::prompt::ResolvedSlots::default();
+        let slots = ResolvedPrompts::default();
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let prompt = build_system_prompt(&vars, "", &slots, &model, model_in_prompt);
         assert_eq!(prompt.contains("- Model:"), model_in_prompt);

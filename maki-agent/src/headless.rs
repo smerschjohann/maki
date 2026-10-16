@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn render_honors_model_in_prompt_config() {
-        let slots = ResolvedSlots::default();
+        let slots = ResolvedPrompts::default();
         let instructions = agent::Instructions::default();
         let config = AgentConfig {
             model_in_prompt: false,
