@@ -1,0 +1,194 @@
+name: Sync, Rebuild & Release
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  push:
+    branches:
+      - masu
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no commits changed'
+        type: boolean
+        default: false
+      create_release:
+        description: 'Create GitHub release with binaries'
+        type: boolean
+        default: true
+
+env:
+  UPSTREAM_URL: 'https://github.com/tontinton/maki.git'
+  UPSTREAM_BRANCH: 'main'
+  TARGET_BRANCH: 'masu'
+  FEATURE_BRANCHES: >-
+    feat/model-in-prompt
+    feature/cost-from-upstream
+    feat/clipboard-cmd
+  BINARY_NAME: 'maki'
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-rebuild:
+    name: Sync & Rebuild
+    runs-on: ubuntu-latest
+    outputs:
+      needs_build: ${{ steps.rebuild.outputs.needs_build }}
+      release_tag: ${{ steps.rebuild.outputs.release_tag }}
+      target_branch: ${{ steps.rebuild.outputs.target_branch }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Check updates and rebuild
+        id: rebuild
+        run: |
+          FORCE="${{ inputs.force_build || 'false' }}"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+
+          git remote add upstream "$UPSTREAM_URL" || true
+          git fetch upstream "$UPSTREAM_BRANCH"
+          git fetch origin
+
+          # Prüfen, ob es neue Commits im Upstream oder in den Feature-Branches gibt
+          NEW_COMMITS=0
+          UPSTREAM_DIFF=$(git rev-list --count origin/"$TARGET_BRANCH"..upstream/"$UPSTREAM_BRANCH" 2>/dev/null || echo "0")
+          echo "Neue Commits im Upstream ($UPSTREAM_BRANCH): $UPSTREAM_DIFF"
+          NEW_COMMITS=$((NEW_COMMITS + UPSTREAM_DIFF))
+
+          for branch in $FEATURE_BRANCHES; do
+            BRANCH_DIFF=$(git rev-list --count origin/"$TARGET_BRANCH"..origin/"$branch" 2>/dev/null || echo "0")
+            echo "Neue Commits in $branch: $BRANCH_DIFF"
+            NEW_COMMITS=$((NEW_COMMITS + BRANCH_DIFF))
+          done
+
+          # Abbrechen, wenn keine neuen Commits vorliegen und kein Build erzwungen wurde
+          if [ "$NEW_COMMITS" -eq 0 ] && [ "$FORCE" != "true" ] && [ "${{ github.event_name }}" != "push" ]; then
+            echo "Weder Upstream noch Feature-Branches haben neue Commits und force_build ist nicht aktiv."
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Rebuild wird gestartet..."
+
+          # 1. masu frisch aus upstream/main erstellen
+          git checkout -B "$TARGET_BRANCH" upstream/"$UPSTREAM_BRANCH"
+
+          # 2. Feature-Branches nacheinander mergen
+          for branch in $FEATURE_BRANCHES; do
+            echo "Merging origin/$branch in $TARGET_BRANCH..."
+            if ! git merge --no-edit "origin/$branch"; then
+              echo "::error::Merge-Konflikt beim Anwenden von $branch auf $TARGET_BRANCH!"
+              git merge --abort
+              exit 1
+            fi
+          done
+
+          # 3. Pipeline-Datei aus origin/masu wiederherstellen
+          git checkout origin/"$TARGET_BRANCH" -- .github/workflows/rebase-and-release.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: sync and rebuild $TARGET_BRANCH with feature branches"
+          fi
+
+          # 4. Neu aufgebauten Branch zu origin pushen
+          echo "Pushe neu aufgebauten $TARGET_BRANCH zu origin..."
+          git push origin "$TARGET_BRANCH" --force-with-lease
+
+          TAG="masu-$(date +'%Y.%m.%d-%H%M')-$(git rev-parse --short HEAD)"
+          echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: Build (${{ matrix.target }})
+    needs: sync-and-rebuild
+    if: needs.sync-and-rebuild.outputs.needs_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-and-rebuild.outputs.target_branch }}
+
+      - name: Build in Alpine container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_INCREMENTAL=0 \
+            alpine:3.21 sh -c '
+              apk add --no-cache gcc g++ musl-dev make linux-headers curl git ca-certificates pkgconf python3-dev
+              git config --global --add safe.directory /workspace
+              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
+              source "$HOME/.cargo/env"
+              cargo build --release --target ${{ matrix.target }}
+            '
+          sudo chown -R $(id -u):$(id -g) target/
+
+      - name: Package
+        run: |
+          tag="${{ needs.sync-and-rebuild.outputs.release_tag }}"
+          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          tar czf "${archive}" "${BINARY_NAME}"
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: [sync-and-rebuild, build-linux]
+    if: needs.sync-and-rebuild.outputs.needs_build == 'true' && (github.event_name != 'workflow_dispatch' || inputs.create_release)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > ../sha256sums.txt
+          cat ../sha256sums.txt
+
+      - name: Create GitHub Release
+        env:
+          TAG_NAME: ${{ needs.sync-and-rebuild.outputs.release_tag }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --title "Maki $TAG_NAME" \
+            --notes "Automatischer Release-Build von \`${{ needs.sync-and-rebuild.outputs.target_branch }}\` (frisch aufgesetzt aus upstream \`${{ env.UPSTREAM_BRANCH }}\` mit Feature-Branches)." \
+            artifacts/* sha256sums.txt
