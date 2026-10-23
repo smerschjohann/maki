@@ -606,8 +606,14 @@ pub async fn parse_sse(
     let mut stop_reason: Option<StopReason> = None;
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
+    let mut comment_cost: Option<f64> = None;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        if let Some(cost) = super::parse_cost_comment(&line) {
+            comment_cost = Some(cost);
+            continue;
+        }
+
         let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
             None => continue,
@@ -802,6 +808,8 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::tool_use(acc.id, name, input));
     }
 
+    usage.cost = usage.cost.or(comment_cost);
+
     Ok(StreamResponse {
         message: Message {
             role: Role::Assistant,
@@ -987,6 +995,29 @@ data: [DONE]\n";
                 (Some(got), Some(want)) => assert!((got - want).abs() < 1e-9),
                 (got, want) => assert_eq!(got, want),
             }
+        })
+    }
+
+    #[test_case(None, Some(0.0000104) ; "comment_prices_the_turn")]
+    #[test_case(Some(0.5), Some(0.5) ; "usage_cost_wins")]
+    fn parse_sse_cost_comment(usage_cost: Option<f64>, expected: Option<f64>) {
+        smol::block_on(async {
+            let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 10});
+            if let Some(cost) = usage_cost {
+                usage["cost"] = json!(cost);
+            }
+            let chunk = json!({"choices": [], "usage": usage});
+            let sse = format!(
+                "data: {chunk}\n\n: energy {{\"energy_joules\": 4.99}}\n\n: cost {{\"request_cost_usd\": 1.04e-05}}\n\ndata: [DONE]\n"
+            );
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.usage.input, 100);
+            assert_eq!(resp.usage.cost, expected);
         })
     }
 
