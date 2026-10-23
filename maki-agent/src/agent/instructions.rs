@@ -24,6 +24,7 @@ const INSTRUCTION_FILES: &[&str] = &[
 
 const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
 const GLOBAL_INSTRUCTION_FILE: &str = "AGENTS.md";
+pub(super) const MODEL_VAR: &str = "{model}";
 
 /// Instruction files the model has seen this session. Startup inserts the
 /// root files; a subdirectory file is inserted by the dispatcher only once its
@@ -96,7 +97,7 @@ pub fn build_system_prompt(
     model: &Model,
     model_in_prompt: bool,
 ) -> String {
-    let vars = vars.clone().set("{model}", model.spec());
+    let vars = vars.clone().set(MODEL_VAR, model.spec());
     if slots.has_template(PromptId::System) {
         return slots.render(PromptId::System, &vars, instructions);
     }

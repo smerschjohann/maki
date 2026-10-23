@@ -1493,7 +1493,7 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Include the model identifier in the system prompt environment and context updates"
+        desc = "Include the model identifier in the default system prompt environment and in switch updates. A custom system template that uses `{model}` always states it"
     )]
     pub model_in_prompt: bool,
 
