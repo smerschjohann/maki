@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
 
 use super::history::History;
-use super::instructions::build_system_prompt;
+use super::instructions::{MODEL_VAR, build_system_prompt};
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::prompt::{PromptId, ResolvedPrompts, Slot, SlotKind};
 use crate::template::Vars;
@@ -61,13 +61,20 @@ impl RunContext {
         model_in_prompt: bool,
     ) -> Self {
         let system = build_system_prompt(vars, instructions, slots, model, model_in_prompt);
+        // A custom template states the model wherever it names `{model}`,
+        // whatever `model_in_prompt` says, so a switch has to be told then.
+        let states_model = if slots.has_template(PromptId::System) {
+            slots.template(PromptId::System).contains(MODEL_VAR)
+        } else {
+            model_in_prompt
+        };
         Self {
             system,
             tools,
             facts: Some(PromptFacts {
                 date: vars.apply("{date}").into_owned(),
                 cwd: vars.apply("{cwd}").into_owned(),
-                model: if model_in_prompt {
+                model: if states_model {
                     model.spec()
                 } else {
                     String::new()
