@@ -17,7 +17,7 @@ use maki_storage::frame::{LiveFacts, PromptFacts};
 use super::compaction::{self, CompactReason, CompactSteer, Compacted};
 use super::display_order::{observation_detail, observation_line};
 use super::frame::{
-    FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
+    FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fit_frame, frame_matches,
 };
 use super::history::{History, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
@@ -540,12 +540,9 @@ impl<'h> Agent<'h> {
             return;
         }
         let candidate = (self.context)(&current.model, self.workflow);
-        let fingerprint = fingerprint(&candidate, self.mcp.as_ref(), &current.model);
-        if self
-            .history
-            .frame()
-            .is_none_or(|frame| frame.fingerprint != fingerprint)
-        {
+        if self.history.frame().is_none_or(|frame| {
+            !frame_matches(frame, &candidate, self.mcp.as_ref(), &current.model)
+        }) {
             debug!(model = %current.model.id, "model switch waits for the next run, its frame differs");
             return;
         }
@@ -2587,6 +2584,7 @@ mod tests {
                     ..Default::default()
                 }),
                 authored: String::new(),
+                model_in_template: None,
             }
         };
 
@@ -2679,6 +2677,49 @@ mod tests {
         assert_eq!(was_told, told);
     }
 
+    #[test_case(true ; "enabled_to_disabled")]
+    #[test_case(false ; "disabled_to_enabled")]
+    #[tokio::test]
+    async fn model_policy_toggle_on_resume_rebuilds_once(enabled_first: bool) {
+        let mut h = Harness::new(Vec::new());
+        let run = async |h: &mut Harness, enabled| {
+            h.run(
+                default_input(),
+                vec![text_response(StopReason::EndTurn)],
+                |agent| {
+                    agent.context = Arc::new(move |model, _| {
+                        RunContext::render(
+                            &Vars::new(),
+                            "",
+                            &ResolvedPrompts::default(),
+                            model,
+                            RequestTools::default(),
+                            enabled,
+                        )
+                    });
+                },
+            )
+            .await
+            .1
+        };
+        run(&mut h, enabled_first).await;
+        let kept = h.history.len();
+        h.restart(kept);
+        h.model.id = SWITCHED_MODEL.into();
+        let events = run(&mut h, !enabled_first).await;
+        let subsequent = run(&mut h, !enabled_first).await;
+        assert!(announced_rebuild(&events));
+        assert!(!announced_rebuild(&subsequent));
+        let requests = h.requests.lock().unwrap();
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert_append_only(&requests[1], &requests[2]);
+        let updates = updates(&h.history);
+        assert_eq!(
+            updates.iter().any(|update| update.contains(SWITCHED_MODEL)),
+            !enabled_first
+        );
+    }
+
     const NEXT_DATE: &str = "2026-10-03";
     const MEMORY_HINT: &str = "memory/after_instructions";
     const PLAN_FILE: &str = "/plans/p.md";
@@ -2718,6 +2759,7 @@ mod tests {
                     ),
                     facts: (!*world.host_written.lock().unwrap()).then_some(facts),
                     authored: world.authored.lock().unwrap().to_string(),
+                    model_in_template: None,
                 }
             })
         }

@@ -15,7 +15,7 @@ use serde_json::Value;
 pub struct PromptFacts {
     pub date: String,
     pub cwd: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instructions: String,
@@ -296,6 +296,21 @@ mod tests {
                 ..FactsUpdate::default()
             }
         );
+    }
+
+    #[test_case(false ; "empty_model")]
+    #[test_case(true ; "missing_legacy_model")]
+    fn empty_model_round_trips_with_upstream_field(missing: bool) {
+        let mut value = serde_json::to_value(prompt()).unwrap();
+        if missing {
+            value.as_object_mut().unwrap().remove("model");
+        } else {
+            value["model"] = serde_json::json!("");
+        }
+        let facts: PromptFacts = serde_json::from_value(value).unwrap();
+        assert!(facts.model.is_empty());
+        let serialized = serde_json::to_value(facts).unwrap();
+        assert_eq!(serialized["model"], "");
     }
 
     #[test]
