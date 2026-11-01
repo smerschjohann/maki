@@ -220,7 +220,14 @@ impl AgentLoop {
         let host_prompt = Arc::clone(&self.host_prompt);
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
             let tools = base_tools(&vars, model, &config, has_mcp, workflow);
-            host_prompt.context(&vars, &instructions, &slots, model, tools)
+            host_prompt.context(
+                &vars,
+                &instructions,
+                &slots,
+                model,
+                tools,
+                config.model_in_prompt,
+            )
         });
         (context, prompt_slots)
     }
