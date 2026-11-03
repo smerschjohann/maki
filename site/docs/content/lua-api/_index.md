@@ -918,7 +918,8 @@ name the session now running or focused. What each event adds:
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-  or `"idle"`), `data.title`, and `data.focused` (boolean).
+  or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+  stays `"working"` while a background task it waits on still runs.
 - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
   when the title changes (rename or auto-generation).
 - `"SessionCwdChanged"`: `data.cwd`, the session's new working
@@ -1518,6 +1519,9 @@ prompt for a subagent session.
     `{{instructions}}` marker.
     `true` loads project instruction files.
     `false` or nil omits them.
+  - `tools` (`table[]?`) the definitions the session will get, as returned
+    by `maki.agent.tools`. A plugin's hints are dropped when none of its
+    tools are in it. Without it, the hints follow the config.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.
 
@@ -1527,6 +1531,7 @@ prompt for a subagent session.
 local prompt, err = maki.agent.system_prompt(ctx, {
   prompt_id = "research",
   instructions = true,
+  tools = tool_defs,
 })
 if err then error(err) end
 ```
@@ -2551,8 +2556,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     with the current call. `"plugin"` keeps it alive until the plugin
     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
     session ends, and survives plugin reload.
-  - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
-    (default 20, 0 disables, max 1024).
+  - `tail` (`integer?`) trailing lines per stream kept for `jobinfo` and
+    `jobwait` (default 20, 0 disables, max 1024).
   - `max_line_bytes` (`integer?`) longest line delivered, in bytes. A longer
     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
     skipped without being read into memory (default and `0`: 64 MiB, the
@@ -2631,12 +2636,12 @@ maki.fn.jobwait({job_id}, {timeout_ms?})
 ```
 
 Wait for a job to finish and collect its output. Returns a result
-table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
-already exited answers from its captured tail, so `truncated` says
-whether that tail ever lost a line (`tail` too small or 0, or the stream
-redirected away). Waiting on a live job collects every line and is never
-truncated. Neither counts lines cut by `max_line_bytes`: those still
-arrive, ending in `...`.
+table with `stdout`, `stderr`, `exit_code`, and `truncated`. The output
+starts from the job's captured tail, which holds what was delivered before
+the wait, and a live job adds every line from then on. `truncated` says
+whether that tail had already lost a line by then (`tail` too small or 0,
+or the stream redirected away). It doesn't count lines cut by
+`max_line_bytes`: those still arrive, ending in `...`.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
@@ -5116,8 +5121,8 @@ maki.session.live()
 ```
 
 Lists the sessions currently running in this UI. Status is "working",
-"needs_input", or "idle". A mailbox follow-up stays "working" without an
-intermediate "idle" status.
+"needs_input", or "idle". Background work a turn moved out keeps the
+session "working" until its result is in, with no "idle" in between.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
 
@@ -5598,18 +5603,20 @@ tool spawned has its tool call's id, one a plugin opened with
 `plugin` field.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?,
-  parent?, part?, started_at?, ended_at?, cost?}` where `status` is `"working"`,
+  tool?, parent?, part?, started_at?, ended_at?, cost?}` where `status` is `"working"`,
   `"idle"` (a plugin task between prompts), `"done"`, `"error"`, or
   `"cancelled"` (stopped by the user or the model), and `session` is the
-  chat session that `stop()` asks for. `parent` is the id of the call the
-  task runs under, like a `batch` that started it. That call is listed
-  only once it moved. `part` is true for a piece listed with
-  `ctx:set_parts()`. Stopping a part stops its whole call, while a
+  chat session that `stop()` asks for. `tool` is the tool whose call the
+  task runs, `"task"` for a subagent or `"bash"` for a moved command,
+  absent on a session a plugin opened on its own. `parent` is the id of
+  the call the task runs under, like a `batch` that started it. That
+  call is listed only once it moved. `part` is true for a piece listed
+  with `ctx:set_parts()`. Stopping a part stops its whole call, while a
   subagent the call started stops alone. `started_at` and `ended_at` are
   Unix seconds: when the task started, or moved to the background, and
-  when it finished. A task loaded from disk has neither. `cost` is what a
-  subagent billed so far, in dollars. The main chat has none of the
-  three. Or nil and an error.
+  when it finished. A task saved before they were recorded has neither.
+  `cost` is what a subagent billed so far, in dollars. The main chat has
+  none of the three. Or nil and an error.
 
 **Example:**
 

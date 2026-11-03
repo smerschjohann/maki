@@ -14,7 +14,7 @@ use crate::interrupt::Interrupt;
 use crate::provider_scripts;
 use crate::setup;
 
-pub fn run(
+pub async fn run(
     model_arg: Option<String>,
     yolo: bool,
     no_plugins: bool,
@@ -55,13 +55,15 @@ pub fn run(
             config.validate()?;
             Ok(config)
         },
-    )?;
+    )
+    .await?;
     warnings.extend(provider_scripts::startup_warning());
     super::report_warnings(warnings);
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);
 
-    let (model, warning) = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
+    let (model, warning) =
+        setup::resolve_model(model_arg.as_deref(), &config.provider, &storage).await?;
     super::report_warnings(Vec::from_iter(warning));
     setup::remember_thinking(&mut config.session_defaults, &storage);
 
@@ -93,7 +95,8 @@ pub fn run(
         storage,
         background,
         stop: interrupt.stop(),
-    })?;
+    })
+    .await?;
     drop(plugin_host);
     interrupt.exit_if_caught();
     Ok(())

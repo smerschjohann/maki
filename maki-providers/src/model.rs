@@ -21,7 +21,9 @@ use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::{EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect};
+use crate::types::{
+    EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect, thinks_by_default,
+};
 pub use maki_config::providers::ModelTier;
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, ThinkingFields, base_url_override, builtin_provider,
@@ -286,6 +288,7 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    #[cfg(test)]
     pub(crate) fn canonical_id(&self) -> Option<&str> {
         self.prefixes.first().map(String::as_str)
     }
@@ -679,8 +682,14 @@ impl Model {
             .unwrap_or(spec.supports_thinking)
     }
 
+    /// A model that spells its own `off` keeps it: the id rule only covers an
+    /// `off` that would go out as nothing.
     pub fn requires_thinking(&self) -> bool {
         self.thinking_override == Some(ThinkingSupport::Required)
+            || (thinks_by_default(&self.id)
+                && self
+                    .effective_thinking_fields()
+                    .is_none_or(|(fields, _)| fields.off.is_none()))
     }
 
     /// Discovery files its rows under the builtin slug, so a slug that
@@ -1073,14 +1082,16 @@ impl Model {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Non-cached input tokens. Total input = `input + cache_read + cache_creation`.
+    /// u64 because a session accumulates these for its whole life; a u32
+    /// running total saturates around 4.3 billion tokens.
     #[serde(rename = "input_tokens")]
-    pub input: u32,
+    pub input: u64,
     #[serde(rename = "output_tokens")]
-    pub output: u32,
+    pub output: u64,
     #[serde(rename = "cache_creation_input_tokens")]
-    pub cache_creation: u32,
+    pub cache_creation: u64,
     #[serde(rename = "cache_read_input_tokens")]
-    pub cache_read: u32,
+    pub cache_read: u64,
     /// What this one response cost, straight from the provider, when it bothers
     /// to say (OpenRouter's `usage.cost`). Worth preferring on a router, where
     /// our table prices the model we asked for and the router bills for
@@ -1132,13 +1143,13 @@ impl TokenUsage {
         }
     }
 
-    pub fn total_input(&self) -> u32 {
+    pub fn total_input(&self) -> u64 {
         self.input
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_creation)
     }
 
-    pub fn context_tokens(&self) -> u32 {
+    pub fn context_tokens(&self) -> u64 {
         self.total_input().saturating_add(self.output)
     }
 
@@ -1237,7 +1248,7 @@ mod tests {
     const UNPRICED_SCHEDULED_SPEC: &str = "scheduled-plugin/my-custom-model";
     const SCHEDULED_HOST: &str = "scheduled.example";
     const SURCHARGE: f64 = 2.0;
-    const MILLION: u32 = 1_000_000;
+    const MILLION: u64 = 1_000_000;
     const INPUT_ONLY: TokenUsage = TokenUsage {
         input: MILLION,
         output: 0,
@@ -1347,13 +1358,13 @@ mod tests {
     #[test_case(1_000, "1.0k"      ; "thousand")]
     #[test_case(999_999, "1000.0k" ; "just_under_million")]
     #[test_case(1_000_000, "1.0m"  ; "million")]
-    fn format_tokens_display(tokens: u32, expected: &str) {
+    fn format_tokens_display(tokens: u64, expected: &str) {
         assert_eq!(format_tokens(tokens), expected);
     }
 
     #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100, cost: None }, None, "12.3k↑ 456↓" ; "without_cost")]
     #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000, cost: None }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
-    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1, cost: None }, None, "4295.0m↑ 1↓" ; "input_saturates")]
+    #[test_case(TokenUsage { input: u64::from(u32::MAX) + 1, output: 1, cache_creation: 1, cache_read: 1, cost: None }, None, "4295.0m↑ 1↓" ; "past_u32_max")]
     fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
         assert_eq!(usage.format(cost), expected);
     }
@@ -1523,6 +1534,20 @@ mod tests {
         };
         assert_eq!(total.input, COUNTERS.input * 2);
         assert_eq!(total.cost, None);
+    }
+
+    #[test]
+    fn running_total_past_u32_max_keeps_counting() {
+        let mut total = TokenUsage {
+            input: u32::MAX as u64,
+            ..Default::default()
+        };
+        total += TokenUsage {
+            input: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(total.input, u32::MAX as u64 + 1_000);
+        assert_eq!(format_tokens(total.input), "4295.0m");
     }
 
     #[test]
@@ -1942,7 +1967,7 @@ mod tests {
         let model = Model::from_spec(SCHEDULED_SPEC).unwrap();
 
         let list = model.list_cost(&INPUT_ONLY, false).unwrap();
-        let table_price = f64::from(INPUT_ONLY.input) * model.pricing.input / PER_MILLION;
+        let table_price = INPUT_ONLY.input as f64 * model.pricing.input / PER_MILLION;
         assert!(
             (list - table_price).abs() < EPSILON,
             "list_cost {list} must be the table price {table_price}, surcharge free"
@@ -2029,6 +2054,18 @@ mod tests {
         let options = ladder_model(support, Some(ROOMY_OUTPUT)).thinking_options();
         let names: Vec<&str> = options.iter().map(|option| option.name).collect();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn thinking_options_drop_off_where_the_model_thinks_by_default() {
+        let model = Model {
+            id: "claude-opus-5.5".into(),
+            ..ladder_model(ThinkingSupport::Yes, Some(ROOMY_OUTPUT))
+        };
+
+        let options = model.thinking_options();
+        let names: Vec<&str> = options.iter().map(|option| option.name).collect();
+        assert_eq!(names, &LADDER[1..]);
     }
 
     /// `adaptive` promises that the API picks the depth, so a provider that

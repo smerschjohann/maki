@@ -1049,8 +1049,8 @@ impl PluginEntry {
         };
         let slug = self.decl.slug.clone();
         // A reload re-reads what is stored, so it spends no token. It waits
-        // for neither the gate nor the cross-process lock, and it runs under
-        // `block_on` on the ui thread, where either wait would freeze the ui.
+        // for neither the gate nor the cross-process lock: it runs first on a
+        // respawned agent task, and either wait would hold the first request.
         if matches!(purpose, AuthPurpose::Reload) {
             self.auth.mint(&slug, hook.as_ref(), purpose).await?;
             return Ok(Recovery::Adopted);
@@ -3212,7 +3212,8 @@ mod tests {
 
         assert!(is_registered(CATALOG_SLUG), "{TAKEOVER_FAILED}");
         assert!(
-            !catalog::catalog_providers()
+            !catalog::catalog_providers_if_available()
+                .expect("seeded")
                 .iter()
                 .any(|provider| provider.slug == CATALOG_SLUG),
             "{REPLACED}"
@@ -3258,7 +3259,8 @@ mod tests {
         );
         assert!(!is_registered(CATALOG_SLUG), "{NOT_TAKEN}");
         assert!(
-            catalog::catalog_providers()
+            catalog::catalog_providers_if_available()
+                .expect("seeded")
                 .iter()
                 .any(|provider| provider.slug == CATALOG_SLUG),
             "{STILL_LISTED}"
