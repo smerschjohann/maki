@@ -664,7 +664,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     prompt_slots: Arc::clone(&params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     ledger: turn.ledger(),
-                    registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
                 },
@@ -774,6 +773,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures::FutureExt;
+    use maki_config::project::{self, TrustMode};
     use maki_config::providers::Protocol;
     use maki_providers::model::ModelTier;
     use maki_providers::plugin::{
@@ -1002,7 +1002,8 @@ mod tests {
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
-            project_config: ProjectConfig::for_project(tmp.path()),
+            project_config: project::resolve_noninteractive(tmp.path(), TrustMode::Session)
+                .project_config,
             local_tools: LocalTools::default(),
             background: BackgroundMode::Blocking,
             stop: CancelToken::none(),
@@ -1254,6 +1255,7 @@ mod tests {
         mailbox.settle(
             TASK_ID,
             Some(BackgroundNotice {
+                markdown: false,
                 text: NOTICE_BODY.into(),
                 display: None,
                 wake: true,
