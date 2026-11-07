@@ -225,6 +225,37 @@ maki.setup({{
          guard protects.\n"
     )
     .unwrap();
+    writeln!(
+        out,
+        "Servers that ask for a client certificate get the one configured for \
+         their host:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "\
+```lua
+maki.setup({{
+    net = {{
+        client_certs = {{
+            {{ host = \"mtls.example.com\", cert = \"~/certs/client.pem\", key = \"~/certs/client-key.pem\" }},
+        }},
+    }},
+}})
+```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "`host` also takes a port to pin the certificate to it, as in \
+         `\"mtls.example.com:8443\"`. The certificate is presented on the \
+         request to that host only. maki does not send it on a redirect to \
+         another host. The server's own certificate still has to verify \
+         against the system store or the `SSL_CERT_FILE` bundle. A PEM file \
+         that holds the chain and the private key together works for both \
+         fields.\n"
+    )
+    .unwrap();
 }
 
 /// `paths` is a `Vec<String>`, which the `ConfigValue` table cannot describe,
