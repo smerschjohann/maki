@@ -905,12 +905,23 @@ impl ProviderFileConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct NetFileConfig {
     pub allowed_private_hosts: Option<Vec<String>>,
+    pub client_certs: Option<Vec<ClientCertFileConfig>>,
 }
 
 impl NetFileConfig {
     fn merge(&mut self, overlay: NetFileConfig) {
-        merge_option!(self, overlay, allowed_private_hosts);
+        merge_option!(self, overlay, allowed_private_hosts, client_certs);
     }
+}
+
+/// `net.client_certs` entries as written: a host to present the certificate
+/// to, plus the PEM files holding the chain and the private key.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCertFileConfig {
+    pub host: String,
+    pub cert: String,
+    pub key: String,
 }
 
 /// Folder trust answered ahead of time. Only the global `init.lua` may set
@@ -1819,13 +1830,55 @@ pub struct NetConfig {
         desc = "Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://`"
     )]
     pub allowed_private_hosts: Vec<String>,
+
+    #[config(
+        ty = "table",
+        default = "Vec::new()",
+        default_doc = "[]",
+        desc = "Client certificates maki presents to one host, as `{ host, cert, key }` tables. `host` also takes a port to pin it. The server certificate still has to verify against the system store or `SSL_CERT_FILE`"
+    )]
+    pub client_certs: Vec<ClientCert>,
+}
+
+/// A client certificate maki presents to `host`, from `net.client_certs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCert {
+    pub host: String,
+    pub port: Option<u16>,
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 impl NetConfig {
     fn from_file(f: NetFileConfig) -> Self {
         Self {
             allowed_private_hosts: f.allowed_private_hosts.unwrap_or_default(),
+            client_certs: f
+                .client_certs
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(ClientCert::from_file)
+                .collect(),
         }
+    }
+}
+
+impl ClientCert {
+    fn from_file(f: ClientCertFileConfig) -> Option<Self> {
+        let Some((host, port)) = split_host_port(f.host.trim()) else {
+            warn!(host = %f.host, "ignoring net.client_certs entry with an invalid host");
+            return None;
+        };
+        if f.cert.trim().is_empty() || f.key.trim().is_empty() {
+            warn!(host = %f.host, "ignoring net.client_certs entry with an empty cert or key path");
+            return None;
+        }
+        Some(Self {
+            host: canonical_host(host).to_ascii_lowercase(),
+            port,
+            cert: paths::expand_tilde(Path::new(f.cert.trim())),
+            key: paths::expand_tilde(Path::new(f.key.trim())),
+        })
     }
 }
 
@@ -2994,6 +3047,9 @@ mod tests {
 
     const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";
     const PROJECT_ALLOWED_HOST: &str = "searx.lan:8888";
+    const CLIENT_HOST: &str = "mtls.example.com";
+    const CLIENT_CERT_PATH: &str = "/certs/client.pem";
+    const CLIENT_KEY_PATH: &str = "/certs/client-key.pem";
     const HOME_GLOB: &str = "~/src/me/*";
     const HOME_TREE_GLOB: &str = "~/src/me/**";
     const BLANKET_GLOB: &str = "**";
@@ -3219,6 +3275,7 @@ mod tests {
         let raw_with = |host: &str| RawConfig {
             net: NetFileConfig {
                 allowed_private_hosts: Some(vec![host.into()]),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -3230,6 +3287,55 @@ mod tests {
 
         let net = global.into_config(&[]).unwrap().net;
         assert_eq!(net.allowed_private_hosts, [PROJECT_ALLOWED_HOST]);
+    }
+
+    #[test_case("MTLS.example.com", "mtls.example.com", None ; "host_is_lowercased")]
+    #[test_case("mtls.example.com:8443", "mtls.example.com", Some(8443) ; "port_pins_the_host")]
+    #[test_case("[::1]", "::1", None ; "brackets_of_an_ipv6_literal")]
+    fn client_certs_parse_host_and_port(entry: &str, host: &str, port: Option<u16>) {
+        let raw = RawConfig {
+            net: NetFileConfig {
+                client_certs: Some(vec![ClientCertFileConfig {
+                    host: entry.into(),
+                    cert: CLIENT_CERT_PATH.into(),
+                    key: CLIENT_KEY_PATH.into(),
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let net = raw.into_config(&[]).unwrap().net;
+        assert_eq!(
+            net.client_certs,
+            [ClientCert {
+                host: host.into(),
+                port,
+                cert: CLIENT_CERT_PATH.into(),
+                key: CLIENT_KEY_PATH.into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn broken_client_certs_are_dropped() {
+        let entry = |host: &str, cert: &str| ClientCertFileConfig {
+            host: host.into(),
+            cert: cert.into(),
+            key: CLIENT_KEY_PATH.into(),
+        };
+        let raw = RawConfig {
+            net: NetFileConfig {
+                client_certs: Some(vec![
+                    entry("", CLIENT_CERT_PATH),
+                    entry(CLIENT_HOST, ""),
+                    entry(CLIENT_HOST, CLIENT_CERT_PATH),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let net = raw.into_config(&[]).unwrap().net;
+        assert_eq!(net.client_certs.len(), 1);
     }
 
     #[test]

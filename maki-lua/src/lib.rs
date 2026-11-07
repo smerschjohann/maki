@@ -20,7 +20,7 @@ pub use api::r#fn::set_shell_preference;
 pub use api::keymap::{
     InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot,
 };
-pub use api::net::set_allowed_private_hosts;
+pub use api::net::{set_allowed_private_hosts, set_client_certs};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
 pub use api::session::SessionSnapshotFn;

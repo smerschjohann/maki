@@ -160,6 +160,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `allowed_private_hosts` | string[] | `[]` | Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://` |
+| `client_certs` | table | `[]` | Client certificates maki presents to one host, as `{ host, cert, key }` tables. `host` also takes a port to pin it. The server certificate still has to verify against the system store or `SSL_CERT_FILE` |
 
 `maki.net` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through:
 
@@ -172,6 +173,20 @@ maki.setup({
 ```
 
 An entry with no port covers every port. A name you list is allowed whatever it resolves to. A name you did not list stays blocked when DNS lands it on a private address, unless that address falls in a range you allowed, so keep ranges as small as the service needs. Every redirect hop is checked against the same list. [Permissions](/docs/permissions/#network-addresses) covers what the guard protects.
+
+Servers that ask for a client certificate get the one configured for their host:
+
+```lua
+maki.setup({
+    net = {
+        client_certs = {
+            { host = "mtls.example.com", cert = "~/certs/client.pem", key = "~/certs/client-key.pem" },
+        },
+    },
+})
+```
+
+`host` also takes a port to pin the certificate to it, as in `"mtls.example.com:8443"`. The certificate is presented on the request to that host only. maki does not send it on a redirect to another host. The server's own certificate still has to verify against the system store or the `SSL_CERT_FILE` bundle. A PEM file that holds the chain and the private key together works for both fields.
 
 ### `trust`
 

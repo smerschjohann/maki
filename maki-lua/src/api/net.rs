@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use maki_config::split_host_port;
+use maki_config::{ClientCert, split_host_port};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::http::{
     DNS_ATTEMPTS, HTTP_SCHEME, HTTPS_SCHEME, ProxyEnv, error_chain, extract_host_port, proxy_env,
@@ -18,7 +19,7 @@ use maki_providers::{Timeouts, client_builder};
 use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef};
 use regex::bytes::Regex;
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Client, Error as ReqwestError, Method, Request, Response};
+use reqwest::{Client, Error as ReqwestError, Identity, Method, Request, Response};
 use socket2::SockRef;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -96,6 +97,11 @@ const CROSS_AUTHORITY_HEADERS: [&str; 5] = [
 /// the same list, and `/reload` swaps it.
 static ALLOWED_PRIVATE_HOSTS: LazyLock<ArcSwap<HostAllowlist>> = LazyLock::new(ArcSwap::default);
 
+/// Client certificates from `net.client_certs`. Process-wide for the same
+/// reason as the allowlist: every `maki.net` call reads it, and `/reload`
+/// swaps it.
+static CLIENT_CERTS: LazyLock<ArcSwap<ClientCertStore>> = LazyLock::new(ArcSwap::default);
+
 thread_local! {
     /// Cancelling a plugin's tasks on unload misses a conn it keeps in a plain
     /// variable, so we remember every conn here. The refs are weak, so the GC
@@ -107,6 +113,81 @@ thread_local! {
 /// a `host:port`, nor a CIDR range are dropped with a warning.
 pub fn set_allowed_private_hosts(entries: &[String]) {
     ALLOWED_PRIVATE_HOSTS.store(Arc::new(HostAllowlist::parse(entries)));
+}
+
+/// Applies `net.client_certs`. A host whose files cannot be read or parsed is
+/// dropped with a warning, so the rest still work.
+pub fn set_client_certs(entries: &[ClientCert]) {
+    let mut store = ClientCertStore::default();
+    for entry in entries {
+        match load_client_cert(entry) {
+            Ok(cert) => store.entries.push(Arc::new(cert)),
+            Err(error) => {
+                tracing::warn!(host = %entry.host, %error, "ignoring net.client_certs entry")
+            }
+        }
+    }
+    CLIENT_CERTS.store(Arc::new(store));
+}
+
+/// Certificates to present, and the one host each may be presented to.
+#[derive(Debug, Default)]
+struct ClientCertStore {
+    entries: Vec<Arc<ClientCertPem>>,
+}
+
+impl ClientCertStore {
+    fn for_url(&self, url: &Url) -> Option<Arc<ClientCertPem>> {
+        let host = url.host_str()?;
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        let host = host.strip_suffix('.').unwrap_or(host);
+        let port = url.port_or_known_default();
+        self.entries
+            .iter()
+            .find(|cert| cert.matches(host, port))
+            .cloned()
+    }
+}
+
+/// A certificate chain and private key, already checked to parse. Kept as PEM
+/// because `reqwest::Identity` is not hashable and the pooled client is keyed
+/// on this.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ClientCertPem {
+    host: String,
+    port: Option<u16>,
+    pem: Vec<u8>,
+}
+
+impl ClientCertPem {
+    fn matches(&self, host: &str, port: Option<u16>) -> bool {
+        self.host.eq_ignore_ascii_case(host) && self.port.is_none_or(|pinned| Some(pinned) == port)
+    }
+}
+
+fn load_client_cert(entry: &ClientCert) -> Result<ClientCertPem, String> {
+    let cert = fs::read(&entry.cert)
+        .map_err(|e| format!("read client cert {}: {e}", entry.cert.display()))?;
+    let key = fs::read(&entry.key)
+        .map_err(|e| format!("read client key {}: {e}", entry.key.display()))?;
+    let mut pem = cert;
+    pem.push(b'\n');
+    pem.extend_from_slice(&key);
+    Identity::from_pem(&pem).map_err(|e| {
+        format!(
+            "parse {} and {}: {e}",
+            entry.cert.display(),
+            entry.key.display()
+        )
+    })?;
+    Ok(ClientCertPem {
+        host: entry.host.clone(),
+        port: entry.port,
+        pem,
+    })
 }
 
 /// Split by how far a rule may be trusted: a name only ever answers for the
@@ -338,6 +419,10 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// URLs are automatically upgraded to `https://`. Requests to private
 /// or metadata IP addresses are blocked for safety, unless the host is
 /// listed in `net.allowed_private_hosts`.
+///
+/// A host listed in `net.client_certs` gets the client certificate
+/// configured for it, so a server behind mTLS sees the configured
+/// identity.
 ///
 /// A request to the origin of a provider this plugin registered is sent
 /// like the provider's chat requests: no address check, no https upgrade,
@@ -916,6 +1001,13 @@ fn build_client(key: &ClientKey) -> Result<Client, String> {
     // few servers still match header names case-sensitively.
     let mut builder = client_builder().http1_title_case_headers();
 
+    if let Some(cert) = &key.cert {
+        builder = builder.identity(
+            Identity::from_pem(&cert.pem)
+                .map_err(|e| format!("client certificate for {}: {e}", cert.host))?,
+        );
+    }
+
     if let Some(timeout) = key.timeout {
         builder = builder.timeout(timeout);
     }
@@ -941,6 +1033,9 @@ fn build_client(key: &ClientKey) -> Result<Client, String> {
 struct ClientKey {
     timeout: Option<Duration>,
     route: Route,
+    /// Kept in the key so a client that carries one host's certificate is
+    /// never handed to a request for another.
+    cert: Option<Arc<ClientCertPem>>,
 }
 
 impl ClientKey {
@@ -948,6 +1043,9 @@ impl ClientKey {
         Self {
             timeout: params.timeout.or(params.route.default_timeout()),
             route: params.route.clone(),
+            cert: Url::parse(&params.url)
+                .ok()
+                .and_then(|url| CLIENT_CERTS.load().for_url(&url)),
         }
     }
 }
@@ -1389,6 +1487,11 @@ mod tests {
     const PARKING_WRITE_BYTES: usize = 16 * 1024 * 1024;
     const SECOND_WRITE: &str = "second";
     const PING: &str = "ping";
+    const CERT_HOST: &str = "mtls.example.com";
+    const CERT_URL: &str = "https://mtls.example.com/api";
+    const CERT_FILE_NAME: &str = "client.pem";
+    const CERT_KEY_FILE_NAME: &str = "client-key.pem";
+    const MISSING_CERT_PATH: &str = "/nonexistent/maki-client.pem";
 
     type LuaPair = (Option<String>, Option<String>);
 
@@ -2177,6 +2280,7 @@ mod tests {
         ClientKey {
             timeout: Some(Duration::from_secs(timeout_secs)),
             route: Route::Guarded(None),
+            cert: None,
         }
     }
 
@@ -2336,6 +2440,87 @@ mod tests {
             &pooled_client(&plain).unwrap(),
             &pooled_client(&other).unwrap()
         ));
+    }
+
+    fn a_client_cert(host: &str, port: Option<u16>) -> Arc<ClientCertPem> {
+        Arc::new(ClientCertPem {
+            host: host.into(),
+            port,
+            pem: host.as_bytes().to_vec(),
+        })
+    }
+
+    fn use_client_certs(entries: Vec<Arc<ClientCertPem>>) -> ClientCertsGuard {
+        CLIENT_CERTS.store(Arc::new(ClientCertStore { entries }));
+        ClientCertsGuard
+    }
+
+    /// The store is process-wide, so a test that sets it has to take it back
+    /// down, including when an assertion fails.
+    struct ClientCertsGuard;
+
+    impl Drop for ClientCertsGuard {
+        fn drop(&mut self) {
+            CLIENT_CERTS.store(Arc::new(ClientCertStore::default()));
+        }
+    }
+
+    #[test_case("https://mtls.example.com/api", true ; "the_configured_host")]
+    #[test_case("https://MTLS.example.com/api", true ; "host_case_is_folded")]
+    #[test_case("https://mtls.example.com:8443/api", true ; "any_port_when_unpinned")]
+    #[test_case("https://mtls.example.com./api", true ; "trailing_root_dot")]
+    #[test_case("https://other.example.com/api", false ; "another_host")]
+    fn client_cert_is_bound_to_its_host(url: &str, expected: bool) {
+        let _guard = pool_tests_serialized();
+        let _certs = use_client_certs(vec![a_client_cert(CERT_HOST, None)]);
+        let params = redirect_params(url);
+        assert_eq!(ClientKey::of(&params).cert.is_some(), expected);
+    }
+
+    #[test_case("https://mtls.example.com/api", true ; "default_port")]
+    #[test_case("https://mtls.example.com:443/api", true ; "explicit_default_port")]
+    #[test_case("https://mtls.example.com:8443/api", false ; "another_port")]
+    fn a_pinned_port_narrows_the_certificate(url: &str, expected: bool) {
+        let _guard = pool_tests_serialized();
+        let _certs = use_client_certs(vec![a_client_cert(CERT_HOST, Some(HTTPS_PORT))]);
+        let params = redirect_params(url);
+        assert_eq!(ClientKey::of(&params).cert.is_some(), expected);
+    }
+
+    #[test]
+    fn client_cert_files_are_loaded_and_carried_into_the_key() {
+        let _guard = pool_tests_serialized();
+        let dir = tempfile::TempDir::new().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec![CERT_HOST.to_string()]).unwrap();
+        let cert_path = dir.path().join(CERT_FILE_NAME);
+        let key_path = dir.path().join(CERT_KEY_FILE_NAME);
+        fs::write(&cert_path, certified.cert.pem()).unwrap();
+        fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
+
+        set_client_certs(&[ClientCert {
+            host: CERT_HOST.into(),
+            port: None,
+            cert: cert_path,
+            key: key_path,
+        }]);
+        let _certs = ClientCertsGuard;
+
+        let key = ClientKey::of(&redirect_params(CERT_URL));
+        assert!(key.cert.is_some(), "a valid certificate was dropped");
+        assert!(build_client(&key).is_ok(), "the identity did not build");
+    }
+
+    #[test]
+    fn unreadable_client_cert_files_are_dropped() {
+        let _guard = pool_tests_serialized();
+        let missing = std::path::PathBuf::from(MISSING_CERT_PATH);
+        set_client_certs(&[ClientCert {
+            host: CERT_HOST.into(),
+            port: None,
+            cert: missing.clone(),
+            key: missing,
+        }]);
+        assert!(CLIENT_CERTS.load().entries.is_empty());
     }
 
     fn loopback_listener() -> (TcpListener, u16) {

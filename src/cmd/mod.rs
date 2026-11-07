@@ -98,8 +98,10 @@ async fn load_plugins(
     )?;
 
     // Before any plugin can call `maki.net`, so the first request already sees
-    // the hosts the user exempted from the private-address block.
+    // the hosts the user exempted from the private-address block and the
+    // certificates it should present.
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    maki_lua::set_client_certs(&config.net.client_certs);
     maki_lua::set_shell_preference(config.agent.shell.clone());
 
     if let Err(e) = host.load_builtins(&config.plugins) {

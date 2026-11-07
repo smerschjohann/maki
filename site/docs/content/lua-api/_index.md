@@ -4575,6 +4575,10 @@ URLs are automatically upgraded to `https://`. Requests to private
 or metadata IP addresses are blocked for safety, unless the host is
 listed in `net.allowed_private_hosts`.
 
+A host listed in `net.client_certs` gets the client certificate
+configured for it, so a server behind mTLS sees the configured
+identity.
+
 A request to the origin of a provider this plugin registered is sent
 like the provider's chat requests: no address check, no https upgrade,
 maki's user agent, and connect and stall timeouts instead of a total
