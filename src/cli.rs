@@ -1,12 +1,18 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum, value_parser};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use maki_config::AgentConfig;
 
 use crate::print::OutputFormat;
+
+const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 600;
+/// A week. The deadline is an `Instant`, which panics on overflow.
+const MAX_BACKGROUND_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
@@ -136,6 +142,20 @@ pub struct Cli {
     #[arg(long)]
     pub include_partial_messages: bool,
 
+    /// How long --print, SDK mode and --exit-on-done stay up for background
+    /// tasks once their input ends. Each result that comes back in time wakes
+    /// the model for another turn. Tasks still running after this are stopped.
+    /// Unset: 600 for SDK mode and --exit-on-done, while --print runs with
+    /// background tasks off so it exits right after its answer. 0 turns them
+    /// off for --print, SDK and ACP, so every tool call blocks until it
+    /// finishes. At most a week
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = value_parser!(u64).range(..=MAX_BACKGROUND_TIMEOUT_SECS),
+    )]
+    pub background_timeout: Option<u64>,
+
     /// Permission prompt tool (accepted for compat, used in SDK mode)
     #[arg(long, hide = true)]
     pub permission_prompt_tool: Option<String>,
@@ -203,8 +223,39 @@ impl Cli {
         }
     }
 
+    /// `--allowed-tools` replaces the allowlist and rejects an unknown name;
+    /// `--disallowed-tools` adds to the denylist and skips one.
+    pub fn apply_tool_flags(&self, agent: &mut AgentConfig) -> Result<()> {
+        if !self.allowed_tools.is_empty() {
+            agent.allowed_tools = self
+                .allowed_tools
+                .iter()
+                .map(|t| normalize_tool_name(t))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        agent.disabled_tools.extend(
+            self.disallowed_tools
+                .iter()
+                .filter_map(|t| normalize_tool_name(t).ok()),
+        );
+        Ok(())
+    }
+
     pub fn is_sdk_mode(&self) -> bool {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
+    }
+
+    /// `None` when background tasks are off. `-p` has no one to use the wait
+    /// and promises one answer, so it only waits when asked to.
+    pub fn background_wait(&self) -> Option<Duration> {
+        let secs = self
+            .background_timeout
+            .unwrap_or(if self.print && !self.is_sdk_mode() {
+                0
+            } else {
+                DEFAULT_BACKGROUND_TIMEOUT_SECS
+            });
+        (secs > 0).then(|| Duration::from_secs(secs))
     }
 }
 
@@ -335,7 +386,7 @@ pub enum SessionAction {
 
 #[derive(Subcommand)]
 pub enum MigrateAction {
-    /// Migrate files from ~/.maki/ to XDG directories
+    /// Move ~/.maki/ to the XDG directories (maki also does this on startup)
     Xdg,
     /// Print a prompt that ports your old provider scripts to Lua plugins
     Providers,
@@ -371,7 +422,7 @@ pub enum AuthAction {
     Status,
 }
 
-pub fn normalize_tool_name(name: &str) -> Result<String> {
+fn normalize_tool_name(name: &str) -> Result<String> {
     let mut result = String::with_capacity(name.len() + 4);
     for (i, c) in name.chars().enumerate() {
         if c.is_ascii_uppercase() {
@@ -433,5 +484,29 @@ mod tests {
         let argv = std::iter::once("maki").chain(args.iter().copied());
 
         assert_eq!(Cli::try_parse_from(argv).is_ok(), accepted);
+    }
+
+    #[test_case(&["-p"], None ; "print_default_is_off")]
+    #[test_case(&["-p", "--input-format", "stream-json"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "sdk_default")]
+    #[test_case(&["--exit-on-done"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "tui_default")]
+    #[test_case(&["acp"], Some(DEFAULT_BACKGROUND_TIMEOUT_SECS) ; "acp_default_is_on")]
+    #[test_case(&["-p", "--background-timeout", "30"], Some(30) ; "print_set")]
+    #[test_case(&["--background-timeout", "0", "acp"], None ; "zero_turns_acp_off")]
+    fn background_timeout_flag(args: &[&str], expected_secs: Option<u64>) {
+        let argv = std::iter::once("maki").chain(args.iter().copied());
+
+        let cli = Cli::try_parse_from(argv).unwrap();
+
+        assert_eq!(
+            cli.background_wait(),
+            expected_secs.map(Duration::from_secs)
+        );
+    }
+
+    #[test]
+    fn background_timeout_past_the_cap_is_refused() {
+        let too_long = (MAX_BACKGROUND_TIMEOUT_SECS + 1).to_string();
+
+        assert!(Cli::try_parse_from(["maki", "-p", "--background-timeout", &too_long]).is_err());
     }
 }

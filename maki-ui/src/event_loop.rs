@@ -3,10 +3,12 @@
 //! renders and receives input. `SpawnCtx` carries the shared resources needed
 //! to spawn session runtimes at any point.
 //!
-//! Terminal input arrives on a channel (see [`InputReader`]), so the loop
-//! waits on every event source at once and wakes the moment a plugin action,
-//! agent event, or keypress arrives instead of sleeping in `event::poll`.
+//! The loop is async and selects over every event source at once (terminal
+//! input through [`InputReader`], plugin actions, agent events, timers), so
+//! it wakes the moment any of them has something and never blocks a worker:
+//! it runs under `block_on` on the main thread.
 
+use std::future::{pending, ready};
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -19,13 +21,14 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use futures::future::{LocalBoxFuture, select_all};
 use maki_agent::agent::SessionExport;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
-    Transcript, mcp,
+    SessionMailbox, Transcript, mcp,
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -47,26 +50,31 @@ use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
-use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
+use tokio::runtime::Handle;
+use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::time::timeout;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    AgentHandles, ModelSlot, ModelSlots,
+    AgentDeps, AgentHandles, ModelSlot, ModelSlots, Respawn,
     shared_queue::{Compaction, QueueItem, QueuedInput},
 };
 use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
-use crate::app::tasks::{TaskStatus, diff_task_states};
+use crate::app::tasks::TaskWatch;
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
+use crate::appearance::{self, Background};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::keybindings::key;
 use crate::components::usage_modal::UsageFetchState;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{Action, ExitRequest};
 use crate::decor_worker;
 use crate::input::InputReader;
+use crate::present::present;
 use crate::repaint::{Dirty, IDLE_POLL};
 use crate::theme;
 use crate::{AppSession, OpenSession};
@@ -84,6 +92,9 @@ const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 const FORKED_MSG: &str = "Forked, {key} to switch back";
+/// A `/reload` cannot ask the terminal: its input reader owns the tty.
+const RESTART_FOR_BACKGROUND: &str =
+    "ui.theme: restart Maki to detect the terminal background, using dark until then";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -95,6 +106,10 @@ pub(crate) struct ShutdownReport {
     /// after dropping the terminal guard, so the line is not lost with the
     /// alternate screen.
     pub unsaved: Vec<MakiId>,
+    /// A result that settled but no run drained yet lives only in its
+    /// session's mailbox. `/reload` carries these over so the next generation
+    /// finds it there instead of reporting the work lost.
+    pub mailboxes: Vec<SessionMailbox>,
 }
 
 pub struct EventLoopParams {
@@ -114,6 +129,8 @@ pub struct EventLoopParams {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
+    /// How long `exit_on_done` waits for background work, `None` for not at all.
+    pub background_wait: Option<Duration>,
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
@@ -127,9 +144,12 @@ pub struct EventLoopParams {
     /// What `/trust` would grant and what the `[restricted]` indicator reports.
     /// `None` when the folder is trusted or has nothing to ask about.
     pub trust_question: Option<TrustQuestion>,
+    /// The mailboxes the generation before handed over, held until this one
+    /// registered its own.
+    pub handed_over: Vec<SessionMailbox>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SessionStatus {
     Working,
     NeedsInput,
@@ -202,20 +222,21 @@ impl RunNotificationState {
         &mut self,
         attention: Option<Notification>,
         status: SessionStatus,
-        queue_empty: bool,
     ) -> Option<Notification> {
-        let settled = attention.is_none() && status == SessionStatus::Idle && queue_empty;
+        let settled = attention.is_none() && status == SessionStatus::Idle;
         let prompt = (attention != self.last_attention)
             .then(|| attention.clone())
             .flatten();
         self.last_attention = attention;
 
-        // A due completion is decided on its first reconcile: fire if the
-        // session settled, otherwise drop it for good.
+        // A turn can end while work goes on, and queued input or a background
+        // task may wake the agent again. So the completion waits until the
+        // session waits on the user (see `App::is_working`), and new work
+        // drops it.
         let completion = match self.pending_completion.take() {
-            Some(PendingCompletion::Due(notification)) => settled.then_some(notification),
-            waiting => {
-                self.pending_completion = waiting;
+            Some(PendingCompletion::Due(notification)) if settled => Some(notification),
+            pending => {
+                self.pending_completion = pending;
                 None
             }
         };
@@ -224,10 +245,12 @@ impl RunNotificationState {
 }
 
 impl SessionStatus {
+    /// Background work keeps the session working, like the status bar, so a
+    /// picker never flashes finished while a result is still to come.
     fn of(app: &App) -> Self {
         if app.awaiting_input() {
             Self::NeedsInput
-        } else if app.status == Status::Streaming {
+        } else if app.is_working() {
             Self::Working
         } else {
             Self::Idle
@@ -358,9 +381,7 @@ struct SessionRuntime {
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
     last_title: String,
-    /// Keyed by task id, never by position: a session reset reuses positions,
-    /// so a new task would inherit the old one's status.
-    last_tasks: Vec<(Arc<str>, TaskStatus)>,
+    last_tasks: TaskWatch,
     notifications: RunNotificationState,
     /// This session's model and provider, one cell per runtime and never
     /// shared. The agent loop reads it at the start of every turn, and a
@@ -380,17 +401,6 @@ impl SessionRuntime {
             self.app.clear_exit_request();
         }
         self.notifications.reset();
-    }
-
-    /// A wake may only start a background run when the session is fully
-    /// quiescent. Idle status alone is not enough: restored queue items start
-    /// runs without `start_run` (the app only learns of them via
-    /// `QueueItemConsumed`), and `start_run` destroys text held for recovery
-    /// after an agent error.
-    fn quiescent(&self) -> bool {
-        SessionStatus::of(&self.app) == SessionStatus::Idle
-            && self.handles.queue.is_empty()
-            && !self.app.holds_recovery_text()
     }
 }
 
@@ -440,11 +450,13 @@ impl SpawnCtx {
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
-            self.timeouts,
             self.lua_event_handle.clone(),
-            self.mcp_handle.clone(),
-            self.mcp_config_errors.clone(),
-            Arc::clone(&self.model_policy),
+            AgentDeps {
+                mcp_handle: self.mcp_handle.clone(),
+                mcp_config_errors: self.mcp_config_errors.clone(),
+                timeouts: self.timeouts,
+                model_policy: Arc::clone(&self.model_policy),
+            },
         );
         let mut app = App::new(
             &slot.model,
@@ -452,7 +464,7 @@ impl SpawnCtx {
             self.storage.clone(),
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
-            handles.mcp_config_errors.clone(),
+            handles.deps.mcp_config_errors.clone(),
             self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
@@ -479,7 +491,7 @@ impl SpawnCtx {
             shell_rx,
             last_status: SessionStatus::Idle,
             last_title,
-            last_tasks: Vec::new(),
+            last_tasks: TaskWatch::default(),
             notifications: RunNotificationState::default(),
             slot: cell,
         }
@@ -512,7 +524,7 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
-    _model_fetch_task: smol::Task<()>,
+    _model_fetch_task: AbortOnDropHandle<()>,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -534,13 +546,42 @@ enum Wake {
     ModelsDiscovered,
 }
 
+/// A value from the channel, or never, once it is closed: a closed channel
+/// is not an event.
+async fn recv_or_pending<T>(rx: &flume::Receiver<T>) -> T {
+    match rx.recv_async().await {
+        Ok(value) => value,
+        Err(_) => pending().await,
+    }
+}
+
+/// The first agent envelope or shell event from any session.
+async fn session_wake(sessions: &[SessionRuntime]) -> Wake {
+    let waits: Vec<LocalBoxFuture<'_, Wake>> = sessions
+        .iter()
+        .enumerate()
+        .flat_map(|(i, rt)| {
+            [
+                Box::pin(async move {
+                    Wake::Agent(i, Box::new(recv_or_pending(&rt.handles.agent_rx).await))
+                }) as LocalBoxFuture<'_, Wake>,
+                Box::pin(async move { Wake::Shell(i, recv_or_pending(&rt.shell_rx).await) }),
+            ]
+        })
+        .collect();
+    if waits.is_empty() {
+        return pending().await;
+    }
+    select_all(waits).await.0
+}
+
 struct BackgroundModels {
     available: Arc<ArcSwapOption<ModelList>>,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
-    task: smol::Task<()>,
+    task: AbortOnDropHandle<()>,
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
@@ -553,8 +594,8 @@ fn fetch_models(
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
-) -> smol::Task<()> {
-    smol::spawn(async move {
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         fetch_all_models_cached(&policy, |list, warnings| {
             for w in warnings {
                 let _ = warn_tx.try_send(w);
@@ -570,12 +611,12 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
-    let task = fetch_models(
+    let task = AbortOnDropHandle::new(fetch_models(
         Arc::clone(&available),
         policy,
         warn_tx.clone(),
         models_tx.clone(),
-    );
+    ));
     BackgroundModels {
         available,
         warn_rx,
@@ -587,7 +628,7 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
 }
 
 impl<'t> EventLoop<'t> {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         terminal: &'t mut ratatui::DefaultTerminal,
         params: EventLoopParams,
     ) -> Result<Self> {
@@ -607,6 +648,7 @@ impl<'t> EventLoop<'t> {
             permissions,
             timeouts,
             exit_on_done,
+            background_wait,
             lua_command_reader,
             keymap_reader,
             hint_reader,
@@ -618,6 +660,7 @@ impl<'t> EventLoop<'t> {
             model_policy,
             project_config,
             trust_question,
+            handed_over,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -626,7 +669,12 @@ impl<'t> EventLoop<'t> {
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
         // in-memory name is set, so the user's saved pick survives.
-        if let Some(ref name) = ui_config.theme {
+        if let Some(ref pair) = ui_config.theme {
+            let background = appearance::background();
+            if pair.follows_background() && background.is_none() {
+                startup_warnings.push(RESTART_FOR_BACKGROUND.to_owned());
+            }
+            let name = pair.name(background == Some(Background::Light));
             match crate::theme::load_by_name(name) {
                 Ok(theme) => {
                     crate::theme::set_current_name(name);
@@ -643,7 +691,7 @@ impl<'t> EventLoop<'t> {
         });
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd, project_config));
+        let (mcp_handle, mcp_config_errors) = mcp::start(&cwd, project_config).await;
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(
@@ -693,12 +741,15 @@ impl<'t> EventLoop<'t> {
                 rt
             })
             .collect();
+        drop(handed_over);
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
         }
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
-        app.exit_on_done = exit_on_done;
+        if exit_on_done {
+            app.exit_when_done(background_wait);
+        }
         if needs_login {
             app.login_picker.open(app.storage.clone());
         }
@@ -727,7 +778,7 @@ impl<'t> EventLoop<'t> {
             notifier,
             ctx,
             slots,
-            input: InputReader::spawn(),
+            input: InputReader::new().context("watch terminal input")?,
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             models_rx: bg.models_rx,
@@ -746,32 +797,17 @@ impl<'t> EventLoop<'t> {
         &mut self.sessions[self.focused].app
     }
 
-    /// Paints a frame and parks the terminal cursor on the cell the input box
-    /// reversed, without showing it. macOS anchors IME preedit text to the
-    /// cursor, so it has to sit there, but a visible one would invert that
-    /// already reversed cell back to plain text and ride along with every cell
-    /// the next diff writes.
-    ///
-    /// `Frame::set_cursor_position` cannot do this: ratatui shows the cursor
-    /// whenever a frame asks for a position. Hence the move after the draw,
-    /// and the hide that goes with it, so a widget that does ask for one
-    /// cannot bring the block cursor back.
     fn paint(&mut self) -> Result<()> {
         let app = &mut self.sessions[self.focused].app;
-        let mut cursor = None;
-        self.terminal.draw(|f| {
-            cursor = app.view(f);
-            color_compat::downgrade_if_needed(f.buffer_mut());
+        present(self.terminal, |frame| {
+            let caret = app.view(frame);
+            color_compat::downgrade_if_needed(frame.buffer_mut());
+            caret
         })?;
-        if let Some(pos) = cursor {
-            self.terminal.hide_cursor()?;
-            self.terminal.set_cursor_position(pos)?;
-            self.terminal.backend_mut().flush()?;
-        }
         Ok(())
     }
 
-    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
+    pub(crate) async fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
         if let Some(prompt) = initial_prompt {
             let sub = Submission {
                 text: prompt,
@@ -785,7 +821,7 @@ impl<'t> EventLoop<'t> {
         let mut dirty = Dirty::YES;
         let result = loop {
             dirty |= self.tick();
-            match self.drain_channels() {
+            match self.drain_channels().await {
                 Ok(d) => dirty |= d,
                 Err(e) => break Err(e),
             }
@@ -800,19 +836,29 @@ impl<'t> EventLoop<'t> {
             }
 
             if let Some(i) = self.sessions.iter().position(|rt| {
-                rt.app.exit_request != ExitRequest::None && !rt.notifications.waiting_for_drain()
+                rt.app.exit_request != ExitRequest::None
+                    && !rt.notifications.waiting_for_drain()
+                    && !rt.app.awaits_background(Instant::now())
             }) {
-                // A backgrounded session can finish an `exit_on_done` turn;
-                // focus it so shutdown reports its exit code and id.
-                self.set_focused(i);
-                self.emit_notifications();
-                break Ok(());
+                // A result settling since the drain above both clears its
+                // receipt and wakes the session, so the wake is claimed after
+                // the read: its run goes first, and that run's drain exits.
+                if self.sessions[i].app.exits_on_done() {
+                    dirty |= self.start_woken_runs();
+                }
+                if self.sessions[i].app.exit_request != ExitRequest::None {
+                    // A backgrounded session can finish an `exit_on_done` turn.
+                    // Focus it so shutdown reports its exit code and id.
+                    self.set_focused(i);
+                    self.emit_notifications();
+                    break Ok(());
+                }
             }
 
             // Sleeping a whole frame instead of a fraction of one is what
             // makes a spinner cost 12 paints a second instead of 62.
             let cadence = self.sessions[self.focused].app.cadence();
-            match self.next_wake(cadence.frame().unwrap_or(IDLE_POLL)) {
+            match self.next_wake(cadence.frame().unwrap_or(IDLE_POLL)).await {
                 // Any event can change the screen, so paint after handling it
                 // rather than asking every handler to prove it did.
                 Some(wake) => {
@@ -830,43 +876,42 @@ impl<'t> EventLoop<'t> {
         };
         // Fatal errors still save every session, kill MCP process groups,
         // and drain the storage writer before the process exits.
-        let report = self.shutdown();
+        let report = self.shutdown().await;
         result.map(|()| report)
     }
 
     /// Wait for the next event from any source, or time out so animations
-    /// and periodic polls keep running. `Duration::ZERO` drains whatever is
-    /// already pending.
-    fn next_wake(&self, timeout: Duration) -> Option<Wake> {
-        let mut sel = flume::Selector::new().recv(self.input.receiver(), |res| match res {
-            Ok(ev) => Some(Wake::Input(ev)),
-            Err(_) => Some(Wake::InputGone),
-        });
-        if !self.ui_action_rx.is_disconnected() {
-            sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
+    /// and periodic polls keep running.
+    async fn next_wake(&mut self, wait: Duration) -> Option<Wake> {
+        timeout(wait, self.wake()).await.ok()
+    }
+
+    /// An event that is already pending, checked once. A zero timeout would
+    /// still arm a timer and wait for its next tick. A `select!` rather than
+    /// `now_or_never`, so the poll carries the loop's own waker: crossterm's
+    /// reader thread keeps whatever waker it is first polled with.
+    async fn pending_wake(&mut self) -> Option<Wake> {
+        tokio::select! {
+            biased;
+            wake = self.wake() => Some(wake),
+            () = ready(()) => None,
         }
-        if !self.ui_wake_rx.is_disconnected() {
-            sel = sel.recv(&self.ui_wake_rx, |res| {
-                res.ok().map(|()| Wake::PluginWindow)
-            });
+    }
+
+    /// Terminal input first, then plugin UI actions, then the rest, so a
+    /// keypress is never queued behind a burst of agent events.
+    async fn wake(&mut self) -> Wake {
+        tokio::select! {
+            biased;
+            event = self.input.next() => event.map_or(Wake::InputGone, Wake::Input),
+            action = recv_or_pending(&self.ui_action_rx) => Wake::Ui(action),
+            () = recv_or_pending(&self.ui_wake_rx) => Wake::PluginWindow,
+            () = recv_or_pending(decor_worker::wakes()) => Wake::Decor,
+            warning = recv_or_pending(&self.warn_rx) => Wake::Warn(warning),
+            preparation = recv_or_pending(&self.pack_rx) => Wake::Pack(preparation),
+            () = recv_or_pending(&self.models_rx) => Wake::ModelsDiscovered,
+            wake = session_wake(&self.sessions) => wake,
         }
-        sel = sel.recv(decor_worker::wakes(), |res| res.ok().map(|()| Wake::Decor));
-        sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
-        sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
-        sel = sel.recv(&self.models_rx, |res| {
-            res.ok().map(|()| Wake::ModelsDiscovered)
-        });
-        for (i, rt) in self.sessions.iter().enumerate() {
-            if !rt.handles.agent_rx.is_disconnected() {
-                sel = sel.recv(&rt.handles.agent_rx, move |res| {
-                    res.ok().map(|env| Wake::Agent(i, Box::new(env)))
-                });
-            }
-            sel = sel.recv(&rt.shell_rx, move |res| {
-                res.ok().map(|ev| Wake::Shell(i, ev))
-            });
-        }
-        sel.wait_timeout(timeout).ok().flatten()
     }
 
     fn handle_wake(&mut self, wake: Wake) -> Result<()> {
@@ -898,6 +943,16 @@ impl<'t> EventLoop<'t> {
     /// [`App::tick_background`].
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
+        // A quit ends the whole process, so each session's double press
+        // counts the background tasks of all of them.
+        let running: usize = self
+            .sessions
+            .iter()
+            .map(|rt| rt.app.running_background_tasks().count())
+            .sum();
+        for rt in &mut self.sessions {
+            rt.app.background_elsewhere = running - rt.app.running_background_tasks().count();
+        }
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             if i == self.focused {
                 dirty |= rt.app.tick();
@@ -928,7 +983,7 @@ impl<'t> EventLoop<'t> {
             }
             AgentEvent::QueueItemConsumed { .. } if current => {
                 rt.notifications.on_queue_item_consumed();
-                if rt.app.exit_on_done {
+                if rt.app.exits_on_done() {
                     rt.app.clear_exit_request();
                 }
             }
@@ -938,15 +993,14 @@ impl<'t> EventLoop<'t> {
             event if current => rt.notifications.on_done(event),
             _ => {}
         }
-        let actions = self.sessions[idx].app.update(Msg::Agent(envelope));
-        self.dispatch(idx, actions);
+        self.sessions[idx].app.update(Msg::Agent(envelope));
     }
 
-    fn drain_channels(&mut self) -> Result<Dirty> {
+    async fn drain_channels(&mut self) -> Result<Dirty> {
         let mut dirty = Dirty::NO;
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
-            match self.next_wake(Duration::ZERO) {
+            match self.pending_wake().await {
                 Some(wake) => {
                     self.handle_wake(wake)?;
                     dirty = Dirty::YES;
@@ -967,9 +1021,12 @@ impl<'t> EventLoop<'t> {
         self.sessions[self.focused]
             .app
             .announce_mode(&mut self.last_mode);
-        dirty |= self.start_mailbox_runs();
+        dirty |= self.start_woken_runs();
         self.emit_status_changes();
         self.emit_title_changes();
+        for rt in &mut self.sessions {
+            rt.app.settle_stranded_parts();
+        }
         self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
@@ -1104,8 +1161,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 // A straggler after `/new` finds no tab and is dropped.
                 if let Some(idx) = self.sessions.iter().position(|rt| rt.id() == session) {
-                    let actions = self.sessions[idx].app.deliver(*envelope, Some(plugin));
-                    self.dispatch(idx, actions);
+                    self.sessions[idx].app.deliver(*envelope, Some(plugin));
                 }
             }
             UiAction::PluginTaskOpened {
@@ -1115,6 +1171,11 @@ impl<'t> EventLoop<'t> {
             } => {
                 if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
                     rt.app.open_plugin_task(&info, plugin);
+                }
+            }
+            UiAction::PluginTaskEnded { session, id, end } => {
+                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
+                    rt.app.end_task(&id, end.into());
                 }
             }
         }
@@ -1181,34 +1242,27 @@ impl<'t> EventLoop<'t> {
         let handle = &self.ctx.lua_event_handle;
         for rt in &mut self.sessions {
             let session_id = rt.app.state.session.id;
-            diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
-                handle.fire(
-                    Some(&session_id),
-                    HostEvent::TaskStatusChanged {
-                        id: task.id,
-                        name: task.name,
-                        status: task.status.into(),
-                        plugin: task.plugin.map(|plugin| &**plugin),
-                    },
-                );
-            });
+            rt.last_tasks
+                .diff(session_id, rt.app.task_states(), |task| {
+                    handle.fire(
+                        Some(&session_id),
+                        HostEvent::TaskStatusChanged {
+                            id: task.id,
+                            name: task.name,
+                            status: task.status.into(),
+                            plugin: task.plugin.map(|plugin| &**plugin),
+                        },
+                    );
+                });
         }
     }
 
     /// Called only after the cancel went out, so a handler that checks
     /// `maki.agent.list()` already finds a stopped plugin task gone.
-    fn emit_task_stopped(&self, idx: usize, id: &str) {
-        let app = &self.sessions[idx].app;
-        let plugin = app
-            .task_states()
-            .find(|task| &**task.id == id)
-            .and_then(|task| task.plugin);
+    fn emit_task_stopped(&self, idx: usize, id: &str, plugin: Option<&str>) {
         self.ctx.lua_event_handle.fire(
-            Some(&app.state.session.id),
-            HostEvent::TaskStopped {
-                id,
-                plugin: plugin.map(|plugin| &**plugin),
-            },
+            Some(&self.sessions[idx].app.state.session.id),
+            HostEvent::TaskStopped { id, plugin },
         );
     }
 
@@ -1218,11 +1272,9 @@ impl<'t> EventLoop<'t> {
         };
         let mut selected = None;
         for rt in &mut self.sessions {
-            let candidate = rt.notifications.reconcile(
-                rt.app.attention(),
-                rt.last_status,
-                rt.handles.queue.is_empty(),
-            );
+            let candidate = rt
+                .notifications
+                .reconcile(rt.app.attention(), SessionStatus::of(&rt.app));
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected.filter(|n| self.focus.allows(n))
@@ -1269,23 +1321,11 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn start_mailbox_runs(&mut self) -> Dirty {
-        let ready: Vec<_> = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, runtime)| {
-                if !runtime.quiescent() {
-                    return None;
-                }
-                let preamble = runtime.handles.claim_mailbox_wake();
-                (!preamble.is_empty()).then_some((index, preamble))
-            })
-            .collect();
-
-        let dirty = Dirty::from(!ready.is_empty());
-        for (index, preamble) in ready {
-            let actions = self.sessions[index].app.start_mailbox_run(preamble);
+    fn start_woken_runs(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        for index in 0..self.sessions.len() {
+            let actions = self.sessions[index].app.start_woken_run();
+            dirty |= Dirty::from(!actions.is_empty());
             self.dispatch(index, actions);
         }
         dirty
@@ -1298,14 +1338,13 @@ impl<'t> EventLoop<'t> {
         match req {
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
-                smol::unblock(move || {
+                spawn_blocking(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let reply = AppSession::list(&cwd.to_string_lossy(), &storage)
                         .map_err(|e| e.to_string())
                         .and_then(|list| serde_json::to_value(list).map_err(|e| e.to_string()));
                     let _ = reply_tx.send(reply);
-                })
-                .detach();
+                });
             }
             // Deletes run on the storage writer thread after any queued
             // flushes, so the loop never blocks on disk and a queued save
@@ -1558,11 +1597,10 @@ impl<'t> EventLoop<'t> {
         };
         if prompt.is_none() && !focus {
             let storage = self.ctx.storage.clone();
-            smol::unblock(move || {
+            spawn_blocking(move || {
                 let reply = open.store(&storage).map(|id| json!(id));
                 let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
-            })
-            .detach();
+            });
             return;
         }
         // An inherited model's slot is already built and sitting right here.
@@ -1595,13 +1633,12 @@ impl<'t> EventLoop<'t> {
         answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
     ) {
         let storage = self.ctx.storage.clone();
-        smol::unblock(move || {
+        spawn_blocking(move || {
             let reply = AppSession::read_only(id, &storage)
                 .map_err(|e| e.to_string())
                 .and_then(answer);
             let _ = reply_tx.send(reply);
-        })
-        .detach();
+        });
     }
 
     fn position(&self, id: MakiId) -> Option<usize> {
@@ -1707,7 +1744,7 @@ impl<'t> EventLoop<'t> {
                 .app
                 .apply_loaded_session(open, &slot.model);
             self.apply_model(idx, slot);
-            self.respawn_agent(idx, history);
+            self.respawn_agent(idx, history, Respawn::Load);
         } else {
             let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
             self.set_focused(idx);
@@ -1794,7 +1831,7 @@ impl<'t> EventLoop<'t> {
     fn aggregate_scroll(&self, first: CtMouseEvent, scroll_lines: u32) -> (Msg, Option<Event>) {
         let mut delta = scroll_delta(first.kind, scroll_lines);
         let mut leftover = None;
-        while let Ok(next) = self.input.receiver().try_recv() {
+        while let Some(next) = self.input.try_next() {
             match next {
                 Event::Mouse(m)
                     if matches!(
@@ -1824,7 +1861,7 @@ impl<'t> EventLoop<'t> {
     /// drained along the way is returned so it isn't lost.
     fn coalesce_drag(&self, mut latest: CtMouseEvent) -> (CtMouseEvent, Option<Event>) {
         let mut leftover = None;
-        while let Ok(next) = self.input.receiver().try_recv() {
+        while let Some(next) = self.input.try_next() {
             match next {
                 Event::Mouse(m) if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left)) => {
                     latest = m;
@@ -1883,20 +1920,16 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
+    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>, reason: Respawn) {
         let rt = &mut self.sessions[idx];
         rt.reset_run_notifications();
-        let lua_handle = rt.app.lua_event_handle.clone();
-        let permissions = Arc::clone(&rt.app.permissions);
-        let slot = Arc::clone(&rt.slot);
         rt.handles.respawn(
             history,
-            &slot,
+            &rt.slot,
             self.ctx.config.clone(),
             self.ctx.ui_config.tool_output_lines,
-            &permissions,
             &mut rt.app,
-            lua_handle,
+            reason,
         );
     }
 
@@ -1936,13 +1969,13 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx]
                     .handles
                     .cancel_subagent(tool_use_id.clone());
-                self.emit_task_stopped(idx, &tool_use_id);
+                self.emit_task_stopped(idx, &tool_use_id, None);
             }
-            Action::CancelPluginTask { id } => {
+            Action::CancelPluginTask { id, plugin } => {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
-                self.emit_task_stopped(idx, &id);
+                self.emit_task_stopped(idx, &id, Some(&plugin));
             }
-            Action::RestartAgent(history) => self.respawn_agent(idx, history),
+            Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
             Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
@@ -2052,12 +2085,13 @@ impl<'t> EventLoop<'t> {
         self.sessions[idx].app.flash(PACK_PREPARING.to_owned());
         let handle = self.ctx.lua_event_handle.clone();
         let tx = self.pack_tx.clone();
+        let runtime = Handle::current();
         std::thread::spawn(move || {
             // Without this a panic drops the sender with no answer, and
             // `pack_running` stays set for the rest of the process, so every
             // later package command reports "already running".
             let preparation = catch_unwind(AssertUnwindSafe(|| match handle.package_context() {
-                Ok(context) => maki_lua::prepare_pack_command(&command, &context),
+                Ok(context) => runtime.block_on(maki_lua::prepare_pack_command(&command, &context)),
                 Err(error) => PackPreparation::failed(error),
             }))
             .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
@@ -2080,8 +2114,7 @@ impl<'t> EventLoop<'t> {
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
             self.models_tx.clone(),
-        )
-        .detach();
+        );
     }
 
     fn refresh_usage(&mut self) {
@@ -2089,15 +2122,14 @@ impl<'t> EventLoop<'t> {
         let provider = Arc::clone(&rt.slot.load().provider);
         let slot = Arc::clone(&rt.app.usage_slot);
         slot.store(Some(Arc::new(UsageFetchState::Loading)));
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let state = match provider.fetch_usage().await {
                 Ok(Some(usage)) => UsageFetchState::Ready(usage),
                 Ok(None) => UsageFetchState::Unsupported,
                 Err(e) => UsageFetchState::Error(e.user_message()),
             };
             slot.store(Some(Arc::new(state)));
-        })
-        .detach();
+        });
     }
 
     /// Re-login rebuilds the provider for every tab on it, not just the focused
@@ -2118,7 +2150,7 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn shutdown(mut self) -> ShutdownReport {
+    async fn shutdown(mut self) -> ShutdownReport {
         let started = Instant::now();
         let mut phase_start = started;
         let mut lap = || {
@@ -2151,6 +2183,7 @@ impl<'t> EventLoop<'t> {
         }
         let kill_mcp_ms = lap();
         let mut tabs = Vec::with_capacity(self.sessions.len());
+        let mut mailboxes = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
@@ -2163,13 +2196,14 @@ impl<'t> EventLoop<'t> {
                 session: Arc::unwrap_or_clone(app.state.session),
                 claim: app.state.claim,
             });
+            mailboxes.push(handles.mailbox().clone());
             agent_tasks.push(handles.into_task());
         }
         let save_sessions_ms = lap();
-        crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
+        crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT).await;
         let join_agents_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
-            smol::block_on(h.shutdown());
+            h.shutdown().await;
         }
         let mcp_shutdown_ms = lap();
         let unsaved = match Arc::try_unwrap(self.ctx.storage_writer) {
@@ -2195,6 +2229,7 @@ impl<'t> EventLoop<'t> {
             tabs,
             focused: self.focused,
             unsaved,
+            mailboxes,
         }
     }
 }
@@ -2210,6 +2245,8 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
+    use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
     use test_case::test_case;
@@ -2245,47 +2282,51 @@ mod tests {
 
         state.on_done(&done_event());
         assert!(state.waiting_for_drain());
-        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
+        assert_eq!(state.reconcile(None, SessionStatus::Idle), None);
 
         state.on_drain();
         assert!(!state.waiting_for_drain());
         assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true),
+            state.reconcile(None, SessionStatus::Idle),
             Some(Notification::TurnComplete {
                 response: Some("done".into())
             })
         );
     }
 
-    #[test_case(SessionStatus::Idle, true, true ; "fires_when_settled")]
-    #[test_case(SessionStatus::Idle, false, false ; "queued_message_swallows")]
-    #[test_case(SessionStatus::Working, true, false ; "busy_session_swallows")]
-    fn due_completion_is_decided_on_first_reconcile(
-        status: SessionStatus,
-        queue_empty: bool,
-        fires: bool,
-    ) {
+    #[test_case(false, true ; "fires_once_the_session_settles")]
+    #[test_case(true, false ; "new_work_drops_it")]
+    fn due_completion_waits_while_the_session_works(new_work: bool, fires: bool) {
         let mut state = due_completion();
+        assert_eq!(state.reconcile(None, SessionStatus::Working), None);
 
-        let first = state.reconcile(None, status, queue_empty);
-        assert_eq!(first.is_some(), fires);
-        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
+        if new_work {
+            state.on_queue_item_consumed();
+        }
+
+        assert_eq!(state.reconcile(None, SessionStatus::Idle).is_some(), fires);
+        assert_eq!(state.reconcile(None, SessionStatus::Idle), None);
     }
 
+    /// A background task can ask something after the turn ended. The turn
+    /// still notifies once the user answers and the work is done.
     #[test]
     fn prompt_wins_over_completion_and_is_not_repeated_unchanged() {
         let prompt = Notification::QuestionRequested;
         let mut state = due_completion();
 
         assert_eq!(
-            state.reconcile(Some(prompt.clone()), SessionStatus::Idle, true),
+            state.reconcile(Some(prompt.clone()), SessionStatus::NeedsInput),
             Some(prompt.clone())
         );
         assert_eq!(
-            state.reconcile(Some(prompt), SessionStatus::NeedsInput, true),
+            state.reconcile(Some(prompt), SessionStatus::NeedsInput),
             None
         );
-        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle),
+            Some(Notification::TurnComplete { response: None })
+        );
     }
 
     #[test_case(Focus::Focused, false ; "watching_user_already_saw_the_turn_end")]
@@ -2363,5 +2404,18 @@ mod tests {
 
         let text = preamble.iter().map(Message::user_text).collect::<Vec<_>>();
         assert_eq!(text, [Some(SHELL_RESULT), Some(OBSERVATION)]);
+    }
+
+    /// A turn that moved a call out is not over for the user: the session
+    /// picker keeps its spinner until the task ends, with no "finished"
+    /// flash in between.
+    #[test]
+    fn a_session_stays_working_while_its_background_task_runs() {
+        let (mut app, _buf) = app_with_moved_call();
+        end_turn(&mut app);
+        assert_eq!(SessionStatus::of(&app), SessionStatus::Working);
+
+        app.end_task(MOVED_ID, BackgroundOutcome::Done);
+        assert_eq!(SessionStatus::of(&app), SessionStatus::Idle);
     }
 }

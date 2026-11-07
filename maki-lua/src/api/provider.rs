@@ -16,12 +16,14 @@ use maki_storage::auth::{
     delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
 };
 use mlua::{
-    Function, Lua, LuaSerdeExt, MetaMethod, MultiValue, RegistryKey, Result as LuaResult, Table,
-    UserData, UserDataMethods, Value as LuaValue,
+    Function, Lua, LuaSerdeExt, LuaString, MetaMethod, MultiValue, RegistryKey,
+    Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::task::spawn_blocking;
+use tokio::time::timeout;
 
 use crate::api::Owner;
 use crate::api::net::{self, NetError, ResponseData};
@@ -247,13 +249,9 @@ where
                 .map_err(|_| AgentError::Channel)?;
             let answered = async { answer.recv_async().await.map_err(|_| AgentError::Channel) };
             let value = match self.timeout {
-                Some(limit) => {
-                    futures_lite::future::or(answered, async {
-                        smol::Timer::after(limit).await;
-                        Err(self.timed_out(limit))
-                    })
-                    .await?
-                }
+                Some(limit) => timeout(limit, answered)
+                    .await
+                    .unwrap_or_else(|_| Err(self.timed_out(limit)))?,
                 None => answered.await?,
             };
             value.map_err(|failure| match failure {
@@ -493,8 +491,7 @@ async fn fetch_json(
     } = net::provider_get(url, headers, egress)
         .await
         .map_err(|error| match error {
-            NetError::Transport(error) => AgentError::Http(error),
-            NetError::Read(error) => AgentError::Io(error),
+            NetError::Transport(error) | NetError::Read(error) => AgentError::from(error),
             NetError::Refused(message) => AgentError::Config {
                 message: format!("{GET_JSON} {url}: {message}"),
             },
@@ -506,9 +503,13 @@ async fn fetch_json(
                 .find(|(key, _)| key.eq_ignore_ascii_case(name))
                 .map(|(_, value)| value.as_str())
         };
-        return Err(AgentError::from_parts(status, header, body));
+        return Err(AgentError::from_parts(
+            status,
+            header,
+            String::from_utf8_lossy(&body).into_owned(),
+        ));
     }
-    Ok(serde_json::from_str(&body)?)
+    Ok(serde_json::from_slice(&body)?)
 }
 
 /// What a login or logout adds to `ctx`. Stdio, because the one caller is the
@@ -527,7 +528,9 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
         lua.create_async_function(|_, opts: Table| async move {
             let label: String = opts.get("label").unwrap_or_default();
             let secret = opts.opt::<bool>("secret")?.unwrap_or(false);
-            Ok(smol::unblock(move || read_answer(&label, secret)).await)
+            spawn_blocking(move || read_answer(&label, secret))
+                .await
+                .map_err(mlua::Error::external)
         })?,
     )?;
     ctx.set(
@@ -907,7 +910,7 @@ fn hook_slot(name: &str) -> Option<HookSlot> {
 fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
     let malformed = |e: mlua::Error| mlua::Error::runtime(format!("{HTTP_ERROR}: {e}"));
     let status: u16 = res.get(STATUS_FIELD).map_err(malformed)?;
-    let body: String = res.get(BODY_FIELD).map_err(malformed)?;
+    let body: LuaString = res.get(BODY_FIELD).map_err(malformed)?;
     let headers: HashMap<String, String> = res
         .opt::<HashMap<String, String>>(HEADERS)
         .map_err(malformed)?
@@ -918,7 +921,7 @@ fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
     Ok(ProviderError(AgentError::from_parts(
         status,
         |name| headers.get(name).map(String::as_str),
-        body,
+        body.to_string_lossy(),
     )))
 }
 
@@ -955,12 +958,14 @@ async fn write_credentials(
     slug: String,
     write: impl FnOnce(&StateDir, &str) -> Result<(), String> + Send + 'static,
 ) -> Result<(), String> {
-    smol::unblock(move || {
+    spawn_blocking(move || {
         let dir = StateDir::resolve().map_err(|e| e.to_string())?;
         let _lock = lock_credentials(&dir, &slug);
         write(&dir, &slug)
     })
     .await
+    .map_err(|e| e.to_string())
+    .flatten()
 }
 
 /// Store credentials for one of this plugin's providers, replacing what was
@@ -1102,6 +1107,8 @@ mod tests {
     const TRANSPORT_HEADER: &str = "Host";
     const BAD_HEADER: &str = "bad header";
     const FAILED_BODY: &str = r#"{"error":{"message":"slow down"}}"#;
+    const BINARY_ERROR_BODY: &[u8] = b"bad\xff\0response";
+    const BINARY_ERROR_TEXT: &str = "bad\u{fffd}\0response";
     const RETRY_AFTER: &str = "Retry-After";
     const RETRY_AFTER_SECS: &str = "7";
     const UNAUTHORIZED: u16 = 401;
@@ -1191,27 +1198,30 @@ mod tests {
 
     /// A bare name would silently glue onto the origin's last segment, so it
     /// is refused as the programmer error it is.
-    #[test]
-    fn get_json_refuses_a_target_that_is_neither_a_path_nor_a_url() {
+    #[tokio::test]
+    async fn get_json_refuses_a_target_that_is_neither_a_path_nor_a_url() {
         let lua = Lua::new();
         let ctx = hook_ctx(&lua, &keys_from(&lua, []), false).unwrap();
         let get_json: Function = ctx.get(GET_JSON).unwrap();
 
-        let error = smol::block_on(get_json.call_async::<LuaValue>(RELATIVE_TARGET)).unwrap_err();
+        let error = get_json
+            .call_async::<LuaValue>(RELATIVE_TARGET)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains(RELATIVE_TARGET), "{error}");
     }
 
     /// A slug with no origin is a state the plugin can report, so it comes
     /// back as an error to return rather than raised.
-    #[test]
-    fn get_json_without_an_origin_answers_with_an_error() {
+    #[tokio::test]
+    async fn get_json_without_an_origin_answers_with_an_error() {
         let lua = Lua::new();
         let ctx = hook_ctx(&lua, &keys_from(&lua, []), false).unwrap();
         let get_json: Function = ctx.get(GET_JSON).unwrap();
 
         let (value, error): (LuaValue, AnyUserData) =
-            smol::block_on(get_json.call_async(PATH_TARGET)).unwrap();
+            get_json.call_async(PATH_TARGET).await.unwrap();
 
         assert!(value.is_nil());
         let ProviderError(error) = error.take().unwrap();
@@ -1226,8 +1236,8 @@ mod tests {
     /// nil key is an absent key, so without the template the fields the hook
     /// never looked at would come back deleted, silently, and only for the
     /// bodies that happen to carry a null.
-    #[test]
-    fn a_body_a_hook_handed_back_keeps_the_fields_it_never_touched() {
+    #[tokio::test]
+    async fn a_body_a_hook_handed_back_keeps_the_fields_it_never_touched() {
         const EDITED_FIELD: &str = "thinking";
         const KEPT_NULL_FIELD: &str = "tool_choice";
 
@@ -1246,7 +1256,7 @@ mod tests {
             MODEL_FIELD: "m-1",
         });
 
-        let returned = smol::block_on(run_hook(&lua, &hooks, HookSlot::BuildBody, payload));
+        let returned = run_hook(&lua, &hooks, HookSlot::BuildBody, payload).await;
         let body: Value = decode(&lua, returned.unwrap()).unwrap();
 
         assert_eq!(
@@ -1298,7 +1308,7 @@ mod tests {
     /// Runs `source`, which evaluates to a function, as a `fetch_usage` hook
     /// through the whole bridge: [`LuaHook::call`] on the caller's side, the
     /// host's [`run_hook`] on the other.
-    fn call_usage_hook(source: &str) -> Result<Option<ProviderUsage>, AgentError> {
+    async fn call_usage_hook(source: &str) -> Result<Option<ProviderUsage>, AgentError> {
         let lua = provider_lua(true);
         let func: Function = lua.load(source).eval().unwrap();
         let (requests, served) = flume::unbounded();
@@ -1323,37 +1333,51 @@ mod tests {
             };
             answer(&lua, run_hook(&lua, &hook, slot, payload).await);
         };
-        smol::block_on(futures_lite::future::zip(bridge.call(()), host)).0
+        tokio::join!(bridge.call(()), host).0
     }
 
     /// The header is spelled `Retry-After`, the way servers send it, to show
     /// that `http_error` still finds it.
     #[test_case(UNAUTHORIZED, None ; "unauthorized")]
     #[test_case(RATE_LIMITED, Some(RETRY_AFTER_SECS) ; "rate_limited_with_retry_after")]
-    fn a_returned_http_error_is_the_native_error(status: u16, retry_after: Option<&str>) {
+    #[tokio::test]
+    async fn a_returned_http_error_is_the_native_error(status: u16, retry_after: Option<&str>) {
         let source = format!(
             "return function() return nil, provider.http_error({}) end",
             lua_response(status, retry_after)
         );
 
-        let error = call_usage_hook(&source).unwrap_err();
+        let error = call_usage_hook(&source).await.unwrap_err();
 
         assert_same_error(&error, &native_error(status, retry_after));
     }
 
-    /// Only our own userdata is a reported failure. A string beside a nil means
-    /// what it always did: the nil is the answer, and a nil usage shows nothing.
     #[test]
-    fn a_returned_string_error_is_not_a_reported_failure() {
-        let source = format!(r#"return function() return nil, "{HOOK_ERROR}" end"#);
-        assert!(call_usage_hook(&source).unwrap().is_none());
+    fn binary_http_error_body_is_decoded_lossily() {
+        let lua = Lua::new();
+        let response = lua.create_table().unwrap();
+        response.set(STATUS_FIELD, RATE_LIMITED).unwrap();
+        response
+            .set(BODY_FIELD, lua.create_string(BINARY_ERROR_BODY).unwrap())
+            .unwrap();
+        let ProviderError(error) = http_error(&lua, response).unwrap();
+        let expected = AgentError::from_parts(RATE_LIMITED, |_| None, BINARY_ERROR_TEXT.into());
+        assert_same_error(&error, &expected);
     }
 
-    #[test]
-    fn a_raised_error_is_still_a_broken_hook() {
+    /// Only our own userdata is a reported failure. A string beside a nil means
+    /// what it always did: the nil is the answer, and a nil usage shows nothing.
+    #[tokio::test]
+    async fn a_returned_string_error_is_not_a_reported_failure() {
+        let source = format!(r#"return function() return nil, "{HOOK_ERROR}" end"#);
+        assert!(call_usage_hook(&source).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_raised_error_is_still_a_broken_hook() {
         let source = format!(r#"return function() error("{HOOK_ERROR}") end"#);
 
-        let error = call_usage_hook(&source).unwrap_err();
+        let error = call_usage_hook(&source).await.unwrap_err();
 
         assert!(
             matches!(&error, AgentError::Config { message } if message.contains(HOOK_ERROR)),

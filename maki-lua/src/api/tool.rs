@@ -14,12 +14,13 @@ use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
     ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
+    AgentEvent, BufferSnapshot, CallScope, ImageMediaType, ImageSource, SharedBuf, TextOutput,
+    ToolOutput,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -28,6 +29,7 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use tokio::time::sleep;
 
 use crate::api::image::LuaImage;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -152,21 +154,56 @@ impl ToolPermission<PermissionScopeSpec> {
     }
 }
 
-pub(crate) struct PendingTool {
+const NEEDS_BACKGROUND_KEY: &str = "needs_background";
+
+/// What a tool offers only to a session whose model can move a call to the
+/// background itself.
+#[derive(Clone, Default)]
+pub(crate) struct BackgroundOnly {
+    pub(crate) tool: bool,
+    pub(crate) params: Vec<String>,
+}
+
+impl BackgroundOnly {
+    fn from_spec(spec: &Table, schema: &Value) -> LuaResult<Self> {
+        let params = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, param)| param.get(NEEDS_BACKGROUND_KEY) == Some(&Value::Bool(true)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        Ok(Self {
+            tool: spec_opt(spec, NEEDS_BACKGROUND_KEY, "a boolean")?.unwrap_or(false),
+            params,
+        })
+    }
+}
+
+/// What `register_tool` declared, carried unchanged from the pending entry
+/// into the registered tool.
+#[derive(Clone)]
+pub(crate) struct ToolMeta {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
+    pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) start_annotation: Option<StartAnnotation>,
+    pub(crate) examples: Option<Value>,
+    pub(crate) background_only: BackgroundOnly,
+}
+
+pub(crate) struct PendingTool {
+    pub(crate) meta: ToolMeta,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) start_key: Option<RegistryKey>,
     pub(crate) permission: Option<ToolPermission<PermissionScopeSpec>>,
-    pub(crate) mutable_path_field: Option<Arc<str>>,
-    pub(crate) timeout: Option<Duration>,
-    pub(crate) start_annotation: Option<StartAnnotation>,
-    pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
 }
 
@@ -206,37 +243,29 @@ pub(crate) struct PendingRule {
 pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
 
 pub(crate) struct LuaTool {
-    pub(crate) name: Arc<str>,
-    pub(crate) description: String,
-    pub(crate) schema: &'static ParamSchema,
-    pub(crate) audience: ToolAudience,
-    pub(crate) kind: Option<Arc<str>>,
+    pub(crate) meta: ToolMeta,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
     pub(crate) permission: Option<ToolPermission<PermissionScopeKind>>,
-    pub(crate) mutable_path_field: Option<Arc<str>>,
-    pub(crate) timeout: Option<Duration>,
-    pub(crate) start_annotation: Option<StartAnnotation>,
-    pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
 }
 
 impl Tool for LuaTool {
     fn name(&self) -> &str {
-        &self.name
+        &self.meta.name
     }
 
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
         if !self.has_describe_fn {
-            return Cow::Borrowed(&self.description);
+            return Cow::Borrowed(&self.meta.description);
         }
         let dctx = dctx_json(ctx);
-        if let Some(result) = local_describe(&self.plugin, &self.name, &dctx) {
+        if let Some(result) = local_describe(&self.plugin, &self.meta.name, &dctx) {
             return match result {
                 Some(s) => Cow::Owned(s),
-                None => Cow::Borrowed(&self.description),
+                None => Cow::Borrowed(&self.meta.description),
             };
         }
         let (reply_tx, reply_rx) = flume::bounded(1);
@@ -244,7 +273,7 @@ impl Tool for LuaTool {
             .tx
             .send(Request::Describe {
                 plugin: Arc::clone(&self.plugin),
-                tool: Arc::clone(&self.name),
+                tool: Arc::clone(&self.meta.name),
                 dctx,
                 reply: reply_tx,
             })
@@ -254,29 +283,45 @@ impl Tool for LuaTool {
                 Ok(Some(s)) => return Cow::Owned(s),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(
-                    tool = %self.name,
+                    tool = %self.meta.name,
                     error = %e,
                     "describe round trip failed; falling back to static description"
                 ),
             }
         }
-        Cow::Borrowed(&self.description)
+        Cow::Borrowed(&self.meta.description)
     }
 
     fn schema(&self) -> Value {
-        to_json_schema(self.schema)
+        to_json_schema(self.meta.schema)
+    }
+
+    fn offered_schema(&self, background: bool) -> Option<Value> {
+        if background {
+            return Some(self.schema());
+        }
+        if self.meta.background_only.tool {
+            return None;
+        }
+        let mut schema = self.schema();
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            for param in &self.meta.background_only.params {
+                properties.remove(param);
+            }
+        }
+        Some(schema)
     }
 
     fn audience(&self) -> ToolAudience {
-        self.audience
+        self.meta.audience
     }
 
     fn tool_kind(&self) -> Option<&str> {
-        self.kind.as_deref()
+        self.meta.kind.as_deref()
     }
 
     fn examples(&self) -> Option<Value> {
-        self.examples.clone()
+        self.meta.examples.clone()
     }
 
     fn reach(&self) -> Option<ToolReach> {
@@ -287,7 +332,7 @@ impl Tool for LuaTool {
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-        let validated = validate(self.schema, input.clone())?;
+        let validated = validate(self.meta.schema, input.clone())?;
         let permission_state = match self.permission.as_ref().and_then(|p| p.scopes.as_ref()) {
             Some(PermissionScopeKind::Field(field)) => {
                 let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
@@ -300,16 +345,16 @@ impl Tool for LuaTool {
             None => PermissionState::Ready(None),
         };
         Ok(Box::new(LuaToolInvocation {
-            tool: Arc::clone(&self.name),
+            tool: Arc::clone(&self.meta.name),
             plugin: Arc::clone(&self.plugin),
             has_header_fn: self.has_header_fn,
             has_start_fn: self.has_start_fn,
             input: validated,
             tx: self.tx.clone(),
             permission_state,
-            mutable_path_field: self.mutable_path_field.clone(),
-            timeout: self.timeout,
-            start_annotation: self.start_annotation.clone(),
+            mutable_path_field: self.meta.mutable_path_field.clone(),
+            timeout: self.meta.timeout,
+            start_annotation: self.meta.start_annotation.clone(),
         }))
     }
 }
@@ -497,14 +542,13 @@ impl ToolInvocation for LuaToolInvocation {
             }
 
             let recv = async { Some(reply_rx.recv_async().await) };
+            let call = ctx.call.as_deref();
+            let own_call = call.is_some_and(|call| ctx.tool_use_id.as_deref() == Some(call.id()));
             let result = match effective_secs {
-                Some(secs) => {
-                    futures_lite::future::race(recv, async move {
-                        smol::Timer::after(Duration::from_secs(secs)).await;
-                        None
-                    })
-                    .await
-                }
+                Some(secs) => tokio::select! {
+                    reply = recv => reply,
+                    () = backstop(Duration::from_secs(secs), call, own_call) => None,
+                },
                 None => recv.await,
             };
 
@@ -517,9 +561,9 @@ impl ToolInvocation for LuaToolInvocation {
                 ))
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
-                Some(Ok(reply)) => {
+                Some(Ok(mut reply)) => {
                     if let Some(ref id) = ctx.tool_use_id {
-                        if let Some(live_buf) = reply.live_buf {
+                        if let Some(live_buf) = reply.live_buf.take() {
                             crate::runtime::send_render_event(
                                 &ctx.event_tx,
                                 id,
@@ -531,42 +575,50 @@ impl ToolInvocation for LuaToolInvocation {
                             );
                         }
                         crate::runtime::RestoreReply {
-                            body: reply.snapshot,
-                            header: reply.header,
+                            body: reply.snapshot.take(),
+                            header: reply.header.take(),
                         }
                         .emit(id, None, &ctx.event_tx);
                     }
-                    let format = reply.format;
-                    let image = reply.image;
-                    let state = reply.state;
-                    ToolExecResult {
-                        output: reply.result.map(|s| {
-                            if let Some(source) = image {
-                                ToolOutput::Image { source, text: s }
-                            } else if let Some(diff) = reply.diff {
-                                ToolOutput::Diff {
-                                    summary: s,
-                                    path: diff.path,
-                                    before: diff.before,
-                                    after: diff.after,
-                                }
-                            } else {
-                                let inner = TextOutput {
-                                    state,
-                                    ..TextOutput::from(s)
-                                };
-                                match format {
-                                    LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
-                                    LuaOutputFormat::Plain => ToolOutput::Plain(inner),
-                                }
-                            }
-                        }),
-                        annotation: reply.annotation,
-                        written_path: reply.written_path,
-                    }
+                    reply.into_exec_result()
                 }
             }
         })
+    }
+}
+
+/// Ends the wait after {timeout}, unless {call} moved to the background
+/// first. A moved call, and every call nested in it, runs until its work ends
+/// or someone stops it.
+///
+/// A move and the timeout can land at the same moment. For the model call
+/// itself ({own_call}) the timeout ends the call through the same trigger a
+/// move claims, so only one wins: the receipt is the reply, or the move finds
+/// the call already ended.
+async fn backstop(timeout: Duration, call: Option<&CallScope>, own_call: bool) {
+    let Some(call) = call else {
+        sleep(timeout).await;
+        return;
+    };
+    let lapsed = async {
+        sleep(timeout).await;
+        if own_call {
+            call.end()
+        } else {
+            call.home().is_none()
+        }
+    };
+    let moved = async {
+        call.moved().await;
+        false
+    };
+    let ended = tokio::select! {
+        biased;
+        ended = lapsed => ended,
+        ended = moved => ended,
+    };
+    if !ended {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -698,6 +750,7 @@ fn register_prompt(
 /// to decide when to use the tool), a JSON Schema for the input, and a handler
 /// function. The handler receives `(input, ctx)` and returns either a plain
 /// string or a table with richer output fields.
+/// Invalid UTF-8 in the returned text becomes U+FFFD.
 ///
 /// `ctx:output_mode()` returns "compact" when the result goes to the model and
 /// "full" when code such as `code_execution` made the call. Apply output limits
@@ -733,6 +786,7 @@ fn register_prompt(
 ///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
+///   needs_background (boolean) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
 /// @return
 /// @example
 /// maki.api.register_tool({
@@ -1175,8 +1229,11 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// `server__tool` shaped name resolves whether or not a server offers it,
 /// so this is not an existence check for MCP tools.
 ///
+/// `background_params` lists the parameters marked `needs_background`,
+/// which only a session that can move calls to the background sees.
+///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore?, format? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
 /// @example
 /// local t = maki.api.get_tool("bash")
 /// if t then
@@ -1253,14 +1310,7 @@ fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
     };
     let t = lua.create_table()?;
     t.set("name", name.as_str())?;
-    t.set(
-        "format",
-        if view.markdown {
-            LUA_FORMAT_MARKDOWN
-        } else {
-            LUA_FORMAT_PLAIN
-        },
-    )?;
+    t.set("format", format_name(view.markdown))?;
     let summary = {
         let name = name.clone();
         lua.create_function(move |lua, input: LuaValue| {
@@ -1274,13 +1324,33 @@ fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
 
 fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     let t = lua.create_table()?;
+    let schema = entry.tool.schema();
     t.set("name", entry.name())?;
-    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+    t.set("schema", json_to_lua(lua, &schema)?)?;
     t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
     }
+    let background_params = background_params(&schema, entry.tool.offered_schema(false));
+    if !background_params.is_empty() {
+        t.set("background_params", background_params)?;
+    }
     Ok(t)
+}
+
+/// The parameters `schema` has and `offered`, the schema a session without
+/// background moves gets, leaves out. A tool that such a session never sees
+/// has none, since the whole tool is the condition.
+fn background_params(schema: &Value, offered: Option<Value>) -> Vec<String> {
+    let properties = |schema: &Value| schema.get("properties").and_then(Value::as_object).cloned();
+    let (Some(all), Some(offered)) = (properties(schema), offered.as_ref().and_then(properties))
+    else {
+        return Vec::new();
+    };
+    all.keys()
+        .filter(|name| !offered.contains_key(*name))
+        .cloned()
+        .collect()
 }
 
 /// Async so wrapped fns can yield (e.g. bash restore highlights inline).
@@ -1625,6 +1695,7 @@ fn register_tool_from_lua(
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences, ToolAudience::default())?;
+    let background_only = BackgroundOnly::from_spec(spec, &schema_val)?;
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1653,20 +1724,23 @@ fn register_tool_from_lua(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(PendingTool {
-            name,
-            description,
-            schema: param_schema,
-            audience,
-            kind,
+            meta: ToolMeta {
+                name,
+                description,
+                schema: param_schema,
+                audience,
+                kind,
+                mutable_path_field,
+                timeout,
+                start_annotation,
+                examples,
+                background_only,
+            },
             handler_key,
             header_key,
             restore_key,
             start_key,
             permission,
-            mutable_path_field,
-            timeout,
-            start_annotation,
-            examples,
             describe_key,
         });
 
@@ -1773,9 +1847,53 @@ pub(crate) struct ToolCallReply {
     /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
+    /// Set when `result` is the receipt of a call that moved to the
+    /// background.
+    pub moved: Option<MovedCall>,
 }
 
 impl ToolCallReply {
+    pub(crate) fn into_exec_result(self) -> ToolExecResult {
+        let Self {
+            result,
+            format,
+            annotation,
+            written_path,
+            diff,
+            image,
+            state,
+            moved,
+            ..
+        } = self;
+        let output = result.map(|s| {
+            if let Some(source) = image {
+                ToolOutput::Image { source, text: s }
+            } else if let Some(diff) = diff {
+                ToolOutput::Diff {
+                    summary: s,
+                    path: diff.path,
+                    before: diff.before,
+                    after: diff.after,
+                }
+            } else {
+                let inner = TextOutput {
+                    state,
+                    ..TextOutput::from(s)
+                };
+                match format {
+                    LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
+                    LuaOutputFormat::Plain => ToolOutput::Plain(inner),
+                }
+            }
+        });
+        ToolExecResult {
+            output,
+            annotation,
+            written_path,
+            moved,
+        }
+    }
+
     pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
         let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
@@ -1820,6 +1938,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
+            moved: None,
         }
     }
 
@@ -1852,6 +1971,7 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
+            moved: None,
         }
     }
 
@@ -1860,7 +1980,15 @@ impl ToolCallReply {
     }
 }
 
-fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
+pub(crate) fn format_name(markdown: bool) -> &'static str {
+    if markdown {
+        LUA_FORMAT_MARKDOWN
+    } else {
+        LUA_FORMAT_PLAIN
+    }
+}
+
+pub(crate) fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
     let Ok(LuaValue::String(s)) = t.get::<LuaValue>("format") else {
         return LuaOutputFormat::default();
     };
@@ -1916,11 +2044,11 @@ fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
 
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     match result {
-        LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
+        LuaValue::String(s) => Ok(s.to_string_lossy()),
         LuaValue::Table(t) => {
             let output = t.get::<LuaValue>("llm_output").ok().and_then(|v| {
                 if let LuaValue::String(s) = v {
-                    s.to_str().ok().map(|s| s.to_owned())
+                    Some(s.to_string_lossy())
                 } else {
                     None
                 }
@@ -1940,6 +2068,26 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{call_scope, moved_home};
+    use crate::runtime::wake_or_fail;
+    use tokio::task::yield_now;
+
+    const BACKGROUND_PARAM: &str = "background";
+
+    #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {} } })), &[BACKGROUND_PARAM] ; "a_hidden_param")]
+    #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {}, "background": {} } })), &[] ; "offered_everywhere")]
+    #[test_case::test_case(None, &[] ; "a_background_only_tool")]
+    fn background_params_are_those_offered_only_for_the_background(
+        offered: Option<Value>,
+        expected: &[&str],
+    ) {
+        let schema = serde_json::json!({ "properties": { "command": {}, "background": {} } });
+
+        assert_eq!(background_params(&schema, offered), expected);
+    }
+
+    const LEGACY_TEXT: &[u8] = b"caf\xe9";
+    const DISPLAY_TEXT: &str = "caf\u{fffd}";
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
@@ -2070,11 +2218,18 @@ mod tests {
         .unwrap();
         let (tx, _rx) = flume::unbounded();
         LuaTool {
-            name: Arc::from("test_tool"),
-            description: "test".into(),
-            schema,
-            audience: ToolAudience::default(),
-            kind: None,
+            meta: ToolMeta {
+                name: Arc::from("test_tool"),
+                description: "test".into(),
+                schema,
+                audience: ToolAudience::default(),
+                kind: None,
+                mutable_path_field: None,
+                timeout: Some(Duration::from_secs(60)),
+                start_annotation: None,
+                examples: None,
+                background_only: BackgroundOnly::default(),
+            },
             tx,
             plugin: Arc::from("test"),
             has_header_fn: false,
@@ -2082,22 +2237,18 @@ mod tests {
                 permission: Permission::FsWrite,
                 scopes: Some(scopes),
             }),
-            mutable_path_field: None,
-            timeout: Some(Duration::from_secs(60)),
-            start_annotation: None,
             has_start_fn: false,
-            examples: None,
             has_describe_fn: false,
         }
     }
 
-    #[test]
-    fn permission_scope_extracted_at_parse_time() {
+    #[tokio::test]
+    async fn permission_scope_extracted_at_parse_time() {
         let tool = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("url"))));
         let inv = tool
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        let scopes = smol::block_on(inv.permission_scopes());
+        let scopes = inv.permission_scopes().await;
         assert_eq!(
             scopes.unwrap().scopes,
             vec!["https://example.com".to_string()]
@@ -2106,29 +2257,44 @@ mod tests {
 
     #[test_case::test_case("format" ; "absent_field")]
     #[test_case::test_case("count" ; "non_string_field")]
-    fn permission_scope_field_invalid_forces_prompt(field: &str) {
+    #[tokio::test]
+    async fn permission_scope_field_invalid_forces_prompt(field: &str) {
         let input = serde_json::json!({"url": "https://example.com", "count": 42});
         let inv = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from(field))))
             .parse(&input)
             .unwrap();
-        let scopes = smol::block_on(inv.permission_scopes()).expect("should fail closed");
+        let scopes = inv.permission_scopes().await.expect("should fail closed");
         assert!(scopes.force_prompt);
         assert_eq!(scopes.scopes, vec![input.to_string()]);
     }
 
-    #[test]
-    fn permission_scope_none_when_unconfigured() {
+    #[tokio::test]
+    async fn permission_scope_none_when_unconfigured() {
         let unconfigured = make_lua_tool(None)
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        assert!(smol::block_on(unconfigured.permission_scopes()).is_none());
+        assert!(unconfigured.permission_scopes().await.is_none());
+    }
+
+    #[test_case::test_case(b"hello", "hello" ; "utf8")]
+    #[test_case::test_case(LEGACY_TEXT, DISPLAY_TEXT ; "non_utf8")]
+    fn coerce_string_returns_ok(input: &[u8], expected: &str) {
+        let lua = Lua::new();
+        let val = LuaValue::String(lua.create_string(input).unwrap());
+        assert_eq!(coerce_tool_result(&val).as_deref(), Ok(expected));
     }
 
     #[test]
-    fn coerce_string_returns_ok() {
+    fn coerce_table_decodes_invalid_utf8() {
         let lua = Lua::new();
-        let val = LuaValue::String(lua.create_string("hello").unwrap());
-        assert_eq!(coerce_tool_result(&val), Ok("hello".to_string()));
+        let result = lua.create_table().unwrap();
+        result
+            .set("llm_output", lua.create_string(LEGACY_TEXT).unwrap())
+            .unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(result)).as_deref(),
+            Ok(DISPLAY_TEXT)
+        );
     }
 
     #[test]
@@ -2174,8 +2340,8 @@ mod tests {
         assert_eq!(extract_format(&t), LuaOutputFormat::Plain);
     }
 
-    #[test]
-    fn needs_compute_fallback_on_failure() {
+    #[tokio::test]
+    async fn needs_compute_fallback_on_failure() {
         // Closed channel → fallback to force_prompt
         let (tx, rx) = flume::bounded(0);
         drop(rx);
@@ -2191,7 +2357,7 @@ mod tests {
             start_annotation: None,
             has_start_fn: false,
         };
-        let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
+        let scopes = inv.permission_scopes().await.expect("should fallback");
         assert!(scopes.force_prompt);
         assert!(!scopes.scopes.is_empty());
 
@@ -2214,12 +2380,12 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let scopes2 = smol::block_on(inv2.permission_scopes()).expect("should fallback");
+        let scopes2 = inv2.permission_scopes().await.expect("should fallback");
         assert!(scopes2.force_prompt);
     }
 
-    #[test]
-    fn needs_compute_returns_callback_result() {
+    #[tokio::test]
+    async fn needs_compute_returns_callback_result() {
         let (tx, rx) = flume::bounded(1);
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
@@ -2241,7 +2407,7 @@ mod tests {
                 }));
             }
         });
-        let result = smol::block_on(inv.permission_scopes());
+        let result = inv.permission_scopes().await;
         let scopes = result.unwrap();
         assert_eq!(scopes.scopes, vec!["cargo", "test"]);
         assert!(!scopes.force_prompt);
@@ -2415,13 +2581,42 @@ mod tests {
         assert_eq!(inv.start_annotation(), expected.map(String::from));
     }
 
-    #[test]
-    fn start_without_tool_use_id_is_noop() {
+    #[tokio::test]
+    async fn start_without_tool_use_id_is_noop() {
         let inv = LuaToolInvocation {
             has_start_fn: true,
             ..invocation(serde_json::json!({"code": "x"}))
         };
         let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-        smol::block_on(inv.start(&ctx));
+        inv.start(&ctx).await;
+    }
+
+    /// Once the timeout ended the model call, a move landing late finds
+    /// nothing to move, so the two never both answer it.
+    #[test_case::test_case(true ; "own_call")]
+    #[test_case::test_case(false ; "nested_call")]
+    #[tokio::test]
+    async fn the_backstop_fires_for_a_call_still_in_the_foreground(own_call: bool) {
+        let (call, _run, _task) = call_scope(false);
+        wake_or_fail(backstop(Duration::ZERO, Some(&*call), own_call)).await;
+        assert_eq!(call.cancel().is_cancelled(), own_call);
+        assert_eq!(call.move_to(moved_home()).is_err(), own_call);
+    }
+
+    /// A bash nested in a moved batch would otherwise die at its own timeout.
+    #[test_case::test_case(true ; "own_call")]
+    #[test_case::test_case(false ; "nested_call")]
+    #[tokio::test]
+    async fn the_backstop_never_fires_once_the_call_moved(own_call: bool) {
+        let (call, _run, _task) = call_scope(true);
+        let fired = wake_or_fail(async {
+            tokio::select! {
+                biased;
+                () = backstop(Duration::ZERO, Some(&*call), own_call) => true,
+                () = yield_now() => false,
+            }
+        })
+        .await;
+        assert!(!fired);
     }
 }

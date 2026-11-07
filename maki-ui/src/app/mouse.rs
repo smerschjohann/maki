@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
 use crate::clipboard::{self, CopyResult};
+use crate::components::messages::ClickOutcome;
+use crate::components::scrollbar::Thumbs;
 use crate::selection::{
     self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
     SelectionZone,
@@ -13,7 +15,7 @@ use crate::image;
 use crate::repaint::Dirty;
 
 use super::image_paste::{spawn_read, take_ready};
-use super::{App, InputWriter, Msg};
+use super::{App, InputWriter, MAIN_CHAT, Msg};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -26,8 +28,13 @@ impl App {
             // plain button event, so the selection is read back and routed
             // like a bracketed paste.
             MouseEventKind::Down(MouseButton::Middle) => {
-                self.primary_paste_rx
+                self.mouse_paste_rx
                     .push(spawn_read(clipboard::read_primary_selection));
+            }
+            // Windows consoles paste on right-click, but mouse capture eats
+            // that click, so we read the clipboard ourselves.
+            MouseEventKind::Down(MouseButton::Right) if cfg!(windows) => {
+                self.mouse_paste_rx.push(spawn_read(clipboard::read_text));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
@@ -58,8 +65,7 @@ impl App {
                         let zone = sel.zone;
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
-                            let area = self.msg_area();
-                            self.chats[self.active_chat].handle_click(event.row, area);
+                            self.click_messages(event.row, event.column);
                         }
                     }
                 }
@@ -68,11 +74,43 @@ impl App {
         }
     }
 
+    /// A moved row whose task tab was deleted, or never restored, has no task
+    /// to open, so it takes the click any row would.
+    fn click_messages(&mut self, row: u16, col: u16) {
+        let area = self.msg_area();
+        let chat = self.active_chat;
+        let outcome = self.chats[chat].handle_click(row, col, area);
+        let outcome = match outcome {
+            ClickOutcome::OpenTask(id) if self.chat_of_task(&id).is_err() => {
+                self.chats[chat].toggle_click(row, area)
+            }
+            outcome => outcome,
+        };
+        self.handle_click_outcome(outcome);
+    }
+
+    pub(super) fn handle_click_outcome(&mut self, outcome: ClickOutcome) {
+        match outcome {
+            ClickOutcome::OpenTask(id) => {
+                if let Err(e) = self.focus_task(&id) {
+                    self.flash(e);
+                }
+            }
+            ClickOutcome::MoveCall(id) => {
+                self.move_to_background(Some(&id));
+            }
+            ClickOutcome::Handled | ClickOutcome::None => {}
+        }
+    }
+
     /// What the chat input does with a paste no one else took: a line that is
     /// an image path attaches the image, otherwise the text goes in.
     pub(super) fn builtin_paste(&mut self, text: &str) {
+        // A finished tab has no input box, so the paste goes to the main
+        // chat, the way typed keys do.
         if !self.chat_accepts_input() {
-            return;
+            self.last_esc = None;
+            self.set_active_chat(MAIN_CHAT);
         }
         let mut any_image = false;
         for line in text.lines() {
@@ -86,12 +124,11 @@ impl App {
         }
     }
 
-    /// The selection is read in the background, so it comes back as a paste
-    /// typed now and waits behind any keys still held, like one from the
-    /// terminal.
-    pub fn poll_primary_paste(&mut self) -> Dirty {
+    /// The text is read in the background, so it comes back as a paste typed
+    /// now and waits behind any keys still held, like one from the terminal.
+    pub fn poll_mouse_paste(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
-        while let Some(selection) = take_ready(&mut self.primary_paste_rx) {
+        while let Some(selection) = take_ready(&mut self.mouse_paste_rx) {
             dirty = Dirty::YES;
             if let Some(text) = selection.filter(|text| !text.is_empty()) {
                 let actions = self.update(Msg::Paste(text));
@@ -235,6 +272,7 @@ impl App {
         buf: &mut ratatui::buffer::Buffer,
         sel: &Selection,
         render_chat: usize,
+        thumbs: &Thumbs,
     ) {
         let text = match sel.zone {
             SelectionZone::Messages => {
@@ -257,7 +295,7 @@ impl App {
                     area: sel.area,
                     ..Default::default()
                 }];
-                selection::extract_selected_text(buf, &screen_sel, &regions)
+                selection::extract_selected_text(&thumbs.uncovered(buf), &screen_sel, &regions)
             }
         };
 

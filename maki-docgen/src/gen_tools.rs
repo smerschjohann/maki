@@ -1,5 +1,5 @@
 use maki_agent::template::Vars;
-use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
+use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
 use maki_config::{PluginFileConfig, PluginsConfig};
 use regex::Regex;
 use serde_json::Value;
@@ -12,8 +12,11 @@ use maki_lua::{OptionType, PluginHost};
 use crate::lua_util::in_registration_window;
 
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
+/// Tools a plugin registers only when one of its boolean options is on, as
+/// (plugin, option, tool).
+const OPTION_GATED_TOOLS: &[(&str, &str, &str)] = &[("task", "allow_background", "task_message")];
 
-const SECTIONS: &[(&str, &[&str])] = &[
+pub(crate) const SECTIONS: &[(&str, &[&str])] = &[
     (
         "File Operations",
         &[
@@ -37,15 +40,17 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Agent & Knowledge",
-        &["task", "todo_write", "memory", "skill"],
+        &[
+            "task",
+            "task_stop",
+            "task_message",
+            "todo_write",
+            "memory",
+            "skill",
+        ],
     ),
     ("Web", &["webfetch", "websearch"]),
 ];
-
-struct ToolInfo {
-    def: Value,
-    source: ToolSource,
-}
 
 struct Param {
     name: String,
@@ -134,21 +139,17 @@ fn write_param_table(out: &mut String, params: &[Param]) {
     }
 }
 
-fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &HashSet<String>) {
-    let description = info
-        .def
+fn write_tool_entry(out: &mut String, name: &str, def: &Value, opt_in: &HashSet<String>) {
+    let description = def
         .get("description")
         .and_then(|d| d.as_str())
         .unwrap_or("");
-    let schema = info.def.get("input_schema").cloned().unwrap_or(Value::Null);
+    let schema = def.get("input_schema").cloned().unwrap_or(Value::Null);
     let params = extract_params(&schema);
     let summary = first_paragraph(description);
 
     writeln!(out).unwrap();
     let mut badges = String::new();
-    if matches!(info.source, ToolSource::Mcp { .. }) {
-        badges.push_str(" <span class=\"badge\">mcp</span>");
-    }
     if opt_in.contains(name) {
         badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
     }
@@ -209,27 +210,24 @@ fn write_front_matter(out: &mut String) {
     writeln!(out, "+++").unwrap();
 }
 
-fn collect_tool_info(
-    def_map: &HashMap<String, &Value>,
-    entry: &maki_agent::tools::RegisteredTool,
-) -> Option<ToolInfo> {
-    let name = entry.name();
-    let def = def_map.get(name)?;
-    Some(ToolInfo {
-        def: redact_def(def),
-        source: entry.source.clone(),
-    })
-}
-
-/// Loads every builtin with all sub-tools on, so the reference documents
-/// opt-in tools too. "Opt-in" means the plugin declares the tool as a boolean
-/// option defaulting to false, so the badge cannot drift from the defaults.
+/// Loads every builtin with all sub-tools and option-gated tools on, so the
+/// reference documents opt-in tools too. "Opt-in" means the plugin declares
+/// the tool, or the option gating it, as a boolean option defaulting to false,
+/// so the badge cannot drift from the defaults.
 fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     let mut edit = PluginFileConfig::default();
     for &sub in maki_config::EDIT_SUB_TOOLS {
         edit.opts.insert(sub.to_owned(), Value::Bool(true));
     }
-    let config = PluginsConfig::from_plugins(HashMap::from([("edit".to_owned(), edit)]));
+    let mut plugins = HashMap::from([("edit".to_owned(), edit)]);
+    for &(plugin, option, _) in OPTION_GATED_TOOLS {
+        plugins
+            .entry(plugin.to_owned())
+            .or_default()
+            .opts
+            .insert(option.to_owned(), Value::Bool(true));
+    }
+    let config = PluginsConfig::from_plugins(plugins);
 
     let registry = Arc::new(ToolRegistry::new());
     let host = in_registration_window(|| {
@@ -239,7 +237,7 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
         host
     });
 
-    let opt_in = host
+    let mut opt_in: HashSet<String> = host
         .plugin_options()
         .expect("collecting plugin options")
         .into_values()
@@ -247,6 +245,12 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
         .filter(|o| o.ty == OptionType::Boolean && o.default == Some(Value::Bool(false)))
         .map(|o| o.name)
         .collect();
+    let gated: Vec<String> = OPTION_GATED_TOOLS
+        .iter()
+        .filter(|(_, option, _)| opt_in.contains(*option))
+        .map(|(_, _, tool)| (*tool).to_owned())
+        .collect();
+    opt_in.extend(gated);
     (registry, opt_in)
 }
 
@@ -279,12 +283,10 @@ pub fn generate() -> String {
         .collect();
 
     let snapshot = registry.iter();
-    let mut tools: HashMap<&str, ToolInfo> = HashMap::new();
-    for entry in snapshot.iter() {
-        if let Some(info) = collect_tool_info(&def_map, entry) {
-            tools.insert(entry.name(), info);
-        }
-    }
+    let tools: HashMap<&str, Value> = snapshot
+        .iter()
+        .filter_map(|entry| Some((entry.name(), redact_def(def_map.get(entry.name())?))))
+        .collect();
 
     let total = tools.len();
     let mut out = String::new();
@@ -317,8 +319,8 @@ pub fn generate() -> String {
         writeln!(out).unwrap();
         writeln!(out, "## {section_name}").unwrap();
         for name in present {
-            let info = tools.get(name).expect("checked above");
-            write_tool_entry(&mut out, name, info, &opt_in);
+            let def = tools.get(name).expect("checked above");
+            write_tool_entry(&mut out, name, def, &opt_in);
             rendered.insert(name);
         }
     }
@@ -333,8 +335,8 @@ pub fn generate() -> String {
         writeln!(out).unwrap();
         writeln!(out, "## Additional tools").unwrap();
         for name in leftovers {
-            let info = tools.get(name).expect("checked above");
-            write_tool_entry(&mut out, name, info, &opt_in);
+            let def = tools.get(name).expect("checked above");
+            write_tool_entry(&mut out, name, def, &opt_in);
         }
     }
 

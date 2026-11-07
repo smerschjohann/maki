@@ -5,6 +5,7 @@ use maki_config::providers::{
     resolve_base_url, resolve_protocol,
 };
 use serde_json::{Value, json};
+use tokio::task::spawn_blocking;
 use tracing::warn;
 
 use super::ResolvedAuth;
@@ -221,13 +222,20 @@ fn model_from_def(
     // rates -- it is free at the point of use -- so fall back to the
     // published list price purely as the reference shown alongside the $0
     // bill.
-    let pricing = row.pricing.take().unwrap_or_default();
+    let declared_pricing = row.pricing.take();
+    let using_discovered_pricing = declared_pricing.is_none();
+    let discovered_pricing = discovered.and_then(|d| d.pricing.as_ref());
+    let pricing = declared_pricing
+        .or_else(|| discovered_pricing.cloned())
+        .unwrap_or_default();
     row.pricing = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
         .and_then(|base_id| catalog::model_meta_if_available(super::anthropic::SLUG, base_id))
         .and_then(|meta| meta.pricing)
         .or(Some(pricing));
     Model {
         subsidised_by: subsidy_source.map(Arc::from),
+        discovered_free: using_discovered_pricing
+            && discovered_pricing.is_some_and(ModelPricing::is_zero),
         ..row.to_model(slug, base, model_id.to_string())
     }
 }
@@ -251,6 +259,29 @@ fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
         }
     }
     specs
+}
+
+/// The declared specs, plus the providers whose list they fully describe.
+/// A `discover_models` provider is left out of the second list: its declared
+/// specs show before discovery finishes, but only a successful probe proves
+/// which models it still serves.
+pub fn declared_batch() -> (Vec<String>, Vec<String>) {
+    declared_batch_from(&ProvidersConfig::load())
+}
+
+fn declared_batch_from(config: &ProvidersConfig) -> (Vec<String>, Vec<String>) {
+    let specs = declared_specs_from(config);
+    let providers = config
+        .providers
+        .iter()
+        .filter(|(slug, def)| {
+            !def.discover_models
+                && !is_builtin_slug(slug)
+                && resolve_protocol(slug, Some(*def)).is_some()
+        })
+        .map(|(slug, _)| slug.clone())
+        .collect();
+    (specs, providers)
 }
 
 /// Models a custom provider can start on: its own `default_model`, then one
@@ -314,8 +345,10 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 /// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
 /// goes through here, so an empty `discover_models = false` provider returns
 /// nothing and never hits the network.
-pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
-    let config = ProvidersConfig::load();
+pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
+    let config = spawn_blocking(ProvidersConfig::load)
+        .await
+        .expect("providers config load panicked");
     let mut all_specs = Vec::new();
     for slug in config.providers.keys() {
         if is_builtin_slug(slug) {
@@ -331,7 +364,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         match create(slug, timeouts) {
             Ok(provider) => {
                 let slug_c = slug.clone();
-                let result = smol::block_on(provider.list_models());
+                let result = provider.list_models().await;
                 match result {
                     Ok(mut models) => {
                         overlay_declared_tiers(def, &mut models);
@@ -416,6 +449,23 @@ mod tests {
         assert_eq!(model.provider.as_ref(), "opencode");
     }
 
+    /// A `discover_models` provider's declared specs still show before its
+    /// probe lands, but the batch must not claim it answered: a failed probe
+    /// would otherwise mark its undiscovered recents retired.
+    #[test]
+    fn declared_batch_leaves_discovering_providers_out() {
+        let mut config = ProvidersConfig::default();
+        config.upsert("declared".to_string(), openai_def("small"));
+        let mut discovering = openai_def("small");
+        discovering.discover_models = true;
+        config.upsert("discovering".to_string(), discovering);
+
+        let (specs, providers) = declared_batch_from(&config);
+        assert!(specs.contains(&"declared/small".to_string()));
+        assert!(specs.contains(&"discovering/small".to_string()));
+        assert_eq!(providers, ["declared"]);
+    }
+
     #[test_case("[localai]", &[] ; "entry_without_protocol_is_skipped")]
     #[test_case("[openai]\nprotocol = \"openai\"\ndefault_model = \"openai/gpt-5\"", &[] ; "builtin_slug_is_skipped")]
     #[test_case("[local]\nprotocol = \"openai\"\ndiscover_models = true", &[] ; "protocol_default_is_never_guessed")]
@@ -460,6 +510,64 @@ mod tests {
         let model = model_from_def(&def, openai_spec(), slug, model_id);
         assert_eq!(model.context_window, expected_window);
         assert_eq!(model.max_output_tokens, Some(expected_output));
+    }
+
+    const ENDPOINT_INPUT_PRICE: f64 = 0.5;
+    const ENDPOINT_OUTPUT_PRICE: f64 = 1.5;
+    const DECLARED_INPUT_PRICE: f64 = 3.0;
+    const DECLARED_OUTPUT_PRICE: f64 = 15.0;
+
+    fn seed_discovered_pricing(slug: &str, model_id: &str, pricing: ModelPricing) {
+        crate::model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                pricing: Some(pricing),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+    }
+
+    #[test]
+    fn discovered_pricing_fills_a_model_with_no_declared_rates() {
+        let slug = "custom-discovery-pricing-test";
+        let model_id = "endpoint-priced";
+        seed_discovered_pricing(
+            slug,
+            model_id,
+            ModelPricing::per_million(ENDPOINT_INPUT_PRICE, ENDPOINT_OUTPUT_PRICE, 0.0, 0.0),
+        );
+
+        let model = model_from_def(&openai_def(model_id), openai_spec(), slug, model_id);
+        assert_eq!(model.pricing.input, ENDPOINT_INPUT_PRICE);
+        assert_eq!(model.pricing.output, ENDPOINT_OUTPUT_PRICE);
+    }
+
+    #[test]
+    fn declared_pricing_wins_over_discovered_pricing() {
+        let slug = "custom-declared-pricing-test";
+        let model_id = "declared-price-wins";
+        seed_discovered_pricing(
+            slug,
+            model_id,
+            ModelPricing::per_million(ENDPOINT_INPUT_PRICE, ENDPOINT_OUTPUT_PRICE, 0.0, 0.0),
+        );
+        let mut def = openai_def(model_id);
+        def.models[0].pricing_input = Some(DECLARED_INPUT_PRICE);
+        def.models[0].pricing_output = Some(DECLARED_OUTPUT_PRICE);
+
+        let model = model_from_def(&def, openai_spec(), slug, model_id);
+        assert_eq!(model.pricing.input, DECLARED_INPUT_PRICE);
+        assert_eq!(model.pricing.output, DECLARED_OUTPUT_PRICE);
+    }
+
+    #[test]
+    fn discovered_zero_price_marks_the_model_free() {
+        let slug = "custom-discovery-free-test";
+        let model_id = "endpoint-free";
+        seed_discovered_pricing(slug, model_id, ModelPricing::ZERO);
+
+        let model = model_from_def(&openai_def(model_id), openai_spec(), slug, model_id);
+        assert!(model.is_free());
     }
 
     #[test]
@@ -565,17 +673,19 @@ mod tests {
             }
         }
 
-        fn ask(&self) -> Result<StreamResponse, AgentError> {
+        async fn ask(&self) -> Result<StreamResponse, AgentError> {
             let (tx, _rx) = flume::unbounded();
-            smol::block_on(self.provider.stream_message(
-                &self.model,
-                &[Message::user(PROMPT.to_owned())],
-                "",
-                &json!([]),
-                &tx,
-                RequestOptions::default(),
-                None,
-            ))
+            self.provider
+                .stream_message(
+                    &self.model,
+                    &[Message::user(PROMPT.to_owned())],
+                    "",
+                    &json!([]),
+                    &tx,
+                    RequestOptions::default(),
+                    None,
+                )
+                .await
         }
 
         fn sent_thinking(&self) -> Vec<bool> {
@@ -589,32 +699,33 @@ mod tests {
     }
 
     /// #1302. The last refusal fails the test if the block ever goes out again.
-    #[test]
-    fn a_refused_default_thinking_block_is_dropped_and_remembered() {
+    #[tokio::test]
+    async fn a_refused_default_thinking_block_is_dropped_and_remembered() {
         const SCRIPT: &[Canned] = &[LITELLM_REFUSAL, ANSWER, ANSWER, LITELLM_REFUSAL];
         let gateway = Gateway::serve(Value::Null, SCRIPT);
 
-        assert!(gateway.ask().is_ok());
-        assert!(gateway.ask().is_ok());
+        assert!(gateway.ask().await.is_ok());
+        assert!(gateway.ask().await.is_ok());
         assert_eq!(gateway.sent_thinking(), [true, false, false]);
     }
 
     #[test_case(&[LITELLM_REFUSAL, UNAVAILABLE, LITELLM_REFUSAL, ANSWER] ; "replay_unavailable")]
     #[test_case(&[UNRELATED_REFUSAL, UNRELATED_REFUSAL, LITELLM_REFUSAL, ANSWER] ; "refusal_that_only_mentions_thinking")]
-    fn a_failed_replay_is_not_remembered(script: &'static [Canned]) {
+    #[tokio::test]
+    async fn a_failed_replay_is_not_remembered(script: &'static [Canned]) {
         let gateway = Gateway::serve(Value::Null, script);
 
-        assert!(gateway.ask().is_err());
-        assert!(gateway.ask().is_ok());
+        assert!(gateway.ask().await.is_err());
+        assert!(gateway.ask().await.is_ok());
         assert_eq!(gateway.sent_thinking(), [true, false, true, false]);
     }
 
-    #[test]
-    fn a_declared_thinking_block_is_never_dropped() {
+    #[tokio::test]
+    async fn a_declared_thinking_block_is_never_dropped() {
         const SCRIPT: &[Canned] = &[LITELLM_REFUSAL; 2];
         let gateway = Gateway::serve(json!({"off": {THINKING_FIELD: {"type": "off"}}}), SCRIPT);
 
-        assert!(gateway.ask().is_err());
+        assert!(gateway.ask().await.is_err());
         assert_eq!(gateway.sent_thinking(), [true]);
     }
 

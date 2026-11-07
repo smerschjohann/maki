@@ -3,9 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flume::Sender;
-use futures_lite::io::BufReader;
-use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::SessionRef;
+use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -26,7 +25,7 @@ use maki_config::providers::Protocol;
 
 pub mod auth;
 
-const SLUG: &str = "copilot";
+pub(crate) const SLUG: &str = "copilot";
 const DISPLAY_NAME: &str = "Copilot";
 const ENV_VAR: &str = "GH_COPILOT_TOKEN";
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
@@ -47,9 +46,10 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
-    adaptive_effort,
+    sends_thinking,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/copilot.toml"),
@@ -108,7 +108,7 @@ const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
 const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
 
 pub struct Copilot {
-    client: HttpClient,
+    client: Client,
     stream_timeout: Duration,
     auth: Arc<Mutex<Option<CopilotAuth>>>,
     resolved_auth: Option<Arc<Mutex<super::ResolvedAuth>>>,
@@ -176,18 +176,25 @@ impl Copilot {
 
         let models = self.fetch_models().await?;
         self.remember(models);
-        Ok(self
-            .models
-            .lock()
-            .unwrap()
+        let known = self.models.lock().unwrap();
+        known
             .get(model_id)
             .map(CopilotModel::endpoint)
-            .unwrap_or_else(|| guess_endpoint(model_id)))
+            .ok_or_else(|| {
+                let mut available = known.keys().map(String::as_str).collect::<Vec<_>>();
+                available.sort_unstable();
+                AgentError::Config {
+                    message: format!(
+                        "'{model_id}' is not enabled for this Copilot account. Available: {}",
+                        available.join(", ")
+                    ),
+                }
+            })
     }
 
-    /// Merges rather than replaces: `/models` sometimes omits a model it
-    /// served a moment ago, and forgetting it would reroute that model to
-    /// a guessed endpoint mid-session.
+    /// Merges instead of replacing. `/models` sometimes leaves out a model
+    /// it listed a moment ago, and forgetting it would make that model fail
+    /// mid-session.
     fn remember(&self, models: Vec<CopilotModel>) {
         self.models
             .lock()
@@ -198,20 +205,20 @@ impl Copilot {
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
         let auth = self.auth().await?;
         let request = copilot_request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("{}{MODELS_PATH}", auth.endpoint)),
+            self.client.get(format!("{}{MODELS_PATH}", auth.endpoint)),
             &auth,
             None,
         )
-        .body(())?;
+        .build()?;
+        let body_text = super::send_request(&self.client, request, |response| async move {
+            if !response.status().is_success() {
+                return Err(AgentError::from_response(response).await);
+            }
+            Ok(response.text().await?)
+        })
+        .await?;
 
-        let mut response = self.client.send_async(request).await?;
-        if !response.status().is_success() {
-            return Err(AgentError::from_response(response).await);
-        }
-
-        let body: CopilotModelsResponse = serde_json::from_str(&response.text().await?)?;
+        let body: CopilotModelsResponse = serde_json::from_str(&body_text)?;
         let mut models = body
             .data
             .into_iter()
@@ -263,18 +270,12 @@ impl Copilot {
                 Some("conversation-agent"),
                 &body,
             )?
-            .body(serde_json::to_vec(&body)?)?;
-        let response = self.client.send_async(request).await?;
-        if response.status().is_success() {
-            openai_compat::parse_sse(
-                BufReader::new(response.into_body()),
-                event_tx,
-                self.stream_timeout,
-            )
-            .await
-        } else {
-            Err(AgentError::from_response(response).await)
-        }
+            .body(serde_json::to_vec(&body)?)
+            .build()?;
+        super::ok_sse(&self.client, request, |body| {
+            openai_compat::parse_sse(body, event_tx, self.stream_timeout)
+        })
+        .await
     }
 
     async fn stream_responses(
@@ -333,13 +334,12 @@ impl Copilot {
         let request = self
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
-            .body(serde_json::to_vec(&body)?)?;
-        let response = self.client.send_async(request).await?;
-        if response.status().is_success() {
-            super::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
-        }
+            .body(serde_json::to_vec(&body)?)
+            .build()?;
+        super::ok_sse(&self.client, request, |body| {
+            super::anthropic::parse_sse(body, event_tx, self.stream_timeout)
+        })
+        .await
     }
 
     fn build_post(
@@ -348,16 +348,14 @@ impl Copilot {
         path: &str,
         interaction_type: Option<&str>,
         body: &Value,
-    ) -> Result<isahc::http::request::Builder, AgentError> {
+    ) -> Result<RequestBuilder, AgentError> {
         debug!(
             path,
             body_bytes = serde_json::to_vec(body)?.len(),
             "sending Copilot API request"
         );
         Ok(copilot_request(
-            Request::builder()
-                .method("POST")
-                .uri(format!("{}{path}", auth.endpoint)),
+            self.client.post(format!("{}{path}", auth.endpoint)),
             auth,
             interaction_type,
         ))
@@ -436,9 +434,11 @@ struct CopilotTokenPriceTier {
 }
 
 impl CopilotModel {
+    /// `model_picker_enabled` is left out on purpose. It only hides a model
+    /// from Copilot's own picker, the account can still use it, so routing
+    /// needs it here and only `list_models` filters on it.
     fn is_enabled_chat_model(&self) -> bool {
-        self.model_picker_enabled
-            && self.capabilities.model_type == "chat"
+        self.capabilities.model_type == "chat"
             && self
                 .policy
                 .as_ref()
@@ -649,7 +649,7 @@ struct GraphQlCopilotEndpoints {
     api: String,
 }
 
-async fn discover_api_endpoint(client: &HttpClient, token: &str, graphql_url: &str) -> String {
+async fn discover_api_endpoint(client: &Client, token: &str, graphql_url: &str) -> String {
     match try_discover_api_endpoint(client, token, graphql_url).await {
         Ok(endpoint) => endpoint,
         Err(err) => {
@@ -660,25 +660,27 @@ async fn discover_api_endpoint(client: &HttpClient, token: &str, graphql_url: &s
 }
 
 async fn try_discover_api_endpoint(
-    client: &HttpClient,
+    client: &Client,
     token: &str,
     graphql_url: &str,
 ) -> Result<String, AgentError> {
     let body = json!({ "query": GRAPHQL_QUERY });
-    let request = Request::builder()
-        .method("POST")
-        .uri(graphql_url)
+    let request = client
+        .post(graphql_url)
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .header("user-agent", super::user_agent())
-        .body(serde_json::to_vec(&body)?)?;
+        .body(serde_json::to_vec(&body)?)
+        .build()?;
+    let body_text = super::send_request(client, request, |response| async move {
+        if !response.status().is_success() {
+            return Err(AgentError::from_response(response).await);
+        }
+        Ok(response.text().await?)
+    })
+    .await?;
 
-    let mut response = client.send_async(request).await?;
-    if !response.status().is_success() {
-        return Err(AgentError::from_response(response).await);
-    }
-
-    let parsed: GraphQlResponse = serde_json::from_str(&response.text().await?)?;
+    let parsed: GraphQlResponse = serde_json::from_str(&body_text)?;
     parsed
         .data
         .map(|data| data.viewer.copilot_endpoints.api)
@@ -688,10 +690,10 @@ async fn try_discover_api_endpoint(
 }
 
 fn copilot_request(
-    builder: isahc::http::request::Builder,
+    builder: RequestBuilder,
     auth: &CopilotAuth,
     interaction_type: Option<&str>,
-) -> isahc::http::request::Builder {
+) -> RequestBuilder {
     let builder = builder
         .header("authorization", format!("Bearer {}", auth.token))
         .header("content-type", "application/json")
@@ -783,37 +785,20 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
     }
 }
 
-fn adaptive_effort(model: &Model) -> Option<Effort> {
+fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     model_registry::provider_info::<CopilotModelInfo>(SLUG, &model.id)
-        .and_then(|info| listed_adaptive_effort(&info))
+        .map_or(choice, |info| listed_sends_thinking(&info, choice))
 }
 
-/// Only the responses endpoint renders `adaptive` through the dialect. The
+/// Only the responses endpoint renders thinking through the dialect. The
 /// messages endpoint spells it natively and chat completions carries no
 /// reasoning at all.
-fn listed_adaptive_effort(info: &CopilotModelInfo) -> Option<Effort> {
-    (info.endpoint == Endpoint::Responses)
-        .then(|| effort_dialect(info).adaptive_effort())
-        .flatten()
-}
-
-fn guess_endpoint(model_id: &str) -> Endpoint {
-    if model_id.starts_with("claude-") {
-        Endpoint::Messages
-    } else if model_id.contains("codex") || gpt_major(model_id).is_some_and(|major| major >= 5) {
-        Endpoint::Responses
+fn listed_sends_thinking(info: &CopilotModelInfo, choice: ThinkingConfig) -> ThinkingConfig {
+    if info.endpoint == Endpoint::Responses {
+        effort_dialect(info).sends(choice)
     } else {
-        Endpoint::ChatCompletions
+        choice
     }
-}
-
-fn gpt_major(model_id: &str) -> Option<u32> {
-    model_id
-        .strip_prefix("gpt-")?
-        .split(['.', '-'])
-        .next()?
-        .parse()
-        .ok()
 }
 
 impl Provider for Copilot {
@@ -854,6 +839,7 @@ impl Provider for Copilot {
             let models = self.fetch_models().await?;
             let infos = models
                 .iter()
+                .filter(|model| model.model_picker_enabled)
                 .map(CopilotModel::model_info)
                 .collect::<Vec<_>>();
             self.remember(models);
@@ -873,10 +859,15 @@ impl Provider for Copilot {
 mod tests {
     use super::*;
     use crate::spec::ProviderRegistry;
+    use crate::test_support::{Canned, serve};
     use crate::{ContentBlock, Role, TokenUsage};
     use test_case::test_case;
 
     const OPUS_CACHE_WRITE: f64 = 6.25;
+    const HIDDEN_ONLY_CATALOG: &[Canned] = &[Canned::json(
+        200,
+        r#"{"data":[{"id":"gpt-4o-hidden","model_picker_enabled":false,"capabilities":{"type":"chat"},"supported_endpoints":["/responses"]}]}"#,
+    )];
     const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
     const REPLY: &str = "reply";
     const SOL: &str = "gpt-6.1-sol";
@@ -905,16 +896,21 @@ mod tests {
         assert_eq!(model.endpoint(), Endpoint::ChatCompletions);
     }
 
-    #[test_case("gpt-6-luna", Endpoint::Responses ; "gpt_6")]
-    #[test_case("gpt-5.6-terra", Endpoint::Responses ; "gpt_5")]
-    #[test_case("gpt-10-mini", Endpoint::Responses ; "two_digit_major")]
-    #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex")]
-    #[test_case("gpt-4.1", Endpoint::ChatCompletions ; "gpt_4")]
-    #[test_case("gpt-4o", Endpoint::ChatCompletions ; "gpt_4o")]
-    #[test_case("claude-opus-5", Endpoint::Messages ; "claude")]
-    #[test_case("gemini-3.7-flash", Endpoint::ChatCompletions ; "other")]
-    fn guess_endpoint_for_unlisted_model(model_id: &str, expected: Endpoint) {
-        assert_eq!(guess_endpoint(model_id), expected);
+    #[test_case("gpt-4o-hidden", Some(Endpoint::Responses) ; "hidden_model_takes_its_listed_endpoint")]
+    #[test_case("gpt-4o", None ; "unlisted_model_is_refused")]
+    #[tokio::test]
+    async fn endpoint_comes_from_the_whole_catalog(model_id: &str, expected: Option<Endpoint>) {
+        let (base_url, _) = serve(HIDDEN_ONLY_CATALOG);
+        let auth = ResolvedAuth::for_test(
+            Some(base_url),
+            vec![("Authorization".into(), "Bearer token".into())],
+        );
+        let copilot = Copilot::with_auth(Arc::new(Mutex::new(auth)), Timeouts::default());
+        let result = copilot.model_endpoint(model_id).await;
+        match expected {
+            Some(endpoint) => assert_eq!(result.unwrap(), endpoint),
+            None => assert!(matches!(result, Err(AgentError::Config { .. }))),
+        }
     }
 
     #[test]
@@ -923,9 +919,11 @@ mod tests {
             token: "token".into(),
             endpoint: DEFAULT_API_ENDPOINT.into(),
         };
-        let request = copilot_request(Request::builder(), &auth, None);
+        let request = copilot_request(Client::new().get(DEFAULT_API_ENDPOINT), &auth, None)
+            .build()
+            .unwrap();
         assert_eq!(
-            request.headers_ref().unwrap()["copilot-integration-id"],
+            request.headers()["copilot-integration-id"],
             INTEGRATION_ID_HEADER
         );
         assert!(copilot_headers(&auth, None).contains(&(
@@ -1009,7 +1007,10 @@ mod tests {
             "capabilities": {"type": "chat", "supports": supports}
         }))
         .unwrap();
-        assert_eq!(listed_adaptive_effort(&listed.reasoning_info()), expected);
+        assert_eq!(
+            listed_sends_thinking(&listed.reasoning_info(), ThinkingConfig::Adaptive).level(),
+            expected
+        );
     }
 
     #[test_case(RESPONSES_PATH, true; "responses honors reasoning")]
@@ -1051,7 +1052,7 @@ mod tests {
     #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]
     #[test_case("copilot/gpt-5.4-mini", 100_000, 100_000, 0.075 + 0.45; "gpt-5.4-mini beats gpt-5.4 prefix")]
     #[test_case("copilot/claude-opus-4.8-fast", 100_000, 100_000, 1.00 + 5.00; "opus 4.8 fast beats opus prefix")]
-    fn manifest_models_report_cost(spec: &str, input: u32, output: u32, expected: f64) {
+    fn manifest_models_report_cost(spec: &str, input: u64, output: u64, expected: f64) {
         let usage = TokenUsage {
             input,
             output,

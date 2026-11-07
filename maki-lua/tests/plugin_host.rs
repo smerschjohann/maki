@@ -1,3 +1,5 @@
+mod common;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -5,8 +7,9 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use common::poll_until;
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
 use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
@@ -16,13 +19,14 @@ use maki_agent::tools::{
     ToolSource, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput,
-    TurnCompleteEvent,
+    AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, ModelSlot, SessionMailbox,
+    ToolOutput, TurnCompleteEvent,
 };
 use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
     ThinkingLines, ToolKey, ToolOutputLines,
 };
+use maki_lua::test_support::{fire_autocmd, runtime};
 use maki_lua::{
     InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
@@ -184,7 +188,7 @@ fn exec_output_in(
     if let Some(r) = registry_override {
         ctx.registry = r;
     }
-    smol::block_on(async { inv.execute(&ctx).await }).output
+    runtime().block_on(inv.execute(&ctx)).output
 }
 
 const ECHO_PLUGIN: &str = r#"
@@ -270,6 +274,8 @@ const NIL_WITHOUT_JOBS_ERR: &str =
 const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
 const DEADLINE_ALREADY_SET_ERR: &str = "ctx:set_deadline() already called";
 const TIMED_OUT_SUBSTR: &str = "timed out";
+const PARKED_PAST_DEADLINE_TOOL: &str = "parked_past_deadline";
+const PARKED_PAST_DEADLINE_ERR: &str = "tool parked_past_deadline timed out after 0s";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
@@ -309,9 +315,7 @@ fn register_echo_tool() {
 
     let entry = reg.get("echo_").expect("echo_ tool not registered");
     assert_eq!(entry.tool.name(), "echo_");
-    assert!(
-        matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "echo_plugin"),
-    );
+    assert_eq!(entry.source.plugin.as_ref(), "echo_plugin");
     assert_eq!(entry.tool.tool_kind(), None);
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
@@ -376,7 +380,8 @@ fn exec_with_ctx(
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
+    runtime()
+        .block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             maki_agent::ToolOutput::Plain(s) => s.text,
@@ -711,7 +716,7 @@ fn permission_without_scopes_declares_reach_and_never_prompts() {
             prompted: false,
         })
     );
-    assert!(smol::block_on(inv.permission_scopes()).is_none());
+    assert!(runtime().block_on(inv.permission_scopes()).is_none());
 }
 
 #[test]
@@ -872,9 +877,7 @@ fn handler_state_flows_to_tool_output_and_serde() {
     let entry = reg.get("stateful").unwrap();
     let inv = entry.tool.parse(&serde_json::json!({})).unwrap();
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let out = smol::block_on(async { inv.execute(&ctx).await })
-        .output
-        .unwrap();
+    let out = runtime().block_on(inv.execute(&ctx)).output.unwrap();
     let expected = serde_json::json!({ "n": 3, "tag": "hi" });
     assert_eq!(out.state(), Some(&expected));
 
@@ -1185,7 +1188,7 @@ maki.api.register_tool({{
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.deadline = maki_agent::tools::Deadline::after(std::time::Duration::from_secs(5));
 
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let result = runtime().block_on(inv.execute(&ctx));
 
     assert!(result.output.is_err(), "expected error from timed-out loop");
 
@@ -1760,7 +1763,7 @@ fn conflict_from_different_plugin_preserves_original() {
     assert!(matches!(err, PluginError::NameConflict { .. }));
 
     let entry = reg.get("evolving").unwrap();
-    assert!(matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "keeper"),);
+    assert_eq!(entry.source.plugin.as_ref(), "keeper");
 }
 
 #[test]
@@ -1903,6 +1906,62 @@ fn jobstart_invalid_cwd_errors_with_expanded_path() {
     assert!(out.contains(&expected), "got: {out}");
 }
 
+/// `0` means no cap of the caller's own, as in `maki.fs` reads, so the line
+/// comes through whole.
+#[test]
+fn jobstart_treats_zero_max_line_bytes_as_the_default() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_zero_line_bytes",
+            description = "jobstart with max_line_bytes = 0",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local id = maki.fn.jobstart("echo abcdef", {{ max_line_bytes = 0 }})
+                return maki.fn.jobwait(id).stdout
+            end
+        }})"#,
+    );
+    host.load_source("job_zero_line_bytes", &src).unwrap();
+    let out = exec_tool(&reg, "job_zero_line_bytes", serde_json::json!({})).unwrap();
+    assert_eq!(out, "abcdef");
+}
+
+/// The stream name sits third, where Neovim's job callbacks pass it, and the
+/// uncut length after it: `abcdef` is cut to 3 bytes plus the marker.
+#[test]
+fn job_line_callbacks_get_the_stream_and_the_uncut_length() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_line_args",
+            description = "records line callback arguments",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local seen = {{}}
+                local function record(_, line, stream, bytes)
+                    seen[#seen + 1] = line .. " " .. stream .. " " .. bytes
+                end
+                local id = maki.fn.jobstart("echo abcdef; echo xy >&2", {{
+                    max_line_bytes = 3,
+                    on_stdout = record,
+                    on_stderr = record,
+                }})
+                maki.fn.jobwait(id)
+                table.sort(seen)
+                return table.concat(seen, ",")
+            end
+        }})"#,
+    );
+    host.load_source("job_line_args", &src).unwrap();
+    let out = exec_tool(&reg, "job_line_args", serde_json::json!({})).unwrap();
+    assert_eq!(out, "abc... stdout 6,xy stderr 2");
+}
+
 #[test]
 fn async_job_exits_without_finish_is_error() {
     let reg = fresh_registry();
@@ -1968,7 +2027,7 @@ fn click_until_finished(
             None,
             Some(click_id),
         );
-        smol::block_on(inv.execute(&ctx)).output
+        runtime().block_on(inv.execute(&ctx)).output
     });
     for _ in 0..500 {
         if worker.is_finished() {
@@ -2165,7 +2224,7 @@ fn exec_warm_tool(
         .tool
         .parse(&serde_json::json!({}))
         .expect("parse failed");
-    smol::block_on(inv.execute(ctx)).output
+    runtime().block_on(inv.execute(ctx)).output
 }
 
 /// A click on a finished tool takes the warm path: it mutates the live
@@ -2367,6 +2426,62 @@ fn warm_click_runs_async_jobs() {
     assert!(text.contains(ASYNC_LINE), "async job line missing: {text}");
 }
 
+/// The call token fires with the reply, but a highlight queued by the
+/// handler still has to land: it lives as long as the turn. The job waits
+/// for a release sent after the call ended, so it cannot slip in before.
+#[test]
+fn async_run_from_a_handler_outlives_the_call() {
+    const CALL_ID: &str = "outlives-1";
+    const LATE_LINE: &str = "after_the_reply";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"local release, released
+        maki.api.register_tool({{
+            name = "late_async",
+            description = "appends a line after its reply",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local buf = maki.ui.buf()
+                ctx:live_buf(buf)
+                maki.async.run(function()
+                    if not released then
+                        maki.async.await(1, function(cb) release = cb end)
+                    end
+                    buf:line("{LATE_LINE}")
+                end)
+                return "done"
+            end
+        }})
+        maki.api.register_tool({{
+            name = "late_async_release",
+            description = "lets the late line land",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function()
+                if release then release() else released = true end
+                return "released"
+            end
+        }})"#,
+    );
+    host.load_source("late_async_plugin", &src).unwrap();
+
+    let (mut ctx, rx) = warm_ctx(CALL_ID);
+    let (_run_trigger, run) = CancelToken::new();
+    let call = Arc::new(CallScope::new(CALL_ID.to_owned(), &run));
+    ctx.cancel = call.cancel().clone();
+    ctx.call = Some(Arc::clone(&call));
+    exec_warm_tool(&reg, "late_async", &ctx).expect("tool output");
+    let body = recv_live_buf(&rx, CALL_ID).expect("live buf published");
+    call.end();
+    exec_tool(&reg, "late_async_release", json!({})).expect("release");
+
+    poll_until("the late line never landed", || {
+        body.take().text().contains(LATE_LINE).then_some(())
+    });
+}
+
 /// The warm cell gets a fresh `CancelToken::none()`: cancelling the
 /// original run after it finished must not kill warm clicks.
 #[test]
@@ -2387,14 +2502,14 @@ fn warm_click_survives_post_completion_cancel() {
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
-/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs,
+/// `maki.agent.call_tool` returns `(text, err, format)` and delivers live bufs,
 /// annotations (live and completion alike) and usage through the callbacks.
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
     reg.register(
         Arc::new(UsageTool),
-        ToolSource::Lua {
+        ToolSource {
             plugin: Arc::from("usage_fixture"),
         },
     )
@@ -2408,7 +2523,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
-        return {{ llm_output = "child_done", annotation = "5 items" }}
+        return {{ llm_output = "child_done", annotation = "5 items", format = "markdown" }}
     end
 }})
 maki.api.register_tool({{
@@ -2439,12 +2554,12 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function(input, ctx)
         local ann = "nil"
-        local text, err = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
+        local text, err, format = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
             on_annotation = function(a) ann = a end,
         }})
         local live_text = "none"
         local ann2 = "nil"
-        local text2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
+        local text2, _, format2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
             on_live_buf = function(b)
                 local lines = b:get_lines()
                 live_text = lines[1] and lines[1][1] and lines[1][1][1] or "empty"
@@ -2456,13 +2571,13 @@ maki.api.register_tool({{
             on_usage = function(value) usage = value end,
         }})
         local ann3 = "nil"
-        local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
+        local _, err3, format3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
-        return tostring(text) .. "/" .. ann
-            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+        return tostring(text) .. "/" .. ann .. "/" .. format
+            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2 .. "/" .. format2
             .. " " .. tostring(text3) .. "/" .. usage
-            .. " " .. tostring(err3) .. "/" .. ann3
+            .. " " .. tostring(err3) .. "/" .. ann3 .. "/" .. tostring(format3)
     end
 }})
 "#,
@@ -2478,8 +2593,8 @@ maki.api.register_tool({{
     assert_eq!(
         out,
         format!(
-            "child_done/5 items stream_done/streamed line/1 lines \
-             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
+            "child_done/5 items/markdown stream_done/streamed line/1 line/plain \
+             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil/nil"
         )
     );
 }
@@ -2523,7 +2638,7 @@ maki.api.register_tool({{
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
     let dispatch = || {
-        smol::block_on(maki_agent::agent::tool_dispatch::run(
+        runtime().block_on(maki_agent::agent::tool_dispatch::run(
             String::new(),
             "driver",
             &json!({}),
@@ -3097,6 +3212,55 @@ maki.api.register_tool({{
         .end_sessions_blocking([session], SessionEndReason::Shutdown);
 }
 
+/// The gate holds `three` back until the second wait owns the receiver, and
+/// the first wait only ends once the pump delivered `two`.
+#[cfg(unix)]
+#[test_case::test_case(8, "one\ntwo\nthree:false" ; "tail_held_everything")]
+#[test_case::test_case(1, "two\nthree:true" ; "tail_lost_a_line")]
+#[test_case::test_case(0, "three:true" ; "no_tail")]
+fn jobwait_starts_from_the_lines_a_pump_already_delivered(tail: usize, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
+    let gate = gate.display();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "wait_in_turn",
+    description = "waits on two jobs one after the other",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local first = maki.fn.jobstart("sleep 600", {{ scope = "plugin" }})
+        local second = maki.fn.jobstart(
+            "mkfifo '{gate}'; echo one; echo two; read _ < '{gate}'; echo three",
+            {{
+                scope = "plugin",
+                tail = {tail},
+                on_stdout = function(_, line)
+                    if line == "two" then
+                        maki.fn.jobstop(first)
+                    end
+                end,
+            }}
+        )
+        maki.fn.jobwait(first)
+        maki.fn.jobstart("echo > '{gate}'")
+        local got = maki.fn.jobwait(second)
+        return got.stdout .. ":" .. tostring(got.truncated)
+    end,
+}})
+"#
+    );
+    host.load_source("wait_in_turn", &src).unwrap();
+
+    assert_eq!(
+        exec_tool(&reg, "wait_in_turn", json!({})).unwrap(),
+        expected
+    );
+}
+
 /// `run` on its own is enough to start a job, but pointing a stream at a path
 /// is a write, so it costs `fs_write` too.
 #[test]
@@ -3294,8 +3458,7 @@ maki.api.register_tool({{
     );
     host.load_source("isolation_probe", &src).unwrap();
 
-    host.event_handle()
-        .fire_autocmd("ProbeIsolation", json!({}));
+    fire_autocmd(&host.event_handle(), "ProbeIsolation", json!({}));
 
     // FireAutocmd and CallTool queue on the same channel and dispatch is
     // awaited in order, so the second handler has already run here. A shared
@@ -3336,8 +3499,11 @@ maki.api.register_tool({{
     );
     host.load_source("sessionend_suspend", &src).unwrap();
 
-    host.event_handle()
-        .fire_autocmd("SessionEnd", json!({ "dir": dir.display().to_string() }));
+    fire_autocmd(
+        &host.event_handle(),
+        "SessionEnd",
+        json!({ "dir": dir.display().to_string() }),
+    );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let seen = loop {
@@ -5331,6 +5497,32 @@ fn ctx_set_deadline_times_out() {
     assert!(err.contains(TIMED_OUT_SUBSTR), "got: {err}");
 }
 
+/// No cancel hook is set up yet to word the reply, so it reads the way the
+/// dispatch loop words a timeout.
+#[test]
+fn a_handler_parked_past_its_deadline_times_out() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{PARKED_PAST_DEADLINE_TOOL}",
+            description = "parks past its deadline",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                ctx:set_deadline(0)
+                maki.async.await(1, function(_) end)
+                return "should-not-reach"
+            end
+        }})"#,
+    );
+    host.load_source(PARKED_PAST_DEADLINE_TOOL, &src).unwrap();
+
+    let err = exec_tool(&reg, PARKED_PAST_DEADLINE_TOOL, json!({})).unwrap_err();
+
+    assert_eq!(err, PARKED_PAST_DEADLINE_ERR);
+}
+
 #[test]
 fn ctx_set_deadline_twice_errors() {
     let reg = fresh_registry();
@@ -5355,18 +5547,6 @@ fn ctx_set_deadline_twice_errors() {
 /// Generous: every wait below ends on an event, never on the clock, so only
 /// an already failing test pays this.
 const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
-    let deadline = std::time::Instant::now() + CANCEL_TEST_TIMEOUT;
-    loop {
-        if let Some(got) = check() {
-            return got;
-        }
-        assert!(std::time::Instant::now() < deadline, "{what}");
-        std::thread::sleep(CANCEL_POLL_INTERVAL);
-    }
-}
 
 const PARKED_DEADLINE_REPLY: &str = "partial: timeout";
 const PARKED_DEADLINE_PLUGIN: &str = r#"
@@ -5635,7 +5815,8 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
     let input = serde_json::json!({ "command": command });
     let entry = reg.get("bash").expect("bash registered");
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let scopes = smol::block_on(inv.permission_scopes())
+    let scopes = runtime()
+        .block_on(inv.permission_scopes())
         .expect("permission_scopes returned None (would fall back to raw JSON)");
 
     assert!(
@@ -5675,7 +5856,9 @@ fn bash_permission_scopes_split_per_command(command: &str, expected: &[&str]) {
     let input = serde_json::json!({ "command": command });
     let entry = reg.get("bash").expect("bash registered");
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+    let scopes = runtime()
+        .block_on(inv.permission_scopes())
+        .expect("permission_scopes returned None");
 
     assert!(!scopes.force_prompt, "command: {command}");
     assert_eq!(scopes.scopes, expected, "command: {command}");
@@ -6105,7 +6288,7 @@ fn run_start(
         .tool
         .parse(&input)
         .expect("parse failed");
-    smol::block_on(inv.start(&ctx));
+    runtime().block_on(inv.start(&ctx));
     rx
 }
 
@@ -6715,12 +6898,13 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
 
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
-    let out = smol::block_on(maki_agent::tools::interpreter_bridge::dispatch(
-        &ctx,
-        "img_probe",
-        &serde_json::json!({}),
-    ))
-    .unwrap();
+    let out = runtime()
+        .block_on(maki_agent::tools::interpreter_bridge::dispatch(
+            &ctx,
+            "img_probe",
+            &serde_json::json!({}),
+        ))
+        .unwrap();
     assert!(out.starts_with("[image: test 1x1]"), "got: {out}");
     assert!(
         out.contains(maki_agent::tools::interpreter_bridge::IMAGE_NOT_VISIBLE_NOTE),
@@ -7624,7 +7808,7 @@ const CANCELLED_MSG: &str = "cancelled";
 const STOPPED_BY_USER_ERR: &str = "stopped by user";
 const PAID_TOOL_USE_ID: &str = "toolu_paid";
 const PAID_TOOL_NAME: &str = "not_a_tool";
-const PAID_TURN_INPUT: u32 = 1234;
+const PAID_TURN_INPUT: u64 = 1234;
 const COST_DECIMALS: usize = 12;
 
 /// The spawned task outlives the tool call that started it, so only the chat
@@ -7859,6 +8043,34 @@ fn billed_turns(
         .collect()
 }
 
+/// Waits for the relay to hand the tab a paid turn. The relay is its own task,
+/// so the provider being asked for the next turn says nothing about whether
+/// the tab heard of the last one yet.
+fn await_billed_turn(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> TurnCompleteEvent {
+    let deadline = Instant::now() + CANCEL_TEST_TIMEOUT;
+    loop {
+        let action = ui
+            .recv_deadline(deadline)
+            .expect("the paid turn must reach the tab while the prompt still runs");
+        match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                session: owner,
+                envelope,
+                ..
+            } if owner == session => {
+                if let AgentEvent::TurnComplete(turn) = envelope.event {
+                    return *turn;
+                }
+            }
+            maki_lua::UiAction::PluginTaskOpened { session: owner, .. } if owner == session => {}
+            _ => panic!("only this chat session's task events go to the UI here"),
+        }
+    }
+}
+
 /// The transcript the tab was last handed for task `id`.
 fn handed_over_history(
     ui: &flume::Receiver<maki_lua::UiAction>,
@@ -7905,10 +8117,11 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
-    let turns = billed_turns(&ui, session);
-    let [turn] = turns.as_slice() else {
-        panic!("the paid turn must reach the tab while the prompt still runs");
-    };
+    let turn = await_billed_turn(&ui, session);
+    assert!(
+        billed_turns(&ui, session).is_empty(),
+        "one paid turn must reach the tab once"
+    );
     assert_eq!(turn.usage.input, PAID_TURN_INPUT);
     let billed_cost = turn.cost.expect("the paid turn must have a price");
     let listed_cost = format!("{billed_cost:.COST_DECIMALS$}");
@@ -8051,9 +8264,9 @@ fn a_retired_background_session_refuses_later_prompts() {
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
-/// The provider parks the second turn forever, so only a cancel can end this
-/// prompt. If `close` waited for it instead, a `SessionEnd` callback that
-/// closes its own session would hang.
+/// The provider parks the second turn forever, so only the close can end
+/// this prompt, which then says the session closed. If `close` waited for it
+/// instead, a `SessionEnd` callback that closes its own session would hang.
 #[test]
 fn closing_a_background_session_cancels_its_running_prompt() {
     let reg = fresh_registry();
@@ -8079,7 +8292,7 @@ fn closing_a_background_session_cancels_its_running_prompt() {
     let closed = call_on_thread(&reg, "close_background", CancelToken::none())
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("close must not wait for the parked prompt");
-    assert_eq!(closed, Ok(CANCELLED_MSG.to_owned()));
+    assert_eq!(closed, Ok(SESSION_CLOSED_ERR.to_owned()));
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
@@ -8618,9 +8831,9 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
         .unwrap();
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     let (_answer_tx, answer_rx) = flume::unbounded::<String>();
-    ctx.user_response_rx = answerable.then(|| Arc::new(smol::lock::Mutex::new(answer_rx)));
+    ctx.user_response_rx = answerable.then(|| Arc::new(tokio::sync::Mutex::new(answer_rx)));
 
-    let result = smol::block_on(inv.execute(&ctx)).output;
+    let result = runtime().block_on(inv.execute(&ctx)).output;
 
     let Ok(maki_agent::ToolOutput::Plain(text)) = result else {
         panic!("unexpected output: {result:?}");
@@ -8798,4 +9011,94 @@ mod session_owned_ui {
 
         assert_eq!(hint_owners(&host), [None, Some(kept)]);
     }
+}
+
+const PARK_MS: u64 = 600_000;
+const DELIVERY_POLLS: usize = 3000;
+const DELIVERY_POLL_MS: u64 = 10;
+const SECOND_JOB_EXIT: i32 = 3;
+
+/// The first job's callback parks far longer than the test runs, and the
+/// second job starts only once it has, so that job reaches its `on_exit`
+/// only if the two are delivered apart.
+#[test]
+fn a_parked_callback_holds_back_only_its_own_job() {
+    let src = format!(
+        r#"local parked, exit_code
+local function wait_until(done)
+    for _ = 1, {DELIVERY_POLLS} do
+        if done() then return end
+        maki.async.sleep({DELIVERY_POLL_MS})
+    end
+end
+maki.api.register_tool({{
+    name = "start_jobs",
+    description = "t",
+    schema = {MINIMAL_SCHEMA},
+    handler = function()
+        maki.fn.jobstart("echo park", {{
+            scope = "plugin",
+            on_stdout = function()
+                parked = true
+                maki.async.sleep({PARK_MS})
+            end,
+        }})
+        wait_until(function() return parked end)
+        assert(parked, "the first callback never parked")
+        maki.fn.jobstart("exit {SECOND_JOB_EXIT}", {{
+            scope = "plugin",
+            on_exit = function(_, code) exit_code = code end,
+        }})
+        return "started"
+    end,
+}})
+maki.api.register_tool({{
+    name = "second_exit",
+    description = "t",
+    schema = {MINIMAL_SCHEMA},
+    handler = function()
+        wait_until(function() return exit_code end)
+        return "exit=" .. tostring(exit_code)
+    end,
+}})"#
+    );
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("parked_plugin", &src).unwrap();
+    exec_tool(&reg, "start_jobs", json!({})).unwrap();
+    let out = exec_tool(&reg, "second_exit", json!({})).unwrap();
+    assert_eq!(out, format!("exit={SECOND_JOB_EXIT}"));
+}
+
+/// Twice the 16 MiB a job may queue, so `jobwait` only sees the end if the
+/// lines it takes free the job's readers again.
+#[cfg(unix)]
+const PAST_BOUND_LINES: usize = 2 * 16 * 1024 * 1024 / PADDED_LINE_BYTES;
+#[cfg(unix)]
+const PADDED_LINE_BYTES: usize = 4096;
+#[cfg(unix)]
+const PAST_BOUND_WAIT_MS: u64 = 20_000;
+
+#[cfg(unix)]
+#[test]
+fn jobwait_drains_a_job_past_its_queue_bound() {
+    let src = format!(
+        r#"maki.api.register_tool({{
+    name = "wait_past_bound",
+    description = "t",
+    schema = {MINIMAL_SCHEMA},
+    handler = function()
+        local id = maki.fn.jobstart("seq -f %0{PADDED_LINE_BYTES}g 1 {PAST_BOUND_LINES}")
+        local result, err = maki.fn.jobwait(id, {PAST_BOUND_WAIT_MS})
+        if not result then return "error: " .. err end
+        return tostring(#result.stdout)
+    end,
+}})"#
+    );
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("past_bound_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "wait_past_bound", json!({})).unwrap();
+    let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
+    assert_eq!(out, expected.to_string());
 }
