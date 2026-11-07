@@ -22,7 +22,7 @@ pub use api::keymap::{
     CursorShape, CursorStyle, InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader,
     KeymapSnapshot,
 };
-pub use api::net::set_allowed_private_hosts;
+pub use api::net::{set_allowed_private_hosts, set_client_certs};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
 pub use api::session::SessionSnapshotFn;
