@@ -1,0 +1,361 @@
+name: Sync, Rebuild & Release
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  push:
+    branches:
+      - masu
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no commits changed'
+        type: boolean
+        default: false
+      create_release:
+        description: 'Create GitHub release with binaries'
+        type: boolean
+        default: true
+
+env:
+  UPSTREAM_URL: 'https://github.com/tontinton/maki.git'
+  UPSTREAM_BRANCH: 'main'
+  TARGET_BRANCH: 'masu'
+  FEATURE_BRANCHES: >-
+    feat/model-in-prompt
+    feature/cost-from-upstream
+    feat/clipboard-cmd
+  BINARY_NAME: 'maki'
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  LLM_MODEL: 'deepseek-v4.1-flash'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: masu-sync
+  cancel-in-progress: false
+
+jobs:
+  detect-conflicts:
+    name: Detect conflicts
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      branches: ${{ steps.detect.outputs.branches }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect branches that need help
+        id: detect
+        run: |
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || true
+          git fetch -q upstream "$UPSTREAM_BRANCH"
+          git fetch -q origin
+
+          conflicts=()
+          for b in $FEATURE_BRANCHES; do
+            if git rev-parse -q --verify "origin/ai-fix/$b" >/dev/null \
+              && git merge-base --is-ancestor "origin/$b" "origin/ai-fix/$b" \
+              && git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" "origin/ai-fix/$b"; then
+              echo "::notice::$b already fixed on ai-fix/$b"
+              continue
+            fi
+            if ! git merge-tree --write-tree "origin/$b" "upstream/$UPSTREAM_BRANCH" >/dev/null 2>&1; then
+              echo "::warning::$b conflicts with upstream/$UPSTREAM_BRANCH"
+              conflicts+=("$b")
+            fi
+          done
+          if [ ${#conflicts[@]} -eq 0 ]; then
+            echo 'branches=[]' >> "$GITHUB_OUTPUT"
+          else
+            echo "branches=$(printf '%s\n' "${conflicts[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+          fi
+
+  ai-fix:
+    name: Fix (${{ matrix.branch }})
+    needs: detect-conflicts
+    permissions:
+      contents: write
+    if: needs.detect-conflicts.result == 'success' && needs.detect-conflicts.outputs.branches != '[]'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.detect-conflicts.outputs.branches) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup bubblewrap
+        uses: smerschjohann/keg/.github/actions/setup-bwrap@v0.1.0
+
+      - name: Install keg
+        run: |
+          case "$RUNNER_ARCH" in
+            X64) keg_arch=amd64; maki_target=x86_64-unknown-linux-musl ;;
+            ARM64) keg_arch=arm64; maki_target=aarch64-unknown-linux-musl ;;
+            *) echo "unsupported runner arch: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          echo "MAKI_TARGET=$maki_target" >> "$GITHUB_ENV"
+
+          keg_version=v0.1.0
+          keg_base="https://github.com/smerschjohann/keg/releases/download/$keg_version"
+          curl -fsSLO "$keg_base/keg_${keg_version}_linux_${keg_arch}.tar.gz"
+          curl -fsSLO "$keg_base/checksums.txt"
+          sha256sum --check --ignore-missing checksums.txt
+          tar -xzf "keg_${keg_version}_linux_${keg_arch}.tar.gz"
+          sudo install -m 0755 keg /usr/local/bin/keg
+          keg --version
+
+      - name: Install Rust and check deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake zlib1g-dev python3-dev
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ai-fix-${{ runner.arch }}
+
+      - name: Install maki
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=50" \
+            --jq '[.[] | select(.tag_name | startswith("masu-"))][0].tag_name')
+          mkdir -p "$RUNNER_TEMP/maki"
+          gh release download "$tag" \
+            --pattern "maki-*-${MAKI_TARGET}.tar.gz" \
+            --dir "$RUNNER_TEMP/maki"
+          tar xzf "$RUNNER_TEMP"/maki/*.tar.gz -C "$RUNNER_TEMP/maki"
+          install -m 0755 "$RUNNER_TEMP/maki/maki" "$RUNNER_TEMP/maki-bin"
+          "$RUNNER_TEMP/maki-bin" --version
+
+      - name: Resolve conflicts
+        env:
+          LLMGATE_BASE_URL: ${{ secrets.LLMGATE_BASE_URL }}
+          LLMGATE_API_KEY: ${{ secrets.LLMGATE_API_KEY }}
+          AI_FIX_RUNTIME: direct
+          AI_FIX_PUSH: '1'
+          AI_FIX_CREDIT_USD: '1'
+          MAKI_BIN: ${{ runner.temp }}/maki-bin
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || true
+          ./scripts/ai-fix/run.sh "${{ matrix.branch }}"
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-fix-${{ strategy.job-index }}
+          path: /tmp/maki-ai-fix-out.*
+          if-no-files-found: ignore
+
+  sync-and-rebuild:
+    name: Sync & Rebuild
+    needs: [detect-conflicts, ai-fix]
+    permissions:
+      contents: write
+    if: always() && needs.detect-conflicts.result == 'success' && (needs.ai-fix.result == 'success' || needs.ai-fix.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      needs_build: ${{ steps.rebuild.outputs.needs_build }}
+      release_tag: ${{ steps.rebuild.outputs.release_tag }}
+      target_branch: ${{ steps.rebuild.outputs.target_branch }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Check updates and rebuild
+        id: rebuild
+        run: |
+          FORCE="${{ inputs.force_build || 'false' }}"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+
+          git remote add upstream "$UPSTREAM_URL" || true
+          git fetch upstream "$UPSTREAM_BRANCH"
+          git fetch origin
+
+          # Prüfen, ob es neue Commits im Upstream oder in den Feature-Branches gibt
+          NEW_COMMITS=0
+          UPSTREAM_DIFF=$(git rev-list --count origin/"$TARGET_BRANCH"..upstream/"$UPSTREAM_BRANCH" 2>/dev/null || echo "0")
+          echo "Neue Commits im Upstream ($UPSTREAM_BRANCH): $UPSTREAM_DIFF"
+          NEW_COMMITS=$((NEW_COMMITS + UPSTREAM_DIFF))
+
+          for branch in $FEATURE_BRANCHES; do
+            ref="origin/$branch"
+            if git rev-parse -q --verify "origin/ai-fix/$branch" >/dev/null \
+              && git merge-base --is-ancestor "origin/$branch" "origin/ai-fix/$branch"; then
+              ref="origin/ai-fix/$branch"
+            fi
+            BRANCH_DIFF=$(git rev-list --count "origin/$TARGET_BRANCH".."$ref" 2>/dev/null || echo "0")
+            echo "Neue Commits in $branch ($ref): $BRANCH_DIFF"
+            NEW_COMMITS=$((NEW_COMMITS + BRANCH_DIFF))
+          done
+
+          # Abbrechen, wenn keine neuen Commits vorliegen und kein Build erzwungen wurde
+          if [ "$NEW_COMMITS" -eq 0 ] && [ "$FORCE" != "true" ] && [ "${{ github.event_name }}" != "push" ]; then
+            echo "Weder Upstream noch Feature-Branches haben neue Commits und force_build ist nicht aktiv."
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Rebuild wird gestartet..."
+
+          # 1. masu frisch aus upstream/main erstellen
+          git checkout -B "$TARGET_BRANCH" upstream/"$UPSTREAM_BRANCH"
+
+          # 2. Feature-Branches als je einen Commit squashen. Der interne
+          #    ai-fix-Branch enthält bereits das aufgelöste Upstream-Merge.
+          for branch in $FEATURE_BRANCHES; do
+            ref="origin/$branch"
+            if git rev-parse -q --verify "origin/ai-fix/$branch" >/dev/null \
+              && git merge-base --is-ancestor "origin/$branch" "origin/ai-fix/$branch"; then
+              ref="origin/ai-fix/$branch"
+            fi
+            msg=$(git log -1 --format=%B "origin/$branch")
+            author=$(git log -1 --format='%an <%ae>' "origin/$branch")
+            author_date=$(git log -1 --format=%aI "origin/$branch")
+            echo "Squashing $ref into $TARGET_BRANCH..."
+            if ! git merge --squash "$ref"; then
+              echo "::error::Merge-Konflikt beim Anwenden von $ref auf $TARGET_BRANCH!"
+              exit 1
+            fi
+            # Workflows bleiben Sache der Pipeline, nicht des Features.
+            git checkout HEAD -- .github/workflows
+            if git diff --cached --quiet; then
+              echo "Keine Änderungen aus $branch"
+              continue
+            fi
+            git commit -q --author "$author" --date "$author_date" -m "$msg"
+          done
+
+          # 3. Nur unsere Pipeline behalten: der GITHUB_TOKEN darf Workflows
+          #    nicht anlegen/ändern, sie dürfen im Push-Diff nicht auftauchen.
+          git rm -r -q --ignore-unmatch -- .github/workflows
+          git checkout origin/"$TARGET_BRANCH" -- .github/workflows/rebase-and-release.yml
+          # Die Pipeline-Skripte gehören wie der Workflow selbst zur Pipeline,
+          # nicht zu upstream: der Rebuild startet bei upstream/main.
+          for ref in "$GITHUB_SHA" "origin/$TARGET_BRANCH"; do
+            if git cat-file -e "$ref:scripts/ai-fix" 2>/dev/null; then
+              git rm -r -q --ignore-unmatch -- scripts/ai-fix
+              git checkout "$ref" -- scripts/ai-fix
+              break
+            fi
+          done
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: sync and rebuild $TARGET_BRANCH with feature branches"
+          fi
+
+          # 4. Neu aufgebauten Branch zu origin pushen
+          echo "Pushe neu aufgebauten $TARGET_BRANCH zu origin..."
+          git push origin "$TARGET_BRANCH" --force-with-lease
+
+          TAG="masu-$(date +'%Y.%m.%d-%H%M')-$(git rev-parse --short HEAD)"
+          echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: Build (${{ matrix.target }})
+    needs: sync-and-rebuild
+    if: needs.sync-and-rebuild.outputs.needs_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-and-rebuild.outputs.target_branch }}
+
+      - name: Build in Alpine container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_INCREMENTAL=0 \
+            alpine:3.21 sh -c '
+              apk add --no-cache gcc g++ musl-dev make linux-headers curl git ca-certificates pkgconf python3-dev
+              git config --global --add safe.directory /workspace
+              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
+              source "$HOME/.cargo/env"
+              cargo build --release --target ${{ matrix.target }}
+            '
+          sudo chown -R $(id -u):$(id -g) target/
+
+      - name: Package
+        run: |
+          tag="${{ needs.sync-and-rebuild.outputs.release_tag }}"
+          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          tar czf "${archive}" "${BINARY_NAME}"
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: [sync-and-rebuild, build-linux]
+    permissions:
+      contents: write
+    if: needs.sync-and-rebuild.outputs.needs_build == 'true' && (github.event_name != 'workflow_dispatch' || inputs.create_release)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > ../sha256sums.txt
+          cat ../sha256sums.txt
+
+      - name: Create GitHub Release
+        env:
+          TAG_NAME: ${{ needs.sync-and-rebuild.outputs.release_tag }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --title "Maki $TAG_NAME" \
+            --notes "Automatischer Release-Build von \`${{ needs.sync-and-rebuild.outputs.target_branch }}\` (frisch aufgesetzt aus upstream \`${{ env.UPSTREAM_BRANCH }}\` mit Feature-Branches)." \
+            artifacts/* sha256sums.txt
