@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(git rev-parse --show-toplevel)
+STREAM_FILTER=$SCRIPT_DIR/stream-json.jq
 
 RUNTIME=${AI_FIX_RUNTIME:-direct}
 IMAGE=${AI_FIX_IMAGE:-maki-ai-fix:local}
@@ -245,8 +246,12 @@ ok=0
 for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
   echo "ai-fix: attempt $attempt/$ATTEMPTS"
   result=$outdir/result-$attempt.json
-  run_maki "$(build_prompt "$extra")" | tee "$result" \
-    || die "maki run failed or timed out after ${TIMEOUT}s (output in $result)"
+  # The log gets the readable rendering; the raw JSONL stays in $result for
+  # the result check and the failure artifact.
+  if ! run_maki "$(build_prompt "$extra")" | tee "$result" \
+    | jq --unbuffered -n -r -R -f "$STREAM_FILTER"; then
+    die "maki run failed or timed out after ${TIMEOUT}s (raw output in $result)"
+  fi
   if ! jq -e -s 'map(select(.type == "result")) | last | .is_error == false' "$result" >/dev/null 2>&1; then
     jq -r -s 'map(select(.type == "result")) | last | .result? // empty' "$result" >&2 || true
     die "maki reported an error (raw output in $result)"
