@@ -15,7 +15,7 @@ use maki_providers::http::{
     resolve,
 };
 use maki_providers::{Timeouts, client_builder};
-use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef};
+use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef, Value as LuaValue};
 use regex::bytes::Regex;
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Error as ReqwestError, Method, Request, Response};
@@ -26,9 +26,16 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use url::Url;
 
+use crate::api::util::convert::{TableExt, bytes_arg};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 use crate::plugin_permissions::{NetEgress, PluginPermissions};
+
+#[cfg(unix)]
+pub(crate) mod unix;
+
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
@@ -279,7 +286,7 @@ impl Route {
 }
 
 pub(crate) struct ResponseData {
-    pub(crate) body: String,
+    pub(crate) body: Vec<u8>,
     pub(crate) status: u16,
     content_type: String,
     pub(crate) headers: Vec<(String, String)>,
@@ -307,7 +314,7 @@ impl From<String> for NetError {
 impl ResponseData {
     fn into_table(self, lua: &Lua) -> LuaResult<Table> {
         let tbl = lua.create_table()?;
-        tbl.set("body", self.body)?;
+        tbl.set("body", lua.create_string(self.body)?)?;
         tbl.set("status", self.status)?;
         tbl.set("content_type", self.content_type)?;
         tbl.set("headers", lua.create_table_from(self.headers)?)?;
@@ -348,7 +355,7 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// {opts} fields:
 ///   `method` (string) HTTP verb, in any case (default `"GET"`).
 ///   `headers` (table) Header name/value pairs.
-///   `body` (string) Request body.
+///   `body` (string|buffer) Request body, sent as is.
 ///   `timeout` (integer) Total timeout in seconds, max 120 (default 30,
 ///     none on a provider's origin). 0 means the default.
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
@@ -364,6 +371,9 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// which breaks `set-cookie`. A compressed response arrives decoded, without
 /// its `content-encoding` and `content-length`. A failed response can go
 /// straight to `maki.provider.http_error`.
+/// `body` holds the raw bytes, so a binary download can go straight to
+/// `maki.fs.write`. Tool results and `maki.text.html_to_markdown` turn
+/// invalid UTF-8 into U+FFFD.
 ///
 /// @param url string URL starting with `http://` or `https://`.
 /// @param opts table? Request options (see above).
@@ -426,11 +436,7 @@ async fn connect(
     port: u16,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Conn>> {
-    let secs = opts
-        .and_then(|o| o.get::<u64>("timeout").ok())
-        .map_or(DEFAULT_CONNECT_TIMEOUT_SECS, |secs| {
-            secs.min(MAX_CONNECT_TIMEOUT_SECS)
-        });
+    let secs = connect_timeout_secs(opts.as_ref());
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let stream = try_pair!(
         timeout(
@@ -440,7 +446,15 @@ async fn connect(
         .await
         .unwrap_or_else(|_| Err(format!("connect to {host}:{port} timed out after {secs}s")))
     );
-    Ok((Some(Conn::track(plugin, stream)), None))
+    Ok((Some(Conn::track(plugin, Stream::Tcp(stream))), None))
+}
+
+/// The `timeout` option every connect takes, capped like the rest.
+fn connect_timeout_secs(opts: Option<&Table>) -> u64 {
+    opts.and_then(|o| o.get::<u64>("timeout").ok())
+        .map_or(DEFAULT_CONNECT_TIMEOUT_SECS, |secs| {
+            secs.min(MAX_CONNECT_TIMEOUT_SECS)
+        })
 }
 
 async fn open_stream(
@@ -482,10 +496,60 @@ async fn dial(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     Err(last_err)
 }
 
+/// The byte stream behind a `Conn`. Both kinds are driven through their
+/// readiness API, so one read and one write can share the stream.
+enum Stream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl Stream {
+    async fn readable(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.readable().await,
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.readable().await,
+        }
+    }
+
+    fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.try_read(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.try_read(buf),
+        }
+    }
+
+    async fn writable(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.writable().await,
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.writable().await,
+        }
+    }
+
+    fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.try_write(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.try_write(buf),
+        }
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => SockRef::from(stream).shutdown(Shutdown::Both),
+            #[cfg(unix)]
+            Self::Unix(stream) => SockRef::from(stream).shutdown(Shutdown::Both),
+        }
+    }
+}
+
 /// A read or write in flight holds its own `Arc`, so the Lua handle can be
 /// collected under it without closing the socket mid-call.
 struct ConnState {
-    stream: TcpStream,
+    stream: Stream,
     closed: AtomicBool,
     /// Reads don't wait in line like writes do. Two readers of one stream
     /// would each get a random slice of it, so a second read is refused.
@@ -501,9 +565,9 @@ impl ConnState {
     /// `Arc`.
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel)
-            && let Err(e) = SockRef::from(&self.stream).shutdown(Shutdown::Both)
+            && let Err(e) = self.stream.shutdown()
         {
-            tracing::debug!(error = %e, "tcp shutdown failed");
+            tracing::debug!(error = %e, "socket shutdown failed");
         }
     }
 
@@ -531,7 +595,7 @@ impl Drop for TornWrite<'_> {
 pub(crate) struct Conn(Arc<ConnState>);
 
 impl Conn {
-    fn track(plugin: Arc<str>, stream: TcpStream) -> Self {
+    fn track(plugin: Arc<str>, stream: Stream) -> Self {
         let state = Arc::new(ConnState {
             stream,
             closed: AtomicBool::new(false),
@@ -552,6 +616,8 @@ pub(crate) fn close_plugin_conns(plugin: &str) {
     for conn in conns.iter().flatten().filter_map(Weak::upgrade) {
         conn.close();
     }
+    #[cfg(unix)]
+    unix::close_plugin_listeners(plugin);
 }
 
 /// Wait for data and return what arrived, at most 64 KiB. Returns
@@ -613,7 +679,7 @@ async fn write(_lua: Lua, this: UserDataRef<Conn>, data: LuaString) -> LuaResult
 
 /// The stream is shared by a read and a write at once, so both go through
 /// its readiness API instead of the exclusive `AsyncRead`/`AsyncWrite` one.
-async fn read_some(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+async fn read_some(stream: &Stream, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         stream.readable().await?;
         match stream.try_read(buf) {
@@ -623,7 +689,7 @@ async fn read_some(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+async fn write_all(stream: &Stream, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
         stream.writable().await?;
         match stream.try_write(data) {
@@ -647,7 +713,10 @@ fn close(_lua: &Lua, this: &Conn) -> LuaResult<()> {
 }
 
 lua_class! {
-    /// A TCP connection opened by `maki.net.connect`.
+    /// A TCP or Unix socket connection.
+    ///
+    /// `maki.net.connect` opens a TCP one and `maki.net.connect_unix` a Unix
+    /// socket one.
     ///
     /// `read` and `write` yield until done and can run at the same time.
     /// The connection closes on `:close()`, when the handle is garbage
@@ -656,7 +725,7 @@ lua_class! {
 }
 
 lua_table! {
-    /// HTTP and plain TCP for plugins.
+    /// HTTP, plain TCP, and Unix sockets for plugins.
     ///
     /// `request` traffic goes over HTTPS (plain HTTP is upgraded). Private
     /// and metadata IP addresses are blocked to prevent SSRF, including
@@ -668,7 +737,8 @@ lua_table! {
     /// keep-alive connection rather than pay a fresh handshake each time.
     ///
     /// `connect` follows the same rules, but only reaches hosts the plugin
-    /// lists in `net_hosts`.
+    /// lists in `net_hosts`. On Unix, `connect_unix` and `listen_unix` reach
+    /// local sockets, and need the `run` permission instead.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")
@@ -744,9 +814,13 @@ async fn extract_request_params(
     };
 
     let body = opts
-        .and_then(|o| o.get::<String>("body").ok())
-        .map(|s| s.into_bytes())
-        .unwrap_or_default();
+        .map(|o| o.opt::<LuaValue>("body"))
+        .transpose()
+        .and_then(|body| match body.flatten() {
+            Some(value) => bytes_arg(&value, "net.request body"),
+            None => Ok(Vec::new()),
+        })
+        .map_err(|e| e.to_string())?;
 
     let timeout = opts
         .and_then(|o| o.get::<u64>("timeout").ok())
@@ -1111,9 +1185,8 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, NetError>
         Some(pattern) => keep_lines_matching(&bytes, pattern),
         None => bytes,
     };
-    let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(ResponseData {
-        body,
+        body: bytes,
         status,
         content_type,
         headers: collect_headers(response.headers()),
@@ -1363,6 +1436,7 @@ mod tests {
     const EXAMPLE_URL: &str = "https://example.com";
     const ZERO_CONTENT_LENGTH: &str = "content-length: 0";
     const QUERY_SECRET: &str = "sk-not-for-logs";
+    const BINARY_PAYLOAD: &[u8] = b"before\0\xff\x80after\r\n";
     const AUTH_HEADER: &str = "Authorization";
     const AUTH_VALUE: &str = "Bearer tok";
     const ACCEPT_HEADER: &str = "Accept";
@@ -2022,15 +2096,39 @@ mod tests {
         assert_eq!(params.timeout, expected);
     }
 
+    #[test_case(false ; "string")]
+    #[test_case(true ; "buffer")]
     #[tokio::test]
-    async fn extract_params_post_with_body() {
+    async fn extract_params_post_with_binary_body(buffer: bool) {
         let lua = Lua::new();
         let opts = lua.create_table().unwrap();
         opts.set("method", "POST").unwrap();
-        opts.set("body", r#"{"key":"val"}"#).unwrap();
+        let value = if buffer {
+            LuaValue::Buffer(lua.create_buffer(BINARY_PAYLOAD).unwrap())
+        } else {
+            LuaValue::String(lua.create_string(BINARY_PAYLOAD).unwrap())
+        };
+        opts.set("body", value).unwrap();
         let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
         assert_eq!(params.method, "POST");
-        assert_eq!(params.body, br#"{"key":"val"}"#);
+        assert_eq!(params.body, BINARY_PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn extract_params_rejects_an_invalid_body() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("body", lua.create_table().unwrap()).unwrap();
+        assert!(request_params(PUBLIC_URL, Some(&opts)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn extract_params_null_body_is_empty() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("body", LuaValue::NULL).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).await.unwrap();
+        assert!(params.body.is_empty());
     }
 
     #[tokio::test]
@@ -2059,10 +2157,10 @@ mod tests {
     }
 
     #[test]
-    fn response_table_exposes_headers_by_lowercase_name() {
+    fn response_table_preserves_body_and_headers() {
         let lua = Lua::new();
         let response = ResponseData {
-            body: PAYLOAD.to_owned(),
+            body: BINARY_PAYLOAD.to_vec(),
             status: TOO_MANY_REQUESTS,
             content_type: JSON_CONTENT_TYPE.to_owned(),
             headers: vec![(RETRY_AFTER_KEY.to_owned(), RETRY_AFTER_SECS.to_owned())],
@@ -2070,14 +2168,14 @@ mod tests {
         lua.globals()
             .set("res", response.into_table(&lua).unwrap())
             .unwrap();
-        let (status, body, content_type, retry_after): (u16, String, String, String) = lua
+        let (status, returned, content_type, retry_after): (u16, LuaString, String, String) = lua
             .load(format!(
                 r#"return res.status, res.body, res.content_type, res.headers["{RETRY_AFTER_KEY}"]"#
             ))
             .eval()
             .unwrap();
         assert_eq!(status, TOO_MANY_REQUESTS);
-        assert_eq!(body, PAYLOAD);
+        assert_eq!(&*returned.as_bytes(), BINARY_PAYLOAD);
         assert_eq!(content_type, JSON_CONTENT_TYPE);
         assert_eq!(retry_after, RETRY_AFTER_SECS);
     }
@@ -2386,7 +2484,7 @@ mod tests {
         let stream = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().unwrap();
         let lua = Lua::new();
-        let conn = Conn::track(Arc::from(TEST_PLUGIN), stream);
+        let conn = Conn::track(Arc::from(TEST_PLUGIN), Stream::Tcp(stream));
         lua.globals().set("conn", conn).unwrap();
         (lua, server)
     }

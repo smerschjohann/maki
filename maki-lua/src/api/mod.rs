@@ -100,10 +100,10 @@ pub(crate) fn create_maki_global(
     // a provider registered through `maki.provider` is reachable from
     // `maki.net` without the manifest naming an origin only maki resolves.
     let egress = reach.egress().clone();
-    maki.set(
-        "net",
-        net::create_net_table(lua, permissions, egress.clone(), Arc::clone(&plugin))?,
-    )?;
+    let net = net::create_net_table(lua, permissions, egress.clone(), Arc::clone(&plugin))?;
+    #[cfg(unix)]
+    net::unix::add_unix_methods(&net, lua, permissions, Arc::clone(&plugin))?;
+    maki.set("net", net)?;
     maki.set(
         "plan",
         plan::create_plan_table(lua, ui_action_tx.clone(), permissions)?,
@@ -115,7 +115,13 @@ pub(crate) fn create_maki_global(
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(
         "session",
-        session::create_session_table(lua, ui_action_tx.clone(), permissions, permissions.clone())?,
+        session::create_session_table(
+            lua,
+            ui_action_tx.clone(),
+            permissions,
+            permissions.clone(),
+            Arc::clone(&plugin),
+        )?,
     )?;
     maki.set(
         "model",

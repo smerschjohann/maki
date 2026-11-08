@@ -53,6 +53,7 @@ pub(crate) struct OpenAiCompatConfig {
     pub base_url: Cow<'static, str>,
     pub max_tokens_field: Cow<'static, str>,
     pub include_stream_usage: bool,
+    pub usage_cost: bool,
     pub provider_name: Cow<'static, str>,
 }
 
@@ -243,12 +244,8 @@ impl OpenAiCompatProvider {
             "sending API request"
         );
 
-        super::send_request(&self.client, request, |response| async move {
-            if response.status().as_u16() == 200 {
-                parse_sse(super::body_reader(response), event_tx, self.stream_timeout).await
-            } else {
-                Err(AgentError::from_response(response).await)
-            }
+        super::ok_sse(&self.client, request, |body| {
+            parse_sse(body, event_tx, self.stream_timeout, self.config.usage_cost)
         })
         .await
     }
@@ -587,18 +584,66 @@ impl ToolAccumulator {
     }
 }
 
-pub(crate) fn reasoning_and_text_blocks(reasoning: String, text: String) -> Vec<ContentBlock> {
-    let mut blocks = Vec::new();
-    if !reasoning.is_empty() {
-        blocks.push(ContentBlock::Thinking {
-            thinking: reasoning,
-            signature: None,
-        });
+/// The text and reasoning streamed so far. The leading whitespace some models
+/// open their answer with is trimmed off its first delta.
+#[derive(Default)]
+pub(crate) struct StreamedText {
+    text: String,
+    pub(crate) reasoning: String,
+    text_started: bool,
+}
+
+impl StreamedText {
+    pub(crate) async fn push_text(
+        &mut self,
+        delta: String,
+        event_tx: &Sender<ProviderEvent>,
+    ) -> Result<(), AgentError> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let delta = if self.text_started {
+            delta
+        } else {
+            self.text_started = true;
+            delta.trim_start().to_owned()
+        };
+        if !delta.is_empty() {
+            self.text.push_str(&delta);
+            event_tx
+                .send_async(ProviderEvent::TextDelta { text: delta })
+                .await?;
+        }
+        Ok(())
     }
-    if !text.is_empty() {
-        blocks.push(ContentBlock::Text { text });
+
+    pub(crate) async fn push_reasoning(
+        &mut self,
+        delta: String,
+        event_tx: &Sender<ProviderEvent>,
+    ) -> Result<(), AgentError> {
+        if !delta.is_empty() {
+            self.reasoning.push_str(&delta);
+            event_tx
+                .send_async(ProviderEvent::ThinkingDelta { text: delta })
+                .await?;
+        }
+        Ok(())
     }
-    blocks
+
+    pub(crate) fn into_blocks(self) -> Vec<ContentBlock> {
+        let mut blocks = Vec::new();
+        if !self.reasoning.is_empty() {
+            blocks.push(ContentBlock::Thinking {
+                thinking: self.reasoning,
+                signature: None,
+            });
+        }
+        if !self.text.is_empty() {
+            blocks.push(ContentBlock::Text { text: self.text });
+        }
+        blocks
+    }
 }
 
 pub(crate) fn parse_tool_input(tool: &str, arguments: &str) -> Value {
@@ -635,15 +680,14 @@ pub async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
+    usage_cost: bool,
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
 
-    let mut text = String::new();
-    let mut reasoning_text = String::new();
+    let mut streamed = StreamedText::default();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
@@ -686,7 +730,7 @@ pub async fn parse_sse(
                 output: u.completion_tokens,
                 cache_read: cached,
                 cache_creation: 0,
-                cost: if u.billed.is_present() {
+                cost: if usage_cost && u.billed.is_present() {
                     u.billed.total()
                 } else {
                     chunk
@@ -715,28 +759,11 @@ pub async fn parse_sse(
             .flatten()
             .find(|s| !s.is_empty())
         {
-            reasoning_text.push_str(&reasoning);
-            event_tx
-                .send_async(ProviderEvent::ThinkingDelta { text: reasoning })
-                .await?;
+            streamed.push_reasoning(reasoning, event_tx).await?;
         }
 
         match delta.content {
-            Some(ContentDelta::String(content_str)) if !content_str.is_empty() => {
-                let content = if is_first_content {
-                    is_first_content = false;
-                    content_str.trim_start().to_string()
-                } else {
-                    content_str
-                };
-
-                if !content.is_empty() {
-                    text.push_str(&content);
-                    event_tx
-                        .send_async(ProviderEvent::TextDelta { text: content })
-                        .await?;
-                }
-            }
+            Some(ContentDelta::String(content)) => streamed.push_text(content, event_tx).await?,
             Some(ContentDelta::Array(content_array)) => {
                 for part in content_array {
                     match part {
@@ -748,31 +775,11 @@ pub async fn parse_sse(
                                     }) => content_str,
                                     ThinkingDelta::String(content_str) => content_str,
                                 };
-
-                                if content.is_empty() {
-                                    continue;
-                                }
-
-                                reasoning_text.push_str(&content);
-                                event_tx
-                                    .send_async(ProviderEvent::ThinkingDelta { text: content })
-                                    .await?;
+                                streamed.push_reasoning(content, event_tx).await?;
                             }
                         }
-                        ContentDeltaPart::Text { text: content_str } => {
-                            let content = if is_first_content {
-                                is_first_content = false;
-                                content_str.trim_start().to_string()
-                            } else {
-                                content_str
-                            };
-
-                            if !content.is_empty() {
-                                text.push_str(&content);
-                                event_tx
-                                    .send_async(ProviderEvent::TextDelta { text: content })
-                                    .await?;
-                            }
+                        ContentDeltaPart::Text { text } => {
+                            streamed.push_text(text, event_tx).await?;
                         }
                     }
                 }
@@ -818,7 +825,7 @@ pub async fn parse_sse(
         }
     }
 
-    let mut content_blocks = reasoning_and_text_blocks(reasoning_text, text);
+    let mut content_blocks = streamed.into_blocks();
 
     for acc in tool_accumulators {
         let input = parse_tool_input(&acc.name, &acc.arguments);
@@ -929,7 +936,7 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
         let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -959,7 +966,7 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -970,13 +977,14 @@ data: [DONE]\n";
 
     /// OpenRouter quotes the bill on the same chunk as the token counts, so the
     /// counts have to come through whatever it says the price is.
-    #[test_case(json!(0.00045), Some(0.00045)   ; "number")]
-    #[test_case(json!("0.00045"), Some(0.00045) ; "quoted_number")]
-    #[test_case(json!("free"), None             ; "unparsable_string")]
-    #[test_case(json!({"usd": 0.00045}), None   ; "unknown_shape")]
-    #[test_case(json!(null), None               ; "null")]
+    #[test_case(json!(0.00045), true, Some(0.00045)   ; "number")]
+    #[test_case(json!("0.00045"), true, Some(0.00045) ; "quoted_number")]
+    #[test_case(json!(67807), false, None             ; "ignored_when_disabled")]
+    #[test_case(json!("free"), true, None             ; "unparsable_string")]
+    #[test_case(json!({"usd": 0.00045}), true, None   ; "unknown_shape")]
+    #[test_case(json!(null), true, None               ; "null")]
     #[tokio::test]
-    async fn parse_sse_cost_from_usage(cost: Value, expected: Option<f64>) {
+    async fn parse_sse_cost_from_usage(cost: Value, usage_cost: bool, expected: Option<f64>) {
         let chunk = json!({
             "choices": [{"finish_reason": "stop", "delta": {}}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 10, "cost": cost},
@@ -984,9 +992,14 @@ data: [DONE]\n";
         let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let resp = parse_sse(
+            Cursor::new(sse.as_bytes()),
+            &tx,
+            TEST_STREAM_TIMEOUT,
+            usage_cost,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
         assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
@@ -1011,7 +1024,7 @@ data: [DONE]\n";
         let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, true)
             .await
             .unwrap();
 
@@ -1037,7 +1050,7 @@ data: [DONE]\n";
         );
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, true)
             .await
             .unwrap();
 
@@ -1055,7 +1068,7 @@ data: [DONE]\n";
         let second = json!({"usage": billing});
         let sse = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n");
         let (tx, _rx) = flume::unbounded();
-        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, true)
             .await
             .unwrap();
         assert_eq!(response.usage.cost, expected);
@@ -1068,7 +1081,7 @@ data: [DONE]\n";
     async fn later_comment_updates_previous_bill(comment: &str, expected: Option<f64>) {
         let sse = format!("data: {{\"usage\":{{\"cost\":0.5}}}}\n\n{comment}\n\ndata: [DONE]\n");
         let (tx, _rx) = flume::unbounded();
-        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, true)
             .await
             .unwrap();
         assert_eq!(response.usage.cost, expected);
@@ -1079,7 +1092,7 @@ data: [DONE]\n";
         let sse =
             "data: {\"usage\":{\"cost\":0.5}}\n\n: cost {\"request_cost_usd\":0}\n\ndata: [DONE]\n";
         let (tx, _rx) = flume::unbounded();
-        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, true)
             .await
             .unwrap();
         assert_eq!(response.usage.cost, Some(0.0));
@@ -1103,7 +1116,7 @@ data: [DONE]\n";
         let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -1134,7 +1147,7 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
         let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -1165,13 +1178,67 @@ data: [DONE]\n";
         let sse = format!("data: {{\"choices\":[{{\"delta\":{delta}}}]}}\n\ndata: [DONE]\n");
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
         assert!(
             matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "think")
         );
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Kind {
+        Text,
+        Reasoning,
+    }
+
+    fn owned(deltas: &[(Kind, &str)]) -> Vec<(Kind, String)> {
+        deltas
+            .iter()
+            .map(|&(kind, text)| (kind, text.into()))
+            .collect()
+    }
+
+    #[test_case(&[(Kind::Text, ""), (Kind::Text, "\n Hi")], &[(Kind::Text, "Hi")], &[(Kind::Text, "Hi")] ; "empty_first_part_keeps_trim")]
+    #[test_case(&[(Kind::Text, "  Hi"), (Kind::Text, " there")], &[(Kind::Text, "Hi"), (Kind::Text, " there")], &[(Kind::Text, "Hi there")] ; "only_first_text_delta_trimmed")]
+    #[test_case(&[(Kind::Reasoning, " think"), (Kind::Text, "\nHi")], &[(Kind::Reasoning, " think"), (Kind::Text, "Hi")], &[(Kind::Reasoning, " think"), (Kind::Text, "Hi")] ; "reasoning_first_keeps_text_trim")]
+    #[tokio::test]
+    async fn streamed_text_trims_leading_whitespace_once(
+        pushed: &[(Kind, &str)],
+        sent: &[(Kind, &str)],
+        blocks: &[(Kind, &str)],
+    ) {
+        let (tx, rx) = flume::unbounded();
+        let mut streamed = StreamedText::default();
+        for &(kind, delta) in pushed {
+            match kind {
+                Kind::Text => streamed.push_text(delta.into(), &tx).await,
+                Kind::Reasoning => streamed.push_reasoning(delta.into(), &tx).await,
+            }
+            .unwrap();
+        }
+
+        let events: Vec<_> = rx
+            .try_iter()
+            .map(|event| match event {
+                ProviderEvent::TextDelta { text } => (Kind::Text, text),
+                ProviderEvent::ThinkingDelta { text } => (Kind::Reasoning, text),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(events, owned(sent));
+
+        let built: Vec<_> = streamed
+            .into_blocks()
+            .into_iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => (Kind::Text, text),
+                ContentBlock::Thinking { thinking, .. } => (Kind::Reasoning, thinking),
+                other => panic!("unexpected block {other:?}"),
+            })
+            .collect();
+        assert_eq!(built, owned(blocks));
     }
 
     #[test]
@@ -1271,7 +1338,7 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
         let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -1304,7 +1371,7 @@ data: [DONE]\n";
 data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n";
 
         let (tx, _rx) = flume::unbounded();
-        let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap_err();
 
@@ -1329,7 +1396,7 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -1348,6 +1415,7 @@ data: [DONE]\n";
                 Cursor::new(TWO_UNNAMED_TOOL_CALLS_SSE.as_bytes()),
                 &tx,
                 TEST_STREAM_TIMEOUT,
+                false,
             )
             .await
             .unwrap();
@@ -1404,7 +1472,7 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -1430,7 +1498,7 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -1532,7 +1600,7 @@ data: [DONE]\n";
     async fn parse_sse_empty_stream() {
         let sse = "data: [DONE]\n";
         let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
         assert!(resp.message.content.is_empty());
@@ -1553,7 +1621,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
 data: [DONE]\n";
 
         let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
             .await
             .unwrap();
 
@@ -1584,6 +1652,7 @@ data: [DONE]\n";
         base_url: Cow::Borrowed("https://example.test/v1"),
         max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
+        usage_cost: false,
         provider_name: Cow::Borrowed("test"),
     };
 

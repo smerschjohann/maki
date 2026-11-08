@@ -50,7 +50,6 @@ use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
-use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
 use tokio::runtime::Handle;
@@ -60,26 +59,28 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    AgentHandles, ModelSlot, ModelSlots, Respawn,
+    AgentDeps, AgentHandles, ModelSlot, ModelSlots, Respawn,
     shared_queue::{Compaction, QueueItem, QueuedInput},
 };
 use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::TaskWatch;
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
+use crate::appearance::{self, Background};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::keybindings::key;
 use crate::components::usage_modal::UsageFetchState;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{Action, ExitRequest};
 use crate::decor_worker;
 use crate::input::InputReader;
+use crate::present::present;
 use crate::repaint::{Dirty, IDLE_POLL};
 use crate::theme;
 use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
-use crate::terminal;
+use crate::terminal::{self, BlockedKind, ProgramState, ProgramStatusReporter};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
@@ -91,6 +92,9 @@ const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 const FORKED_MSG: &str = "Forked, {key} to switch back";
+/// A `/reload` cannot ask the terminal: its input reader owns the tty.
+const RESTART_FOR_BACKGROUND: &str =
+    "ui.theme: restart Maki to detect the terminal background, using dark until then";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -162,6 +166,7 @@ struct RunNotificationState {
     response_candidate: Option<String>,
     pending_completion: Option<PendingCompletion>,
     last_attention: Option<Notification>,
+    outcome: Option<ProgramState>,
 }
 
 impl RunNotificationState {
@@ -172,6 +177,7 @@ impl RunNotificationState {
     fn on_queue_item_consumed(&mut self) {
         self.response_candidate = None;
         self.pending_completion = None;
+        self.outcome = None;
     }
 
     fn on_turn_complete(&mut self, message: &Message) {
@@ -180,10 +186,14 @@ impl RunNotificationState {
 
     fn on_done(&mut self, event: &AgentEvent) {
         let notification = match event {
-            AgentEvent::Done { .. } => Notification::TurnComplete {
-                response: self.response_candidate.take(),
-            },
+            AgentEvent::Done { .. } => {
+                self.outcome = Some(ProgramState::Done);
+                Notification::TurnComplete {
+                    response: self.response_candidate.take(),
+                }
+            }
             AgentEvent::Error { .. } => {
+                self.outcome = Some(ProgramState::Error);
                 self.response_candidate = None;
                 Notification::error_completion()
             }
@@ -218,20 +228,21 @@ impl RunNotificationState {
         &mut self,
         attention: Option<Notification>,
         status: SessionStatus,
-        queue_empty: bool,
     ) -> Option<Notification> {
-        let settled = attention.is_none() && status == SessionStatus::Idle && queue_empty;
+        let settled = attention.is_none() && status == SessionStatus::Idle;
         let prompt = (attention != self.last_attention)
             .then(|| attention.clone())
             .flatten();
         self.last_attention = attention;
 
-        // A due completion is decided on its first reconcile: fire if the
-        // session settled, otherwise drop it for good.
+        // A turn can end while work goes on, and queued input or a background
+        // task may wake the agent again. So the completion waits until the
+        // session waits on the user (see `App::is_working`), and new work
+        // drops it.
         let completion = match self.pending_completion.take() {
-            Some(PendingCompletion::Due(notification)) => settled.then_some(notification),
-            waiting => {
-                self.pending_completion = waiting;
+            Some(PendingCompletion::Due(notification)) if settled => Some(notification),
+            pending => {
+                self.pending_completion = pending;
                 None
             }
         };
@@ -281,6 +292,32 @@ fn select_notification(
         (selected @ Some(_), _) => selected,
         (None, candidate) => candidate,
     }
+}
+
+fn blocked_kind(attention: Option<&Notification>) -> BlockedKind {
+    match attention {
+        Some(Notification::AuthenticationRequired) => BlockedKind::Auth,
+        Some(Notification::QuestionRequested) => BlockedKind::Question,
+        _ => BlockedKind::Permission,
+    }
+}
+
+fn program_state_rank(state: ProgramState) -> u8 {
+    match state {
+        ProgramState::Idle => 0,
+        ProgramState::Done => 1,
+        ProgramState::Error => 2,
+        ProgramState::Working => 3,
+        ProgramState::Blocked(_) => 4,
+    }
+}
+
+fn select_program_status<T>(
+    candidates: impl Iterator<Item = (ProgramState, bool, T)>,
+) -> Option<(ProgramState, T)> {
+    candidates
+        .max_by_key(|&(state, focused, _)| (program_state_rank(state), focused))
+        .map(|(state, _, payload)| (state, payload))
 }
 
 /// Maki never turns focus reporting on under Windows, so anything that looks
@@ -390,26 +427,25 @@ impl SessionRuntime {
         self.app.state.session.id
     }
 
+    fn program_state(&self) -> (ProgramState, Option<String>) {
+        let state = match self.last_status {
+            SessionStatus::NeedsInput => {
+                let attention = self.app.attention();
+                let msg = attention.as_ref().map(Notification::message);
+                return (ProgramState::Blocked(blocked_kind(attention.as_ref())), msg);
+            }
+            SessionStatus::Working => ProgramState::Working,
+            SessionStatus::Idle => self.notifications.outcome.unwrap_or(ProgramState::Idle),
+        };
+        (state, None)
+    }
+
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
     fn reset_run_notifications(&mut self) {
         if self.notifications.waiting_for_drain() {
             self.app.clear_exit_request();
         }
         self.notifications.reset();
-    }
-
-    /// A wake may only start a background run when the session is fully
-    /// quiescent. Not [`SessionStatus`]: background work keeps that working,
-    /// and a wake is how that work ends. Nor the turn's end alone: restored
-    /// queue items start runs without `start_run` (the app only learns of
-    /// them via `QueueItemConsumed`), and `start_run` destroys text held
-    /// for recovery after an agent error.
-    fn quiescent(&self) -> bool {
-        self.app.status != Status::Streaming
-            && !self.app.awaiting_input()
-            && self.handles.queue.is_empty()
-            && !self.app.holds_recovery_text()
-            && self.app.takes_mailbox_runs()
     }
 }
 
@@ -459,11 +495,13 @@ impl SpawnCtx {
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
-            self.timeouts,
             self.lua_event_handle.clone(),
-            self.mcp_handle.clone(),
-            self.mcp_config_errors.clone(),
-            Arc::clone(&self.model_policy),
+            AgentDeps {
+                mcp_handle: self.mcp_handle.clone(),
+                mcp_config_errors: self.mcp_config_errors.clone(),
+                timeouts: self.timeouts,
+                model_policy: Arc::clone(&self.model_policy),
+            },
         );
         let mut app = App::new(
             &slot.model,
@@ -471,7 +509,7 @@ impl SpawnCtx {
             self.storage.clone(),
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
-            handles.mcp_config_errors.clone(),
+            handles.deps.mcp_config_errors.clone(),
             self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
@@ -515,6 +553,7 @@ pub(crate) struct EventLoop<'t> {
     last_mode: InputMode,
     focus: Focus,
     notifier: Option<terminal::TerminalNotifier>,
+    program_status: Option<ProgramStatusReporter>,
     ctx: SpawnCtx,
     slots: ModelSlots,
     input: InputReader,
@@ -676,7 +715,12 @@ impl<'t> EventLoop<'t> {
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
         // in-memory name is set, so the user's saved pick survives.
-        if let Some(ref name) = ui_config.theme {
+        if let Some(ref pair) = ui_config.theme {
+            let background = appearance::background();
+            if pair.follows_background() && background.is_none() {
+                startup_warnings.push(RESTART_FOR_BACKGROUND.to_owned());
+            }
+            let name = pair.name(background == Some(Background::Light));
             match crate::theme::load_by_name(name) {
                 Ok(theme) => {
                     crate::theme::set_current_name(name);
@@ -711,6 +755,7 @@ impl<'t> EventLoop<'t> {
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
+        let program_status = ui_config.program_status.then(ProgramStatusReporter::new);
         let ctx = SpawnCtx {
             storage,
             config,
@@ -749,8 +794,9 @@ impl<'t> EventLoop<'t> {
         }
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
-        app.exit_on_done = exit_on_done;
-        app.background_wait = background_wait;
+        if exit_on_done {
+            app.exit_when_done(background_wait);
+        }
         if needs_login {
             app.login_picker.open(app.storage.clone());
         }
@@ -777,6 +823,7 @@ impl<'t> EventLoop<'t> {
             last_mode: InputMode::Insert,
             focus: Focus::default(),
             notifier,
+            program_status,
             ctx,
             slots,
             input: InputReader::new().context("watch terminal input")?,
@@ -798,28 +845,13 @@ impl<'t> EventLoop<'t> {
         &mut self.sessions[self.focused].app
     }
 
-    /// Paints a frame and parks the terminal cursor on the cell the input box
-    /// reversed, without showing it. macOS anchors IME preedit text to the
-    /// cursor, so it has to sit there, but a visible one would invert that
-    /// already reversed cell back to plain text and ride along with every cell
-    /// the next diff writes.
-    ///
-    /// `Frame::set_cursor_position` cannot do this: ratatui shows the cursor
-    /// whenever a frame asks for a position. Hence the move after the draw,
-    /// and the hide that goes with it, so a widget that does ask for one
-    /// cannot bring the block cursor back.
     fn paint(&mut self) -> Result<()> {
         let app = &mut self.sessions[self.focused].app;
-        let mut cursor = None;
-        self.terminal.draw(|f| {
-            cursor = app.view(f);
-            color_compat::downgrade_if_needed(f.buffer_mut());
+        present(self.terminal, |frame| {
+            let caret = app.view(frame);
+            color_compat::downgrade_if_needed(frame.buffer_mut());
+            caret
         })?;
-        if let Some(pos) = cursor {
-            self.terminal.hide_cursor()?;
-            self.terminal.set_cursor_position(pos)?;
-            self.terminal.backend_mut().flush()?;
-        }
         Ok(())
     }
 
@@ -859,8 +891,8 @@ impl<'t> EventLoop<'t> {
                 // A result settling since the drain above both clears its
                 // receipt and wakes the session, so the wake is claimed after
                 // the read: its run goes first, and that run's drain exits.
-                if self.sessions[i].app.exit_on_done {
-                    dirty |= self.start_mailbox_runs();
+                if self.sessions[i].app.exits_on_done() {
+                    dirty |= self.start_woken_runs();
                 }
                 if self.sessions[i].app.exit_request != ExitRequest::None {
                     // A backgrounded session can finish an `exit_on_done` turn.
@@ -999,7 +1031,7 @@ impl<'t> EventLoop<'t> {
             }
             AgentEvent::QueueItemConsumed { .. } if current => {
                 rt.notifications.on_queue_item_consumed();
-                if rt.app.exit_on_done {
+                if rt.app.exits_on_done() {
                     rt.app.clear_exit_request();
                 }
             }
@@ -1009,8 +1041,7 @@ impl<'t> EventLoop<'t> {
             event if current => rt.notifications.on_done(event),
             _ => {}
         }
-        let actions = self.sessions[idx].app.update(Msg::Agent(envelope));
-        self.dispatch(idx, actions);
+        self.sessions[idx].app.update(Msg::Agent(envelope));
     }
 
     async fn drain_channels(&mut self) -> Result<Dirty> {
@@ -1038,7 +1069,7 @@ impl<'t> EventLoop<'t> {
         self.sessions[self.focused]
             .app
             .announce_mode(&mut self.last_mode);
-        dirty |= self.start_mailbox_runs();
+        dirty |= self.start_woken_runs();
         self.emit_status_changes();
         self.emit_title_changes();
         for rt in &mut self.sessions {
@@ -1046,6 +1077,7 @@ impl<'t> EventLoop<'t> {
         }
         self.emit_task_changes();
         self.emit_notifications();
+        self.emit_program_status();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
         // can never send it, so fail instead of hanging forever.
         if let Some(runtime) = self.sessions.iter().find(|rt| {
@@ -1178,8 +1210,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 // A straggler after `/new` finds no tab and is dropped.
                 if let Some(idx) = self.sessions.iter().position(|rt| rt.id() == session) {
-                    let actions = self.sessions[idx].app.deliver(*envelope, Some(plugin));
-                    self.dispatch(idx, actions);
+                    self.sessions[idx].app.deliver(*envelope, Some(plugin));
                 }
             }
             UiAction::PluginTaskOpened {
@@ -1290,11 +1321,9 @@ impl<'t> EventLoop<'t> {
         };
         let mut selected = None;
         for rt in &mut self.sessions {
-            let candidate = rt.notifications.reconcile(
-                rt.app.attention(),
-                rt.last_status,
-                rt.handles.queue.is_empty(),
-            );
+            let candidate = rt
+                .notifications
+                .reconcile(rt.app.attention(), SessionStatus::of(&rt.app));
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected.filter(|n| self.focus.allows(n))
@@ -1302,6 +1331,36 @@ impl<'t> EventLoop<'t> {
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
             self.notifier = None;
+        }
+    }
+
+    fn clear_program_status(&mut self) {
+        if let Some(reporter) = &mut self.program_status
+            && let Err(error) = reporter.clear()
+        {
+            warn!(%error, "failed to clear program status");
+        }
+    }
+
+    fn emit_program_status(&mut self) {
+        let Some(reporter) = &mut self.program_status else {
+            return;
+        };
+        let focused = self.focused;
+        let candidates = self.sessions.iter().enumerate().map(|(i, rt)| {
+            let (state, msg) = rt.program_state();
+            (
+                state,
+                i == focused,
+                (rt.app.state.session.title.as_str(), msg),
+            )
+        });
+        let Some((state, (title, msg))) = select_program_status(candidates) else {
+            return;
+        };
+        if let Err(error) = reporter.report(state, title, msg.as_deref()) {
+            warn!(%error, "program status reporting disabled after write failure");
+            self.program_status = None;
         }
     }
 
@@ -1341,23 +1400,11 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn start_mailbox_runs(&mut self) -> Dirty {
-        let ready: Vec<_> = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, runtime)| {
-                if !runtime.quiescent() {
-                    return None;
-                }
-                let preamble = runtime.handles.claim_mailbox_wake();
-                (!preamble.is_empty()).then_some((index, preamble))
-            })
-            .collect();
-
-        let dirty = Dirty::from(!ready.is_empty());
-        for (index, preamble) in ready {
-            let actions = self.sessions[index].app.start_mailbox_run(preamble);
+    fn start_woken_runs(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        for index in 0..self.sessions.len() {
+            let actions = self.sessions[index].app.start_woken_run();
+            dirty |= Dirty::from(!actions.is_empty());
             self.dispatch(index, actions);
         }
         dirty
@@ -1955,17 +2002,12 @@ impl<'t> EventLoop<'t> {
     fn respawn_agent(&mut self, idx: usize, history: Vec<Message>, reason: Respawn) {
         let rt = &mut self.sessions[idx];
         rt.reset_run_notifications();
-        let lua_handle = rt.app.lua_event_handle.clone();
-        let permissions = Arc::clone(&rt.app.permissions);
-        let slot = Arc::clone(&rt.slot);
         rt.handles.respawn(
             history,
-            &slot,
+            &rt.slot,
             self.ctx.config.clone(),
             self.ctx.ui_config.tool_output_lines,
-            &permissions,
             &mut rt.app,
-            lua_handle,
             reason,
         );
     }
@@ -2086,6 +2128,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::PreparePack(command) => self.start_pack(idx, command),
             Action::Suspend => {
+                self.clear_program_status();
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
@@ -2196,6 +2239,9 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request.clone();
+        if !self.sessions[self.focused].app.exits_on_done() {
+            self.clear_program_status();
+        }
         // The loop already stopped draining `UiAction`, so say so before the
         // handlers run. Dropping the receiver does not, since the Lua runtime
         // holds one of its own, and a handler touching the UI would then park
@@ -2310,6 +2356,35 @@ mod tests {
         state
     }
 
+    const FOCUSED_TITLE: &str = "focused";
+    const BACKGROUND_TITLE: &str = "background";
+
+    #[test_case(ProgramState::Idle, ProgramState::Working, BACKGROUND_TITLE ; "background_working_beats_focused_idle")]
+    #[test_case(ProgramState::Blocked(BlockedKind::Question), ProgramState::Working, FOCUSED_TITLE ; "blocked_beats_working")]
+    #[test_case(ProgramState::Done, ProgramState::Error, BACKGROUND_TITLE ; "error_beats_done")]
+    #[test_case(ProgramState::Done, ProgramState::Done, FOCUSED_TITLE ; "tie_goes_to_focused")]
+    fn select_program_status_cases(
+        focused: ProgramState,
+        background: ProgramState,
+        expected_title: &str,
+    ) {
+        let candidates = [
+            (background, false, BACKGROUND_TITLE),
+            (focused, true, FOCUSED_TITLE),
+            (background, false, BACKGROUND_TITLE),
+        ];
+        let (_, title) = select_program_status(candidates.into_iter()).unwrap();
+        assert_eq!(title, expected_title);
+    }
+
+    #[test]
+    fn outcome_survives_drain_and_clears_on_next_run() {
+        let mut state = due_completion();
+        assert_eq!(state.outcome, Some(ProgramState::Done));
+        state.on_queue_item_consumed();
+        assert_eq!(state.outcome, None);
+    }
+
     #[test]
     fn completion_waits_for_queue_drain() {
         let mut state = RunNotificationState {
@@ -2319,47 +2394,51 @@ mod tests {
 
         state.on_done(&done_event());
         assert!(state.waiting_for_drain());
-        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
+        assert_eq!(state.reconcile(None, SessionStatus::Idle), None);
 
         state.on_drain();
         assert!(!state.waiting_for_drain());
         assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true),
+            state.reconcile(None, SessionStatus::Idle),
             Some(Notification::TurnComplete {
                 response: Some("done".into())
             })
         );
     }
 
-    #[test_case(SessionStatus::Idle, true, true ; "fires_when_settled")]
-    #[test_case(SessionStatus::Idle, false, false ; "queued_message_swallows")]
-    #[test_case(SessionStatus::Working, true, false ; "busy_session_swallows")]
-    fn due_completion_is_decided_on_first_reconcile(
-        status: SessionStatus,
-        queue_empty: bool,
-        fires: bool,
-    ) {
+    #[test_case(false, true ; "fires_once_the_session_settles")]
+    #[test_case(true, false ; "new_work_drops_it")]
+    fn due_completion_waits_while_the_session_works(new_work: bool, fires: bool) {
         let mut state = due_completion();
+        assert_eq!(state.reconcile(None, SessionStatus::Working), None);
 
-        let first = state.reconcile(None, status, queue_empty);
-        assert_eq!(first.is_some(), fires);
-        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
+        if new_work {
+            state.on_queue_item_consumed();
+        }
+
+        assert_eq!(state.reconcile(None, SessionStatus::Idle).is_some(), fires);
+        assert_eq!(state.reconcile(None, SessionStatus::Idle), None);
     }
 
+    /// A background task can ask something after the turn ended. The turn
+    /// still notifies once the user answers and the work is done.
     #[test]
     fn prompt_wins_over_completion_and_is_not_repeated_unchanged() {
         let prompt = Notification::QuestionRequested;
         let mut state = due_completion();
 
         assert_eq!(
-            state.reconcile(Some(prompt.clone()), SessionStatus::Idle, true),
+            state.reconcile(Some(prompt.clone()), SessionStatus::NeedsInput),
             Some(prompt.clone())
         );
         assert_eq!(
-            state.reconcile(Some(prompt), SessionStatus::NeedsInput, true),
+            state.reconcile(Some(prompt), SessionStatus::NeedsInput),
             None
         );
-        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle),
+            Some(Notification::TurnComplete { response: None })
+        );
     }
 
     #[test_case(Focus::Focused, false ; "watching_user_already_saw_the_turn_end")]

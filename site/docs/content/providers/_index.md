@@ -41,7 +41,7 @@ You can also set `base_url` for a built-in provider in `~/.config/maki/providers
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+The built-in provider still owns the slug, so `api_key_env`, `discover_models`, `models` and `protocol` are ignored with a warning. Use a custom slug if you need those. `ollama` and `llama-cpp` read `protocol` values `openai` and `openai-responses` to pick the chat or Responses API.
 
 ## Built-in Providers
 
@@ -103,6 +103,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
 | Medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-6.1-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
+| Medium | gpt-6.1-terra | $1.00 / $5.00 | 1050K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
@@ -712,7 +713,7 @@ local function credentials()
   if stored then
     return stored
   end
-  local text = maki.fs.read(maki.fs.normalize("~/.maki/auth/acme.json"))
+  local text = maki.fs.read(maki.fs.normalize("~/.local/state/maki/auth/acme.json"))
   if not text then
     return nil
   end
