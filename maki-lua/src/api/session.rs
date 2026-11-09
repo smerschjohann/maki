@@ -15,6 +15,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message, Role};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
+use maki_storage::paths::session_data_dir;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::{Map, Value as JsonValue};
 use tokio::task::{spawn_blocking, yield_now};
@@ -26,6 +27,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{TableExt, json_to_lua, json_to_lua_exact, lua_to_json};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::{Permission, PluginPermissions, require};
+use crate::runtime::Lineage;
 use crate::session_snapshot::SessionSnapshot;
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
@@ -313,14 +315,7 @@ async fn transcript(
 /// The serde shape, nulls as `maki.NIL`. An image block is built around a
 /// handle on its payload, which is never copied, not even into JSON.
 fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
-    let envelope = Message {
-        role: message.role.clone(),
-        content: Vec::new(),
-        display_text: message.display_text.clone(),
-        kind: message.kind.clone(),
-        receipts: message.receipts.clone(),
-        settles: message.settles.clone(),
-    };
+    let envelope = message.with_content(Vec::new());
     let json = serde_json::to_value(&envelope).map_err(mlua::Error::external)?;
     let table = lua.unpack::<Table>(json_to_lua_exact(lua, &json)?)?;
     let content = lua.create_table_with_capacity(message.content.len(), 0)?;
@@ -357,6 +352,16 @@ async fn messages_table(lua: &Lua, messages: &[Message]) -> LuaResult<Table> {
     }
     out.set_metatable(Some(lua.array_metatable()))?;
     Ok(out)
+}
+
+/// The newest `last` of {messages}, or all of them.
+pub(crate) async fn newest_messages_table(
+    lua: &Lua,
+    messages: &[Message],
+    last: Option<usize>,
+) -> LuaResult<Table> {
+    let skip = last.map_or(0, |n| messages.len().saturating_sub(n));
+    messages_table(lua, &messages[skip..]).await
 }
 
 async fn transcript_table(lua: &Lua, export: SessionExport) -> LuaResult<Table> {
@@ -409,7 +414,7 @@ async fn export(
 /// Each message has the same shape as in the session file:
 ///
 /// ```text
-/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, content = { blocks } }
+/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
 /// ```
 ///
 /// `kind` is `"turn"` for something the user or the model said,
@@ -421,7 +426,9 @@ async fn export(
 /// compaction note). `receipts` lists the calls whose results in this
 /// message moved to the background, and `settles` = `{ task, end }` marks the
 /// notice that answered one, with `end` one of `"finished"`, `"failed"`,
-/// `"cancelled"` or `"lost"`. `content` lists blocks:
+/// `"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
+/// that answered one piece early, like one call of a moved batch, and left
+/// the receipt open. `content` lists blocks:
 ///
 /// ```text
 /// { type = "text", text }
@@ -466,8 +473,10 @@ async fn messages(
         Some(history) => history,
         None => try_pair!(transcript(&lua, tx.as_ref(), session).await).messages,
     };
-    let skip = last.map_or(0, |n| history.len().saturating_sub(n));
-    Ok((Some(messages_table(&lua, &history[skip..]).await?), None))
+    Ok((
+        Some(newest_messages_table(&lua, &history, last).await?),
+        None,
+    ))
 }
 
 /// Returns the id of the focused session. Under `maki -p` and the sdk,
@@ -479,6 +488,56 @@ async fn messages(
 #[lua_fn]
 async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
     Ok(pair(focused_session(&lua, tx.as_ref()).await))
+}
+
+/// This plugin's directory for this session's data, as
+/// `state/sessions/data/<session>/<plugin>/`. Core owns it: the delete that
+/// takes the session takes everything written under it. Not created; make it
+/// with `maki.fs.mkdir` before the first write. A plugin's grants cover it
+/// like any other path.
+///
+/// The session defaults to the one the calling agent serves, so a tool of
+/// a background tab gets that tab's dir rather than the one on screen, and
+/// to the focused session otherwise.
+///
+/// @param opts table? `session` names another session.
+/// @return (string|nil, string|nil) The directory path, or nil and an error.
+/// @example
+/// local dir, err = maki.session.data_dir()
+/// if dir then
+///   maki.fs.mkdir(dir, { parents = true })
+///   maki.fs.write(maki.fs.joinpath(dir, "scratch.md"), text)
+/// end
+#[lua_fn]
+async fn data_dir(
+    lua: Lua,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<String>> {
+    let named = match &opts {
+        Some(opts) => opts.opt::<String>("session")?,
+        None => None,
+    };
+    let path: Result<String, String> = async {
+        let named = named
+            .map(|raw| raw.parse::<MakiId>().map_err(|e| e.to_string()))
+            .transpose()?;
+        let session = match named.or_else(|| Lineage::current(&lua).session) {
+            Some(id) => id,
+            None => focused_session(&lua, tx.as_ref())
+                .await?
+                .parse::<MakiId>()
+                .map_err(|e| e.to_string())?,
+        };
+        let state = state_dir(&lua)?;
+        Ok(session_data_dir(state.path(), session)
+            .join(&*plugin)
+            .display()
+            .to_string())
+    }
+    .await;
+    Ok(pair(path))
 }
 
 /// Switches the UI to the session with {id}.
@@ -825,11 +884,12 @@ lua_table! {
         tx: Option<flume::Sender<UiAction>>,
         perms: &PluginPermissions,
         grants: PluginPermissions,
+        plugin: Arc<str>,
     ),
     DOCS [
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx), focus(tx),
         delete(perms, tx), new(perms, tx, grants), prompt(perms, tx), notify(perms, grants),
-        set_mode(perms, tx), set_title(perms, tx),
+        set_mode(perms, tx), set_title(perms, tx), data_dir(plugin, tx),
     ]
 }
 
@@ -884,9 +944,63 @@ mod tests {
 
     fn lua_granted(tx: Option<flume::Sender<UiAction>>, grants: PluginPermissions) -> Lua {
         let lua = Lua::new();
-        let t = create_session_table(&lua, tx, &grants, grants.clone()).unwrap();
+        let t = create_session_table(&lua, tx, &grants, grants.clone(), PLUGIN.into()).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
+    }
+
+    #[test_case(headless_focused_on ; "headless_snapshot_id")]
+    #[test_case(ui_focused_on ; "ui_current_bare_id")]
+    #[tokio::test]
+    async fn data_dir_names_the_plugin_dir_under_the_session(focused_on: fn(MakiId) -> Lua) {
+        let id = MakiId::generate();
+        let tmp = TempDir::new().unwrap();
+        let lua = focused_on(id);
+        lua.set_app_data(StateDir::from_path(tmp.path().to_path_buf()));
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load("return session.data_dir()")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        let want = session_data_dir(tmp.path(), id).join(PLUGIN);
+        assert_eq!(got, Some(want.display().to_string()));
+        assert!(!want.exists(), "asking for the dir must not create it");
+    }
+
+    #[tokio::test]
+    async fn data_dir_prefers_the_named_then_the_lineage_session() {
+        use crate::runtime::{TaskCell, TaskHandle};
+        use maki_agent::cancel::CancelToken;
+        use std::sync::Mutex;
+
+        let (serving, focused) = (MakiId::generate(), MakiId::generate());
+        let tmp = TempDir::new().unwrap();
+        let lua = headless_focused_on(focused);
+        lua.set_app_data(StateDir::from_path(tmp.path().to_path_buf()));
+        let mut cell = TaskCell::new(CancelToken::none(), None, None);
+        cell.lineage.session = Some(serving);
+        lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
+
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load("return session.data_dir()")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        let want = session_data_dir(tmp.path(), serving).join(PLUGIN);
+        assert_eq!(got, Some(want.display().to_string()));
+
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load(format!(
+                "return session.data_dir({{ session = '{focused}' }})"
+            ))
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        let want = session_data_dir(tmp.path(), focused).join(PLUGIN);
+        assert_eq!(got, Some(want.display().to_string()));
     }
 
     #[tokio::test]
