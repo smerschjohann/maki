@@ -2,17 +2,21 @@ use super::segment;
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
+use crate::components::tool_display::{BACKGROUND_INDICATOR, TOOL_INDICATOR};
 use crate::markdown::{EXPAND_HINT, TRUNCATION_PREFIX};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{DocPos, Selection, SelectionZone};
+use crate::theme::Theme;
 use crate::wrap;
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use maki_config::DEFAULT_THINKING_LINES;
+use maki_markdown::render::CODE_BAR;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Duration;
@@ -139,6 +143,7 @@ fn done(id: &str) -> ToolDoneEvent {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     }
 }
 
@@ -175,6 +180,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
         is_error,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
 
     assert_eq!(panel.messages.len(), 1);
@@ -205,12 +211,13 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
 }
 
 #[test_case("line\n".repeat(200).as_str(), Some("2m timeout · 200 lines") ; "merges_start_and_output_annotations")]
-#[test_case("ok",                           Some("2m timeout · 1 lines") ; "merges_start_and_short_output")]
+#[test_case("ok",                           Some("2m timeout · 1 line") ; "merges_start_and_short_output")]
 fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let mut event = start("t1", BASH_TOOL_NAME);
@@ -224,6 +231,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
 }
@@ -251,6 +259,7 @@ fn tool_done_grep_shows_matches() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     let text = &panel.messages[0].text;
     assert!(!text.contains('\n'), "grep body should not be in msg.text");
@@ -369,6 +378,7 @@ fn unknown_tool_id_is_noop() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     assert!(panel.messages.is_empty());
 }
@@ -399,6 +409,7 @@ fn in_progress_tracking() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     assert_eq!(panel.in_progress_count(), 1);
 
@@ -410,6 +421,7 @@ fn in_progress_tracking() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     assert_eq!(panel.in_progress_count(), 0);
 }
@@ -478,6 +490,7 @@ fn events_before_cache_built_render_correctly() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
     assert!(seg_text(&panel, "t1").contains("early output"));
@@ -518,6 +531,7 @@ fn bash_live_output_with_code_input() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     let text = seg_text(&panel, "t1");
     assert!(text.contains("echo hello") && text.contains("done"));
@@ -536,6 +550,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     if cache_built {
         rebuild(&mut panel);
@@ -632,6 +647,7 @@ fn tick_drains_the_highlight_worker() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
 
@@ -677,6 +693,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     assert_eq!(panel.in_progress_count(), 0);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
@@ -723,6 +740,7 @@ fn search_text_grep_result_includes_structured_output() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -746,6 +764,7 @@ fn search_text_diff_output_includes_hunks() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -764,6 +783,7 @@ fn search_text_bash_with_code_input() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -792,6 +812,7 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
 
@@ -805,6 +826,18 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
         !seg_search(&panel, "t1").contains(BODY),
         "the parent tool renders the code, not the instructions it carried"
     );
+}
+
+#[test_case("fix src/__init__.py" ; "underscores")]
+#[test_case("--- a/x\n+++ b/x\n- old\n+ new" ; "pasted_diff")]
+#[test_case("    indented\n# not a heading" ; "indentation_and_hash")]
+fn user_message_shows_as_typed(text: &str) {
+    let message = DisplayMessage::new(DisplayRole::User, text.into());
+    let rows: Vec<String> = build_message_lines(&message, VIEW_WIDTH)
+        .iter()
+        .map(|row| row.to_string())
+        .collect();
+    assert_eq!(rows.join("\n"), format!("{}{text}", user_style().prefix));
 }
 
 #[test]
@@ -955,14 +988,14 @@ fn collapsing_a_tool_keeps_the_scroll_inside_its_segment() {
     let mut panel = panel_with_long_tool(OUTPUT_LINES);
     push_tail_msgs(&mut panel);
     let area = Rect::new(0, 0, WIDE, HEIGHT);
-    assert!(panel.toggle_expansion_at(area.y, area), "expand");
+    assert!(panel.toggle_at(area.y, area), "expand");
     render(&mut panel, WIDE, HEIGHT);
     panel.scroll_to_top();
     render(&mut panel, WIDE, HEIGHT);
     panel.scroll(DEEP_SCROLL);
     render(&mut panel, WIDE, HEIGHT);
 
-    assert!(panel.toggle_expansion_at(area.y, area), "collapse");
+    assert!(panel.toggle_at(area.y, area), "collapse");
     let terminal = render(&mut panel, WIDE, HEIGHT);
     assert_scroll_draws(&panel, &terminal);
 }
@@ -1199,6 +1232,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     render(&mut panel, 80, 24);
     panel
@@ -1210,11 +1244,11 @@ fn toggle_expand_collapse_truncated_tool() {
     let area = Rect::new(0, 0, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(panel.toggle_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(!seg_text(&panel, "t1").contains("click to expand"));
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(panel.toggle_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 }
@@ -1265,7 +1299,7 @@ fn copy_after_resize_keeps_offscreen_text() {
 fn toggle_returns_false_for_non_expandable() {
     let mut panel = panel_with_long_tool(3);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(!panel.toggle_expansion_at(area.y, area));
+    assert!(!panel.toggle_at(area.y, area));
 }
 
 fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
@@ -1294,6 +1328,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     render(&mut panel, 80, 24);
     panel
@@ -1305,11 +1340,11 @@ fn toggle_expand_collapse_grep_tool() {
     let area = Rect::new(0, 0, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(panel.toggle_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(!seg_text(&panel, "t1").contains("click to expand"));
 
-    assert!(panel.toggle_expansion_at(area.y, area));
+    assert!(panel.toggle_at(area.y, area));
     render(&mut panel, 80, 24);
     assert!(seg_text(&panel, "t1").contains("click to expand"));
 }
@@ -1366,6 +1401,7 @@ fn search_text_includes_truncated_bash_output() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
     assert!(seg_search(&panel, "t1").contains(&full_output));
@@ -1402,6 +1438,7 @@ fn done_with_instructions(id: &str) -> ToolDoneEvent {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     }
 }
 
@@ -1480,6 +1517,7 @@ fn instruction_segment_has_spacer_before_it() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
 
@@ -1514,6 +1552,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     rebuild(&mut panel);
 
@@ -1532,7 +1571,7 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(!panel.handle_click(23, area));
+    assert_eq!(panel.handle_click(23, 0, area), ClickOutcome::None);
 }
 
 #[test_case(|end, _| end - 1         => true  ; "its_last_row")]
@@ -1556,7 +1595,8 @@ fn only_the_collapsed_view_expands_streaming_thinking(click_row: fn(u32, u32) ->
         "header plus the tail"
     );
     let row = click_row(panel.layout().total_rows(), collapsed_height);
-    panel.handle_click(row as u16, Rect::new(0, 0, VIEW_WIDTH, VIEW_HEIGHT))
+    panel.handle_click(row as u16, 0, Rect::new(0, 0, VIEW_WIDTH, VIEW_HEIGHT))
+        == ClickOutcome::Handled
 }
 
 #[test]
@@ -1571,6 +1611,7 @@ fn handle_click_on_done_tool_records_click_row() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     panel.tool_snapshot(
         "t1",
@@ -1579,7 +1620,7 @@ fn handle_click_on_done_tool_records_click_row() {
     );
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
     assert_eq!(panel.lua_clicks.get("t1").map(Vec::len), Some(1));
 }
 
@@ -1594,7 +1635,7 @@ fn handle_click_on_running_tool_forwards_live_without_recording() {
     );
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
     assert!(panel.lua_clicks.is_empty());
 }
 
@@ -1602,7 +1643,7 @@ fn handle_click_on_running_tool_forwards_live_without_recording() {
 fn handle_click_returns_toggled_for_truncated_tool_without_snapshot() {
     let mut panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
 }
 
 #[test]
@@ -1614,7 +1655,7 @@ fn handle_click_non_tool_segment_returns_nothing() {
     ));
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(!panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::None);
 }
 
 #[test]
@@ -1633,6 +1674,7 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -1679,7 +1721,7 @@ fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
 
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
     let recorded = panel.lua_clicks["t1"].clone();
     assert_eq!(recorded.len(), 1);
     assert_eq!(probe.try_recv(), Some(("click_fallback", recorded)));
@@ -1716,7 +1758,7 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
 
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
     assert_eq!(panel.lua_clicks.get("t0").map(Vec::len), Some(1));
     assert_eq!(
         probe.try_recv(),
@@ -1744,7 +1786,7 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
 
     render(&mut panel, 80, 24);
     panel.scroll_to_top();
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
     let recorded = panel.lua_clicks["t0"].clone();
     assert_eq!(recorded.len(), 2);
     assert_eq!(probe.try_recv(), Some(("restore", recorded)));
@@ -1770,7 +1812,7 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
 
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
     assert_eq!(
         probe.try_recv(),
         Some(("restore", panel.lua_clicks["t1"].clone()))
@@ -1816,7 +1858,7 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
 
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
     assert_eq!(probe.try_recv(), Some(("click", vec![])));
     assert_eq!(probe.try_recv(), None);
 }
@@ -1856,7 +1898,7 @@ fn restore_reply_stops_watching_buf() {
 
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.handle_click(area.y, 0, area), ClickOutcome::Handled);
     assert_eq!(
         probe.try_recv(),
         Some(("restore", panel.lua_clicks["t1"].clone()))
@@ -1944,6 +1986,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -1968,6 +2011,7 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -1995,6 +2039,7 @@ fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     panel.tool_snapshot(
         id,
@@ -2090,6 +2135,26 @@ fn header_snapshot_stamps_gen_on_top_level() {
     assert_eq!(panel.snapshot_gen_of("t1"), Some(5), "{HEADER_GEN_MSG}");
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert!(msg.render_header.is_some(), "render_header must be set");
+}
+
+/// A headless session stores no tool outputs, so a reopened failed call has
+/// its error only in the row text. The header must keep it, and a body view
+/// must replace it, or a tail view of a long error draws it twice.
+#[test]
+fn restored_row_text_stays_until_a_body_view_lands() {
+    const ERROR_BODY: &str = "error: path not found";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.find_tool_msg_mut("t1").unwrap().text = format!("t1\n{ERROR_BODY}");
+
+    panel.tool_header_snapshot("t1", rendered_snapshot(), Some(1));
+    assert_eq!(
+        panel.find_tool_msg_mut("t1").unwrap().text,
+        format!("rendered\n{ERROR_BODY}")
+    );
+
+    panel.tool_snapshot("t1", rendered_snapshot(), Some(1));
+    assert_eq!(panel.find_tool_msg_mut("t1").unwrap().text, "rendered");
 }
 
 #[test]
@@ -2200,7 +2265,7 @@ fn click_expands_then_collapses_thinking(flushed: bool) {
     view_text(&mut panel);
 
     assert!(
-        panel.handle_click(0, view_area()),
+        panel.handle_click(0, 0, view_area()) == ClickOutcome::Handled,
         "collapsed thinking expands"
     );
     let expanded = view_text(&mut panel);
@@ -2208,7 +2273,7 @@ fn click_expands_then_collapses_thinking(flushed: bool) {
     assert!(!expanded.contains(TRUNCATION_PREFIX), "{expanded}");
 
     assert!(
-        panel.handle_click(0, view_area()),
+        panel.handle_click(0, 0, view_area()) == ClickOutcome::Handled,
         "expanded thinking collapses"
     );
     let collapsed = view_text(&mut panel);
@@ -2231,7 +2296,7 @@ fn never_collapsing_shows_everything_and_ignores_clicks(flushed: bool) {
         "{text}"
     );
     assert!(!text.contains(TRUNCATION_PREFIX), "{text}");
-    assert!(!panel.handle_click(0, view_area()));
+    assert_eq!(panel.handle_click(0, 0, view_area()), ClickOutcome::None);
 }
 
 #[test_case(false ; "streaming")]
@@ -2261,7 +2326,7 @@ fn thinking_that_fits_is_shown_in_full_and_not_clickable(flushed: bool) {
         "{text}"
     );
     assert!(!text.contains(TRUNCATION_PREFIX), "{text}");
-    assert!(!panel.handle_click(0, view_area()));
+    assert_eq!(panel.handle_click(0, 0, view_area()), ClickOutcome::None);
 }
 
 #[test]
@@ -2291,7 +2356,7 @@ fn expanded_live_thinking_stays_expanded_after_the_flush() {
     let mut panel = thinking_panel(ThinkingLines::Tail(TAIL_ROWS));
     add_thinking(&mut panel, &steps(STEP_COUNT), false);
     view_text(&mut panel);
-    assert!(panel.handle_click(0, view_area()));
+    assert_eq!(panel.handle_click(0, 0, view_area()), ClickOutcome::Handled);
 
     panel.flush();
     let text = view_text(&mut panel);
@@ -2309,7 +2374,7 @@ fn stream_reset_clears_thinking_expand_state() {
     panel.streaming_thinking.set_buffer("secret reasoning");
     render(&mut panel, 80, 10);
     assert!(
-        panel.handle_click(0, view_area()),
+        panel.handle_click(0, 0, view_area()) == ClickOutcome::Handled,
         "clicking collapsed thinking should toggle expand"
     );
     assert!(panel.live_thinking_expanded);
@@ -2566,6 +2631,7 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     render(&mut panel, 80, 10);
 
@@ -2754,6 +2820,7 @@ fn theme_switch_repaints_highlighted_code() {
         is_error: false,
         annotation: None,
         written_path: None,
+        backgrounded: false,
     });
     render(&mut panel, 80, 20);
     drain_highlight_worker(&mut panel);
@@ -2919,7 +2986,7 @@ fn a_click_on_the_top_row_reaches_the_scrolled_segment() {
         render(&mut panel, width, 10);
         let area = Rect::new(0, 0, width, 10);
         assert!(
-            panel.handle_click(area.y, area),
+            panel.handle_click(area.y, 0, area) == ClickOutcome::Handled,
             "no click at width {width}"
         );
     }
@@ -3004,4 +3071,321 @@ fn selection_survives_a_resize() {
         before,
         "the reflow above the selection dragged the copy with it"
     );
+}
+
+const MOVABLE_ID: &str = "t1";
+const NARROW_WIDTH: u16 = 24;
+const RECEIPT: &str = "Moved to the background. Last 2 lines: Running unittests";
+const STREAMED: &str = "streamed output";
+const COMMAND: &str = "cargo test";
+const NEW_COMMAND: &str = "cargo test --workspace";
+const CLICK_HINT: &str = "click to open";
+const ELAPSED_MINUTE: &str = "1m";
+const ELAPSED_SECS: u64 = 72;
+const NOTICE_TEXT: &str = "Background bash finished: cargo test";
+const NOTICE_DETAIL: &str = "all 8175 tests passed";
+
+fn movable_panel(movable: bool) -> MessagesPanel {
+    let mut panel = panel_with_tools(&[(MOVABLE_ID, BASH_TOOL_NAME)]);
+    panel.messages[0].timestamp = None;
+    panel.set_tool_movable(MOVABLE_ID, movable);
+    panel
+}
+
+fn header_line<'a>(panel: &'a MessagesPanel, id: &str) -> &'a Line<'static> {
+    let index = panel.cache.find_by_tool_id(id).unwrap();
+    &panel.cache.get(index).unwrap().lines()[0]
+}
+
+fn header_text(panel: &MessagesPanel, id: &str) -> String {
+    header_line(panel, id)
+        .spans
+        .iter()
+        .skip(1)
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn backgrounded_done(receipt: &str) -> ToolDoneEvent {
+    ToolDoneEvent {
+        output: Arc::new(ToolOutput::Plain(receipt.into())),
+        backgrounded: true,
+        ..done(MOVABLE_ID)
+    }
+}
+
+fn moved_panel() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[(MOVABLE_ID, BASH_TOOL_NAME)]);
+    panel.tool_done(backgrounded_done(RECEIPT));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    panel
+}
+
+#[test_case(VIEW_WIDTH, true ; "room_for_hint")]
+#[test_case(NARROW_WIDTH, false ; "no_room_drops_hint")]
+fn movable_hint_is_right_aligned_and_never_shifts_header(width: u16, shown: bool) {
+    let mut plain = movable_panel(false);
+    let mut movable = movable_panel(true);
+    render(&mut plain, width, VIEW_HEIGHT);
+    render(&mut movable, width, VIEW_HEIGHT);
+
+    let plain_header = header_text(&plain, MOVABLE_ID);
+    let movable_header = header_text(&movable, MOVABLE_ID);
+    assert!(movable_header.starts_with(&plain_header));
+    assert_eq!(movable_header == plain_header, !shown);
+    assert_eq!(movable_header.ends_with(MOVABLE_HINT), shown);
+    let hint_end = hint_columns(header_line(&movable, MOVABLE_ID)).map(|cols| cols.end);
+    assert_eq!(hint_end, shown.then_some(width - 2));
+}
+
+#[test]
+fn movable_hint_disappears_after_tool_done() {
+    let mut panel = movable_panel(true);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(hint_columns(header_line(&panel, MOVABLE_ID)).is_some());
+
+    panel.tool_done(done(MOVABLE_ID));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(hint_columns(header_line(&panel, MOVABLE_ID)).is_none());
+    assert!(!panel.messages[0].movable);
+}
+
+/// The hint's columns are the panel's own, so a panel that does not start
+/// at the screen's left edge shifts them by its offset.
+#[test]
+fn clicking_the_hint_counts_from_the_panels_left_edge() {
+    const PANEL_X: u16 = 4;
+    let mut panel = movable_panel(true);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let cols = hint_columns(header_line(&panel, MOVABLE_ID)).unwrap();
+    let area = Rect {
+        x: PANEL_X,
+        ..view_area()
+    };
+
+    for col in [cols.start, cols.end - 1] {
+        assert_eq!(
+            panel.handle_click(0, col + PANEL_X, area),
+            ClickOutcome::MoveCall(MOVABLE_ID.into())
+        );
+    }
+    assert_eq!(
+        panel.handle_click(0, cols.start + PANEL_X - 1, area),
+        ClickOutcome::None
+    );
+}
+
+#[test]
+fn clicking_a_moved_row_opens_its_task() {
+    let mut panel = moved_panel();
+    assert_eq!(
+        panel.handle_click(0, 0, view_area()),
+        ClickOutcome::OpenTask(MOVABLE_ID.into())
+    );
+}
+
+/// Its body moved to the task's tab, so there is nothing left to unfold.
+#[test]
+fn a_moved_row_takes_no_toggle() {
+    let mut panel = moved_panel();
+    assert_eq!(panel.toggle_click(0, view_area()), ClickOutcome::None);
+}
+
+/// The row keeps the lines that say what runs, from the move on. The colored
+/// command can land after the move, so the row keeps following the buf.
+#[test]
+fn a_moved_row_keeps_its_head_and_follows_it() {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines_with_head(vec![snap_line(COMMAND), snap_line(STREAMED)], 1);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
+    panel.register_live_buf(MOVABLE_ID.into(), Arc::clone(&buf));
+    panel.tool_done(backgrounded_done(RECEIPT));
+
+    let text = view_text(&mut panel);
+    assert!(text.contains(COMMAND), "{text}");
+    assert!(!text.contains(RECEIPT), "{text}");
+    assert!(!text.contains(STREAMED), "{text}");
+    assert!(text.contains(BACKGROUND_INDICATOR.trim()), "{text}");
+    assert!(!text.contains(TOOL_INDICATOR.trim()), "{text}");
+    assert!(text.contains(CLICK_HINT), "{text}");
+
+    buf.set_lines_with_head(vec![snap_line(NEW_COMMAND), snap_line(STREAMED)], 1);
+    assert_eq!(panel.tick(), Dirty::YES);
+    assert!(view_text(&mut panel).contains(NEW_COMMAND));
+}
+
+/// A long moved call outlives many quick calls after it, and those must not
+/// evict it from what the panel polls before its outcome lands. A move that
+/// races Esc lands on a row Esc already ended, and streams again all the same.
+#[test_case(false ; "moved_while_running")]
+#[test_case(true ; "moved_after_esc")]
+fn a_moved_row_follows_its_buf_until_its_outcome(esc_first: bool) {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines_with_head(vec![snap_line(COMMAND)], 1);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
+    panel.register_live_buf(MOVABLE_ID.into(), Arc::clone(&buf));
+    if esc_first {
+        panel.cancel_in_progress();
+    }
+    panel.tool_done(backgrounded_done(RECEIPT));
+    for i in 0..=WARM_TOOL_CAP {
+        finish_with_live_buf(&mut panel, &format!("quick{i}"), STREAMED, false);
+    }
+
+    buf.set_lines_with_head(vec![snap_line(NEW_COMMAND)], 1);
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
+    let snapshot = panel
+        .find_tool_msg(MOVABLE_ID)
+        .unwrap()
+        .render_snapshot
+        .as_ref();
+    assert_eq!(
+        snapshot.map(BufferSnapshot::text).as_deref(),
+        Some(NEW_COMMAND)
+    );
+
+    panel.set_background_outcome(MOVABLE_ID, BackgroundOutcome::Done);
+    assert!(!panel.live_bufs.contains_key(MOVABLE_ID));
+}
+
+fn unstruck_cancelled(theme: &Theme) -> Style {
+    theme.todo_cancelled.remove_modifier(Modifier::CROSSED_OUT)
+}
+
+#[test_case(None, BACKGROUND_INDICATOR, |t| t.tool_dim ; "running")]
+#[test_case(Some(BackgroundOutcome::Done), TOOL_INDICATOR, |t| t.tool_success ; "done")]
+#[test_case(Some(BackgroundOutcome::Error), TOOL_INDICATOR, |t| t.tool_error ; "error")]
+#[test_case(Some(BackgroundOutcome::Cancelled), TOOL_INDICATOR, unstruck_cancelled ; "cancelled")]
+#[test_case(Some(BackgroundOutcome::Lost), TOOL_INDICATOR, unstruck_cancelled ; "lost")]
+fn badge_outcome_switches_indicator(
+    outcome: Option<BackgroundOutcome>,
+    glyph: &str,
+    style: fn(&Theme) -> Style,
+) {
+    let mut panel = moved_panel();
+    if let Some(outcome) = outcome {
+        panel.set_background_outcome(MOVABLE_ID, outcome);
+    }
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let indicator = &header_line(&panel, MOVABLE_ID).spans[0];
+    assert_eq!(indicator.content, glyph);
+    assert_eq!(indicator.style, style(&theme::current()));
+    assert_eq!(
+        header_text(&panel, MOVABLE_ID).contains(CLICK_HINT),
+        outcome.is_none()
+    );
+}
+
+#[test]
+fn moved_row_shows_elapsed_since_the_move() {
+    let mut panel = moved_panel();
+    panel.set_tool_background(
+        MOVABLE_ID,
+        BackgroundBadge {
+            id: MOVABLE_ID.into(),
+            started_at: Instant::now().checked_sub(Duration::from_secs(ELAPSED_SECS)),
+            outcome: None,
+        },
+    );
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(header_text(&panel, MOVABLE_ID).contains(ELAPSED_MINUTE));
+}
+
+fn notice_panel(detail: Option<&str>) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut notice = DisplayMessage::new(DisplayRole::Notice, NOTICE_TEXT.into());
+    notice.detail = detail.map(|text| NoticeDetail {
+        text: text.into(),
+        markdown: false,
+    });
+    panel.push(notice);
+    panel
+}
+
+#[test]
+fn notice_detail_expands_then_collapses_on_click() {
+    let mut panel = notice_panel(Some(NOTICE_DETAIL));
+    assert!(!view_text(&mut panel).contains(NOTICE_DETAIL));
+
+    assert_eq!(panel.handle_click(0, 0, view_area()), ClickOutcome::Handled);
+    assert!(view_text(&mut panel).contains(NOTICE_DETAIL));
+
+    assert_eq!(panel.handle_click(0, 0, view_area()), ClickOutcome::Handled);
+    assert!(!view_text(&mut panel).contains(NOTICE_DETAIL));
+}
+
+#[test_case(None, None ; "plain_notice")]
+#[test_case(Some(BackgroundOutcome::Error), Some(|t: &Theme| t.tool_error) ; "failed_task")]
+#[test_case(Some(BackgroundOutcome::Done), Some(|t: &Theme| t.tool_success) ; "done_task")]
+fn a_task_notice_opens_with_its_ending_dot(
+    task_end: Option<BackgroundOutcome>,
+    style: Option<fn(&Theme) -> Style>,
+) {
+    let mut panel = notice_panel(None);
+    panel.messages[0].task_end = task_end;
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let first = &panel.cache.get(0).unwrap().lines()[0].spans[0];
+    let dot = (first.content == TOOL_INDICATOR).then_some(first.style);
+    assert_eq!(dot, style.map(|style| style(&theme::current())));
+}
+
+/// Shell output is not markdown: a diff's `-` lines would turn into bullets.
+#[test_case(false, "- removed line", &format!("{NOTICE_DETAIL_INDENT}- removed line") ; "plain_output_stays_as_written")]
+#[test_case(true, "```\nlet answer = 42;\n```", &format!("{NOTICE_DETAIL_INDENT}{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]
+fn notice_detail_follows_its_format(markdown: bool, text: &str, expected_row: &str) {
+    let detail = NoticeDetail {
+        text: text.into(),
+        markdown,
+    };
+    let rows: Vec<String> = notice_detail_lines(&detail, VIEW_WIDTH)
+        .map(|row| row.to_string())
+        .collect();
+    assert!(rows.iter().any(|row| row == expected_row), "{rows:?}");
+}
+
+#[test]
+fn notice_without_detail_does_not_toggle() {
+    let mut panel = notice_panel(None);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert_eq!(panel.handle_click(0, 0, view_area()), ClickOutcome::None);
+}
+
+#[test]
+fn scrollbar_sits_on_the_theme_window_background() {
+    let dracula = crate::BUNDLED_THEMES
+        .iter()
+        .find(|e| e.name == "dracula")
+        .unwrap()
+        .toml;
+    crate::theme::set(crate::theme::Theme::from_toml(dracula).unwrap());
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.streaming_text.set_buffer(&"line\n".repeat(40));
+    let backend = TestBackend::new(80, 10);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            ratatui::widgets::Widget::render(
+                ratatui::widgets::Block::default()
+                    .style(ratatui::style::Style::new().bg(crate::theme::current().background)),
+                f.area(),
+                f.buffer_mut(),
+            );
+            panel.view(f, f.area(), false, true, &[]);
+        })
+        .unwrap();
+
+    let theme = crate::theme::current();
+    let buf = terminal.backend().buffer();
+    for y in 0..buf.area.height {
+        let c = buf.cell((buf.area.width - 1, y)).unwrap();
+        assert_eq!(
+            c.bg, theme.background,
+            "the scrollbar column must sit on the theme bg, not the terminal's"
+        );
+    }
 }

@@ -1,26 +1,24 @@
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use maki_agent::agent::{self, AgentHooks};
+use maki_agent::mcp::McpHandle;
 use maki_agent::mcp::config::McpServerStatus;
-use maki_agent::mcp::{McpHandle, McpSession};
-use maki_agent::permissions::PermissionManager;
 use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{RequestTools, ToolAudience, ToolRegistry};
+use maki_agent::tools::{BackgroundFor, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
-    CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
-    RunContext, RunContextBuilder, RunLedger, SessionMailbox, SharedMessages, ToolOutputLines,
+    CancelToken, DoneReason, Envelope, EventSender, History, HostPrompt, Instructions, McpCommand,
+    PromptRole, RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
 };
-use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Message, Model};
+use tokio::sync::Mutex;
+use tokio::task::spawn_blocking;
 use tracing::error;
 
-use super::ModelSlot;
 use super::run_cancels::RunCancels;
 use super::shared_queue::{self, Compaction, QueueReceiver, QueueRun};
 
@@ -42,6 +40,17 @@ fn base_tools(
     )
 }
 
+/// The loop's side of everything it shares with its `AgentHandles`.
+pub(super) struct LoopEnds {
+    pub(super) shared_history: SharedMessages,
+    pub(super) agent_tx: flume::Sender<Envelope>,
+    pub(super) answer_rx: flume::Receiver<String>,
+    pub(super) queue: Arc<QueueReceiver>,
+    pub(super) cancels: Arc<RunCancels>,
+    pub(super) mailbox: SessionMailbox,
+    pub(super) subagent_cancels: Arc<CancelMap<String>>,
+}
+
 pub(super) struct AgentLoop {
     /// The registry only holds the seed weakly, so plugins can reach it for
     /// exactly as long as this loop lives.
@@ -54,44 +63,31 @@ pub(super) struct AgentLoop {
     gauge: ContextGauge,
     cancels: Arc<RunCancels>,
     agent_tx: flume::Sender<Envelope>,
-    answer_rx: Arc<smol::lock::Mutex<flume::Receiver<String>>>,
+    answer_rx: Arc<Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
+    host_prompt: Arc<HostPrompt>,
 }
 
 impl AgentLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        model_slot: Arc<ArcSwap<ModelSlot>>,
-        config: AgentConfig,
-        tool_output_lines: ToolOutputLines,
+        seed: AgentSeed,
         resumed: Resumed,
-        shared_history: SharedMessages,
-        mcp_handle: Option<McpHandle>,
-        permissions: Arc<PermissionManager>,
-        agent_tx: flume::Sender<Envelope>,
-        answer_rx: flume::Receiver<String>,
-        queue: Arc<QueueReceiver>,
-        cancels: Arc<RunCancels>,
-        mailbox: SessionMailbox,
-        timeouts: maki_providers::Timeouts,
+        LoopEnds {
+            shared_history,
+            agent_tx,
+            answer_rx,
+            queue,
+            cancels,
+            mailbox,
+            subagent_cancels,
+        }: LoopEnds,
         lua_handle: EventHandle,
-        subagent_cancels: Arc<CancelMap<String>>,
-        model_policy: Arc<ModelPolicy>,
+        host_prompt: Arc<HostPrompt>,
     ) -> Self {
-        let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
-        let seed = mailbox.publish_seed(AgentSeed::new(
-            resumed.id,
-            model_slot,
-            config,
-            tool_output_lines,
-            permissions,
-            mcp,
-            timeouts,
-            model_policy,
-        ));
+        let seed = mailbox.publish_seed(seed);
         Self {
             seed,
             vars: Vars::default(),
@@ -102,11 +98,12 @@ impl AgentLoop {
             gauge: ContextGauge::restored(resumed.context_size),
             cancels,
             agent_tx,
-            answer_rx: Arc::new(smol::lock::Mutex::new(answer_rx)),
+            answer_rx: Arc::new(Mutex::new(answer_rx)),
             queue,
             mailbox,
             lua_handle,
             subagent_cancels,
+            host_prompt,
         }
     }
 
@@ -134,7 +131,8 @@ impl AgentLoop {
 
     async fn process_run(&mut self, run: QueueRun, run_id: u64) {
         let live = self.cancels.start(run_id);
-        let result = self.dispatch_run(run, run_id, live.token()).await;
+        let ledger = Arc::new(RunLedger::default());
+        let result = self.dispatch_run(run, run_id, live.token(), &ledger).await;
         // A `tool_use_id` only names work inside the run that issued the call,
         // so the run ending is what stops whatever still hangs off one, rather
         // than a group emptying out.
@@ -145,7 +143,7 @@ impl AgentLoop {
         // the app already drew, leave the status bar red and fail the exit
         // under `--exit-on-done`.
         if let Err(e) = result {
-            self.emit_error(run_id, e);
+            self.emit_error(run_id, e, ledger.totals());
         }
     }
 
@@ -154,6 +152,7 @@ impl AgentLoop {
         run: QueueRun,
         run_id: u64,
         cancel: &CancelToken,
+        ledger: &Arc<RunLedger>,
     ) -> Result<(), AgentError> {
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
         match run {
@@ -174,7 +173,7 @@ impl AgentLoop {
                     })
                     .collect();
                 if let Some(input) = shared_queue::merge_inputs(inputs) {
-                    self.do_agent_run(input, event_tx, cancel).await?;
+                    self.do_agent_run(input, event_tx, cancel, ledger).await?;
                 }
             }
         }
@@ -212,15 +211,20 @@ impl AgentLoop {
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        let prompt_slots = Arc::new(self.lua_handle.collect_prompt_slots_async().await);
+        let prompt_slots = Arc::new(
+            self.lua_handle
+                .collect_prompt_slots_async(Some(self.seed.session_id.as_str()))
+                .await,
+        );
         let vars = self.vars.clone();
         let instructions = self.instructions.text.clone();
         let slots = Arc::clone(&prompt_slots);
         let config = self.seed.config.clone();
         let has_mcp = self.seed.mcp.is_some();
+        let host_prompt = Arc::clone(&self.host_prompt);
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
             let tools = base_tools(&vars, model, &config, has_mcp, workflow);
-            RunContext::render(&vars, &instructions, &slots, model, tools)
+            host_prompt.context(&vars, &instructions, &slots, model, tools)
         });
         (context, prompt_slots)
     }
@@ -272,6 +276,7 @@ impl AgentLoop {
         mut input: AgentInput,
         event_tx: EventSender,
         cancel: &CancelToken,
+        ledger: &Arc<RunLedger>,
     ) -> Result<DoneReason, AgentError> {
         let (context, prompt_slots) = self.context_builder().await;
 
@@ -290,7 +295,7 @@ impl AgentLoop {
                     message: e.to_string(),
                 })?;
             for pm in messages {
-                let text = pm.content.text.unwrap_or_default();
+                let text = pm.text;
                 let msg = match pm.role {
                     PromptRole::Assistant => Message {
                         role: maki_providers::Role::Assistant,
@@ -318,15 +323,14 @@ impl AgentLoop {
                 tool_output_lines: self.seed.tool_output_lines,
                 permissions: Arc::clone(&self.seed.permissions),
                 session_id: Some(self.seed.session_id.clone()),
-                background_for: None,
+                background_for: BackgroundFor::None,
                 task_id: None,
                 mailbox: Some(self.mailbox.clone()),
                 timeouts: self.seed.timeouts,
                 file_access: Arc::clone(&self.seed.file_access),
                 prompt_slots: Arc::clone(&prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
-                ledger: Arc::new(RunLedger::default()),
-                registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                ledger: Arc::clone(ledger),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&self.seed.model_policy),
             },
@@ -356,7 +360,9 @@ impl AgentLoop {
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
         let config = self.seed.config.instructions.clone();
-        self.instructions = smol::unblock(move || agent::load_instructions(&cwd, &config)).await;
+        self.instructions = spawn_blocking(move || agent::load_instructions(&cwd, &config))
+            .await
+            .expect("instructions load task panicked");
         // Background sessions started from the seed read its list, so it has
         // to follow every reload, the startup one included.
         self.seed
@@ -364,10 +370,10 @@ impl AgentLoop {
             .store(Arc::clone(&self.instructions.files));
     }
 
-    fn emit_error(&self, run_id: u64, error: AgentError) {
+    fn emit_error(&self, run_id: u64, error: AgentError, totals: RunTotals) {
         error!(error = %error, "agent error");
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-        let _ = event_tx.send(AgentEvent::error(&error));
+        let _ = event_tx.send(AgentEvent::error(&error, totals));
     }
 }
 
@@ -386,7 +392,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
         let www_auth = url.clone();
         let oauth = info.oauth.clone();
         let ca_file = info.ca_file.clone();
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let storage = match maki_storage::StateDir::resolve() {
                 Ok(s) => s,
                 Err(e) => {
@@ -412,7 +418,6 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
                 server: server_name.clone(),
             });
             tracing::info!(server = %server_name, "MCP server authenticated via OAuth");
-        })
-        .detach();
+        });
     }
 }

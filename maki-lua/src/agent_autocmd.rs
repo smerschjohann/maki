@@ -268,6 +268,7 @@ pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<Host
             context_size_after,
             context_window,
             summary,
+            ..
         } => Some(HostEvent::CompactionDone {
             context_size_before: *context_size_before,
             context_size_after: *context_size_after,
@@ -315,7 +316,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use maki_agent::{CallRecord, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_agent::{CallRecord, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent};
     use serde_json::json;
     use test_case::test_case;
 
@@ -358,6 +359,7 @@ mod tests {
                 input: json!({ "command": TOOL_COMMAND }),
                 duration: Duration::from_millis(TOOL_MILLIS),
             })),
+            backgrounded: false,
         }))
     }
 
@@ -392,11 +394,13 @@ mod tests {
                 context_size_after: 30_000,
                 context_window: 200_000,
                 summary: String::new(),
+                duration_ms: 0,
             },
             done(DoneReason::EndTurn),
             AgentEvent::Error {
                 message: "boom".into(),
                 auth: false,
+                totals: RunTotals::default(),
             },
         ]
     }

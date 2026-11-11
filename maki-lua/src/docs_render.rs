@@ -98,8 +98,7 @@ reference is at the end of this document.
 
 Plugins live in the maki config dir. There are two of them, same layout:
 
-- `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
-  that one first)
+- `~/.config/maki/` - global, every project
 - `<project>/.maki/` - this project only
 
 ```
@@ -171,6 +170,7 @@ with full debug info.
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
+- Describe parameters as separate fields, never as usage lines like `` `write path content` ``: models copy them into the string field.
 - Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example
@@ -192,8 +192,6 @@ const AGENT_NOTES: &str = r#"## Notes for the agent
   of the maki repo holds the plugins that ship with maki, compiled into the
   binary, so a file dropped there does nothing until maki is rebuilt. That
   holds even when the project you have open is a maki checkout.
-- Both global config dirs can exist, and `~/.maki/` wins, so look before you
-  write.
 - The config dir sits outside the project, but it is an ordinary directory:
   create files there with the normal write and edit tools.
 - You cannot run slash commands or restart maki, so ask the user to run
@@ -570,6 +568,7 @@ fn field_item(text: &str) -> Option<String> {
 
 fn push_fields_block<'a>(out: &mut String, block: impl Iterator<Item = &'a str>, depth: usize) {
     let mut levels: Vec<usize> = Vec::new();
+    let mut after_list = false;
     for raw in block {
         let line = raw.strip_prefix("  ").unwrap_or(raw);
         let text = line.trim_start();
@@ -578,6 +577,10 @@ fn push_fields_block<'a>(out: &mut String, block: impl Iterator<Item = &'a str>,
         }
         let indent = line.len() - text.len();
         if let Some(item) = field_item(text) {
+            if after_list {
+                out.push('\n');
+                after_list = false;
+            }
             while levels.last().is_some_and(|&i| i > indent) {
                 levels.pop();
             }
@@ -590,9 +593,17 @@ fn push_fields_block<'a>(out: &mut String, block: impl Iterator<Item = &'a str>,
             let pad = "  ".repeat(depth + levels.len());
             out.push_str(&format!("{pad}{text}\n"));
         } else {
-            levels.clear();
-            out.push_str(&format!("\n{}{text}\n\n", "  ".repeat(depth)));
+            let pad = "  ".repeat(depth);
+            if !levels.is_empty() {
+                levels.clear();
+                out.push('\n');
+                after_list = true;
+            }
+            out.push_str(&format!("{pad}{text}\n"));
         }
+    }
+    if after_list {
+        out.push('\n');
     }
 }
 
@@ -735,8 +746,8 @@ fn render(compact: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, push_desc, reference,
-        reference_index, site_page, skeleton, skill_content,
+        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, push_desc, push_fields_block,
+        reference, reference_index, site_page, skeleton, skill_content,
     };
 
     const AGENT_VOICE: &str = "ask the user";
@@ -756,6 +767,14 @@ mod tests {
         let mut out = String::new();
         push_desc(&mut out, desc);
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn wrapped_param_text_stays_one_paragraph() {
+        let rest = "  ctx, for the model's stop.\n  More words.";
+        let mut out = String::new();
+        push_fields_block(&mut out, rest.lines(), 1);
+        assert_eq!(out, "  ctx, for the model's stop.\n  More words.\n");
     }
 
     #[test]

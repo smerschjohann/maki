@@ -10,14 +10,27 @@
 //! to decide for itself what counts as a difference.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::time::Duration;
 
+#[cfg(test)]
+use futures::stream;
+
+use maki_config::providers::BASE_URL_ENV_SUFFIX;
 use serde_json::Value;
+use tempfile::TempDir;
 
 use crate::providers::plugin::{self, DeclAuthority, ProviderDecl, ProviderHooks, Registration};
+#[cfg(test)]
+use crate::providers::{SseBody, sse_events};
 
+#[cfg(test)]
+const SSE_BODY_TIMEOUT: Duration = Duration::from_secs(300);
 const LOOPBACK: &str = "127.0.0.1:0";
 const REASON_PHRASE: &str = "Recorded";
 const CONTENT_LENGTH: &str = "content-length";
@@ -26,6 +39,18 @@ const BIND_FAILED: &str = "cannot bind loopback";
 const IO_FAILED: &str = "the recorded connection broke";
 const QUERY_START: char = '?';
 const BAD_DECLARATION: &str = "the test declaration must register";
+const TEMPDIR_FAILED: &str = "cannot create the isolated home";
+const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
+// Logs sit beside the state base, so keep its parent inside the guard.
+// Windows reads `APPDATA` and `LOCALAPPDATA` instead of the XDG variables.
+const USER_DIRS: &[(&str, &str)] = &[
+    ("XDG_CONFIG_HOME", "config"),
+    ("XDG_STATE_HOME", "state"),
+    ("XDG_DATA_HOME", "data"),
+    ("XDG_CACHE_HOME", "cache"),
+    ("APPDATA", "roaming"),
+    ("LOCALAPPDATA", "local"),
+];
 const MIXED_SCRIPT: &str =
     "a script is either all routed with `Canned::at` or all sequential, never a mix";
 
@@ -237,10 +262,99 @@ pub fn sse_event(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+/// A whole body in one chunk, as the events a parser test reads.
+#[cfg(test)]
+pub(crate) fn sse_body(body: impl AsRef<[u8]>) -> SseBody {
+    let chunk = Cursor::new(body.as_ref().to_vec());
+    sse_events(stream::iter([Ok(chunk)]), SSE_BODY_TIMEOUT)
+}
+
+/// What the transport tests in `http` and `error` fail against: a port that
+/// refuses, a port that cannot complete a TLS handshake, a name that cannot
+/// resolve, and a secret that must never reach a message.
+#[cfg(test)]
+pub(crate) mod transport {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread;
+
+    pub(crate) const LOOPBACK_HOST: &str = "127.0.0.1";
+    /// Reserved by RFC 6761, so every resolver answers NXDOMAIN for it. The
+    /// trailing dot keeps it absolute: a search-domain resolver would
+    /// otherwise rewrite the bare name to something that can resolve.
+    pub(crate) const UNRESOLVABLE_HOST: &str = "maki.invalid.";
+    pub(crate) const QUERY_SECRET: &str = "sk-not-for-logs";
+    pub(crate) const URL_MARKER: &str = "for url";
+    const PLAIN_HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n";
+
+    fn loopback_listener() -> (TcpListener, u16) {
+        let listener = TcpListener::bind((LOOPBACK_HOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    /// A loopback port nothing listens on any more.
+    pub(crate) fn closed_port() -> u16 {
+        loopback_listener().1
+    }
+
+    /// A loopback port where plain HTTP answers, so a TLS handshake to it
+    /// cannot complete.
+    pub(crate) fn plain_http_port() -> u16 {
+        let (listener, port) = loopback_listener();
+        thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _ = conn.write_all(PLAIN_HTTP_RESPONSE);
+        });
+        port
+    }
+
+    /// A loopback port that takes the connection and hangs up without an
+    /// answer.
+    pub(crate) fn hangup_port() -> u16 {
+        let (listener, port) = loopback_listener();
+        thread::spawn(move || drop(listener.accept()));
+        port
+    }
+}
+
+/// Points every per-user directory at a fresh temp dir and clears every
+/// `<SLUG>_BASE_URL` override, so a test reads none of this machine's
+/// `providers.toml` or stored credentials and writes its own. Other variables
+/// stay, API keys and host overrides like `OLLAMA_HOST` included. Call it
+/// first, since the base dirs are resolved once per process, and keep the
+/// guard for the whole test.
+pub fn isolated_home() -> TempDir {
+    let home = TempDir::new().expect(TEMPDIR_FAILED);
+    // SAFETY: Nextest runs each test in its own process. Callers set up the
+    // environment before starting work that can read it.
+    unsafe {
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_str()
+                .is_some_and(|key| key.ends_with(BASE_URL_ENV_SUFFIX))
+            {
+                std::env::remove_var(key);
+            }
+        }
+        for var in HOME_VARS {
+            std::env::set_var(var, home.path());
+        }
+        for (var, dir) in USER_DIRS {
+            std::env::set_var(var, home.path().join(dir));
+        }
+    }
+    home
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::panic::catch_unwind;
+    use std::path::PathBuf;
 
+    use maki_config::providers::base_url_env_var;
+    use maki_storage::paths;
     use test_case::test_case;
 
     use super::*;
@@ -249,6 +363,10 @@ mod tests {
     const B_PATH: &str = "/v1/b";
     const A_BODY: &str = r#"{"route":"a"}"#;
     const B_BODY: &str = r#"{"route":"b"}"#;
+    const DIRECTORY_ESCAPED: &str = "a user directory escaped the isolated home";
+    const OVERRIDE_KEPT: &str = "a base URL override survived the isolated home";
+    const GATEWAY_SLUG: &str = "anthropic";
+    const GATEWAY_URL: &str = "http://127.0.0.1:9";
     const ROUTED: &[Canned] = &[
         Canned::at(B_PATH, Canned::json(200, B_BODY)),
         Canned::at(A_PATH, Canned::json(200, A_BODY)),
@@ -257,6 +375,30 @@ mod tests {
         Canned::at(A_PATH, Canned::json(200, A_BODY)),
         Canned::json(200, B_BODY),
     ];
+
+    #[test_case(paths::config_dir ; "config")]
+    #[test_case(paths::data_dir ; "data")]
+    #[test_case(paths::state_dir ; "state")]
+    #[test_case(paths::logs_dir ; "logs")]
+    #[test_case(paths::cache_dir ; "cache")]
+    fn isolated_home_contains_user_directories(resolve: fn() -> io::Result<PathBuf>) {
+        let home = isolated_home();
+        let directory = resolve().unwrap();
+        assert!(
+            directory.starts_with(home.path()),
+            "{DIRECTORY_ESCAPED}: {}",
+            directory.display()
+        );
+    }
+
+    #[test]
+    fn isolated_home_clears_base_url_overrides() {
+        let var = base_url_env_var(GATEWAY_SLUG);
+        // SAFETY: Nextest runs this test in its own process, before any thread.
+        unsafe { std::env::set_var(&var, GATEWAY_URL) };
+        let _home = isolated_home();
+        assert!(std::env::var_os(&var).is_none(), "{OVERRIDE_KEPT}: {var}");
+    }
 
     /// One raw request on its own connection, answered by the status line and
     /// the body.

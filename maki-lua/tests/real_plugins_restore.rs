@@ -2,6 +2,7 @@
 //! A broken restore silently falls back to raw LLM output, so we assert
 //! things only the real views produce (gutters, command headers, truncation).
 
+use std::env::current_dir;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,17 +10,25 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentEvent, EventSender, SpanStyle};
 use maki_config::ToolOutputLines;
 use maki_highlight::highlight_code;
+use maki_lua::test_support::{fire_autocmd, runtime};
 use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
+use test_case::test_case;
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
+/// The bash restore cases all run `echo`, and their output `hi` does not contain it.
+const COMMAND_WORD: &str = "echo";
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 const TODO_SRC: &str = include_str!("../../plugins/todo_write/init.lua");
 const READ_SRC: &str = include_str!("../../plugins/read/init.lua");
+/// Deeper than the 200 lines of context the read plugin highlights.
 const READ_PADDING_LINES: usize = 300;
-const READ_PADDING_BYTES: usize = 128;
+/// Kept short, so the context stays far below the highlighter's 16 KiB
+/// prefix cut, which `maki-highlight` tests on its own. Long lines made a
+/// loaded CI runner miss the 10 s restore deadline and lose the colors.
+const READ_PADDING_BYTES: usize = 8;
 const READ_COMMENT: &str = "/* comment";
 const READ_EXCERPT: &str = "let value = 1;";
 const READ_LANG: &str = "rust";
@@ -194,23 +203,49 @@ fn read_restore_keeps_nearby_comment_colors_with_large_context(ending: &str) {
     assert_eq!(render(&deep, READ_PADDING_LINES + 2), render(&shallow, 2));
 }
 
-#[test]
-fn bash_restore_renders_real_view() {
+/// The body shows the highlighted command, so the title only carries what
+/// the model says the command does. A description that is blank or just the
+/// command says nothing. The directory of a leading `cd` stays, since the
+/// body leaves the `cd` out.
+#[test_case(Some("print hi"), "echo hi", "print hi" ; "described")]
+#[test_case(None, "echo hi", "" ; "undescribed")]
+#[test_case(Some("echo hi"), "echo hi", "" ; "described_by_its_command")]
+#[test_case(Some(" "), "echo hi", "" ; "blank_description")]
+#[test_case(None, "cd src && echo hi", "in src" ; "undescribed_past_a_cd")]
+#[test_case(Some("print hi"), "cd src && echo hi", "print hi in src" ; "described_past_a_cd")]
+#[test_case(Some("echo hi"), "cd src && echo hi", "in src" ; "described_by_its_command_past_a_cd")]
+fn bash_restore_titles_a_call_and_shows_its_command(
+    description: Option<&str>,
+    command: &str,
+    header: &str,
+) {
     let host = load_host();
     let r = restore(
         &host,
         "bash",
-        json!({ "command": "echo hi", "description": "print hi" }),
+        json!({ "command": command, "description": description }),
         "hi",
         None,
         Vec::new(),
     );
-    assert!(
-        r.body.contains("echo hi"),
-        "real view renders the command header; the fallback body is raw output only: {}",
-        r.body
+    assert_eq!(r.header, header);
+    assert!(r.body.contains(COMMAND_WORD), "{}", r.body);
+}
+
+/// The session's own directory tells the reader nothing.
+#[test]
+fn bash_title_leaves_out_the_session_directory() {
+    let cwd = current_dir().unwrap();
+    let host = load_host();
+    let r = restore(
+        &host,
+        "bash",
+        json!({ "command": "echo hi", "description": "print hi", "workdir": cwd }),
+        "hi",
+        None,
+        Vec::new(),
     );
-    assert!(r.header.contains("print hi"), "header: {}", r.header);
+    assert_eq!(r.header, "print hi");
 }
 
 /// Phase 1: children render through their own real views (grep gutter,
@@ -377,7 +412,7 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
         .tool
         .parse(&input)
         .expect("parse failed");
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let result = runtime().block_on(inv.execute(&ctx));
     host.load_source("live_barrier", "").unwrap();
     let mut body = String::new();
     for env in rx.drain() {
@@ -462,18 +497,59 @@ fn index_dir_renders_identically_live_and_restored() {
     );
 }
 
-/// Nothing else runs the real plugin's restore. It draws the call's list into
-/// the chat from its input alone, so a failed call renders the same.
-#[test]
-fn todo_write_restore_renders_the_list() {
+const READ_TOOL: &str = "read";
+const LIST_TOOL: &str = "list";
+const MISSING_PATH: &str = "/missing";
+const MISSING_PATH_ERROR: &str = "error: path not found: /missing";
+
+/// A failed read, index or list call publishes no body, so the host draws the
+/// error text. Restore has to do the same. Their own views follow a limit that
+/// is often 0, and that would hide the error. The header still comes from the
+/// tool, as it does live.
+#[test_case(READ_TOOL ; "read")]
+#[test_case(INDEX_TOOL ; "index")]
+#[test_case(LIST_TOOL ; "list")]
+fn failed_call_restores_without_a_body(tool: &str) {
+    let host = PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).unwrap();
+    let mut item = restore_item(
+        tool,
+        json!({ "path": MISSING_PATH }),
+        MISSING_PATH_ERROR,
+        None,
+        Vec::new(),
+    );
+    item.is_error = true;
+    let r = run_restore(&host, item);
+    assert_eq!(r.body, "");
+    assert!(r.header.starts_with(MISSING_PATH), "header: {}", r.header);
+}
+
+/// The panel shows the live list, so a call's list stays folded under its
+/// header in the chat. Each recorded click on the row flips it, and restore
+/// replays them, so it builds the list from the input alone and a failed call
+/// renders the same.
+#[test_case(Vec::new() => false ; "folded_by_default")]
+#[test_case(vec![0] => true ; "click_unfolds")]
+#[test_case(vec![0, 1] => false ; "second_click_folds")]
+fn todo_write_restore_shows_the_list_once_clicked(clicks: Vec<usize>) -> bool {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
     let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
-    let item = in_subagent_load(restore_item(TODO_TOOL, input, "", None, Vec::new()));
+    let item = in_subagent_load(restore_item(TODO_TOOL, input, "", None, clicks));
 
-    let r = run_restore(&host, item);
+    run_restore(&host, item).body.contains(TODO_ITEM)
+}
 
-    assert!(r.body.contains(TODO_ITEM), "list missing: {}", r.body);
+#[test]
+fn todo_write_live_call_starts_folded() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+    let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
+
+    let live = exec_live(&host, &reg, TODO_TOOL, input);
+
+    assert!(!live.body.contains(TODO_ITEM), "list shown: {}", live.body);
 }
 
 /// A session load replays a transcript, so its restores run with the panel
@@ -492,7 +568,8 @@ fn todo_load_restore_leaves_the_panel_closed() {
     // Focus what a restore-time store would have written: the calling chat's
     // own ids.
     let sid = session_ref().id().to_string();
-    host.event_handle().fire_autocmd(
+    fire_autocmd(
+        &host.event_handle(),
         "TaskFocusChanged",
         json!({ "session_id": sid, "id": SUBAGENT_TASK_ID }),
     );
@@ -519,7 +596,7 @@ fn todo_panel_opens_in_the_tab_of_each_writing_session() {
     for session in sessions {
         let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         ctx.session_id = Some(SessionRef::from_id(session));
-        smol::block_on(tool.parse(&input).unwrap().execute(&ctx));
+        runtime().block_on(tool.parse(&input).unwrap().execute(&ctx));
     }
 
     let owners: Vec<_> = host

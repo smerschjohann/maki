@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,13 +11,17 @@ use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
 use maki_lua::agent_autocmd::host_event_fields;
-use maki_lua::test_support::{content_omitted_message, layer_skipped_message};
+use maki_lua::test_support::{
+    content_omitted_message, fire_autocmd, layer_skipped_message, runtime,
+};
 use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
     PluginPermissions, SessionEndReason, UiAction,
 };
 use maki_storage::id::MakiId;
 use test_case::test_case;
+use tokio::join;
+use tokio::time::timeout;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 /// Generous on purpose. A bound a slow machine can trip is a bound that fails
@@ -36,6 +41,10 @@ fn load(host: &PluginHost, name: &str, source: &str) {
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
+    runtime().block_on(run_tool(reg, name))
+}
+
+async fn run_tool(reg: &ToolRegistry, name: &str) -> String {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
@@ -44,7 +53,9 @@ fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
         .parse(&serde_json::json!({}))
         .expect("parse failed");
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let out = smol::block_on(async { inv.execute(&ctx).await })
+    let out = inv
+        .execute(&ctx)
+        .await
         .output
         .unwrap_or_else(|e| panic!("tool {name} failed: {e}"));
     match out {
@@ -142,9 +153,9 @@ fn content_fields_are_left_out_without_session_read(event: &str) {
         .map(|key| ((*key).to_owned(), PAYLOAD_VALUE.into()))
         .collect();
     let events = host.event_handle();
-    events.fire_autocmd(event, payload.clone().into());
-    events.fire_autocmd(event, payload.into());
-    events.fire_autocmd(SENTINEL_EVENT, serde_json::json!({}));
+    fire_autocmd(&events, event, payload.clone().into());
+    fire_autocmd(&events, event, payload.into());
+    fire_autocmd(&events, SENTINEL_EVENT, serde_json::json!({}));
 
     let everything = format!(
         "{CONTENT_READER}:{}",
@@ -190,11 +201,12 @@ fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, w
     );
 
     let events = host.event_handle();
-    events.fire_autocmd(
+    fire_autocmd(
+        &events,
         event,
         serde_json::json!({ SESSION_ID_KEY: PAYLOAD_VALUE, UNCLASSIFIED_KEY: PAYLOAD_VALUE }),
     );
-    events.fire_autocmd(SENTINEL_EVENT, serde_json::json!({}));
+    fire_autocmd(&events, SENTINEL_EVENT, serde_json::json!({}));
 
     let expected = if whole {
         vec![format!(
@@ -443,14 +455,17 @@ end }})
         probe_tool("probe_turn_end", "return table.concat(log, \";\")")
     );
     load(&host, "listener", &listener);
-    host.event_handle()
-        .fire_autocmd("TurnEnd", serde_json::json!({ "k": "v" }));
+    fire_autocmd(
+        &host.event_handle(),
+        "TurnEnd",
+        serde_json::json!({ "k": "v" }),
+    );
     assert_eq!(exec_tool(&reg, "probe_turn_end"), "TurnEnd|nil|v");
 }
 
 /// A handler has to tell the teardown paths apart, so every reason arrives
 /// naming the session it left behind. Only the paths someone waits on carry a
-/// deadline, and by the time `end_sessions_blocking` is back the handler has
+/// deadline, and by the time `end_sessions` is back the handler has
 /// already had its say.
 #[test]
 fn session_end_carries_session_reason_and_deadline() {
@@ -475,13 +490,13 @@ end }})
         SessionEndReason::Completed,
     ] {
         let session = MakiId::generate();
-        host.event_handle().end_sessions_blocking([session], reason);
+        runtime().block_on(host.event_handle().end_sessions([session], reason));
         expected.push(format!("{session}|{reason}|number"));
     }
     assert_eq!(
         exec_tool(&reg, "probe_session_end"),
         expected.join(";"),
-        "end_sessions_blocking must only return once the handler ran"
+        "end_sessions must only return once the handler ran"
     );
 
     for reason in [
@@ -508,6 +523,49 @@ end }})
         );
         std::thread::sleep(DISPATCH_POLL);
     }
+}
+
+const PARK_POLL_MS: u64 = 1;
+const HANDLER_FINISHED: &str = "finished";
+const WAIT_BLOCKED_THREAD: &str = "end_sessions returned before its thread ran anything else";
+
+/// On one thread the release only runs if the wait yields, and the handler
+/// only finishes once it did.
+#[tokio::test]
+async fn end_sessions_yields_its_thread_while_a_handler_is_parked() {
+    let (reg, host) = host();
+    let parker = format!(
+        r#"
+local released, state = false, "parked"
+maki.api.create_autocmd("SessionEnd", {{ callback = function()
+    while not released do maki.async.sleep({PARK_POLL_MS}) end
+    state = "{HANDLER_FINISHED}"
+end }})
+{}{}
+"#,
+        probe_tool("release_session_end", "released = true return \"\""),
+        probe_tool("probe_parked_session_end", "return state")
+    );
+    load(&host, "parker", &parker);
+
+    let ended = Cell::new(false);
+    join!(
+        async {
+            host.event_handle()
+                .end_sessions([MakiId::generate()], SessionEndReason::Shutdown)
+                .await;
+            ended.set(true);
+        },
+        async {
+            assert!(!ended.get(), "{WAIT_BLOCKED_THREAD}");
+            run_tool(&reg, "release_session_end").await;
+        },
+    );
+
+    assert_eq!(
+        run_tool(&reg, "probe_parked_session_end").await,
+        HANDLER_FINISHED
+    );
 }
 
 #[test]
@@ -589,6 +647,7 @@ fn call_of<'a>(
         origin,
         output_mode: ToolOutputMode::Compact,
         authority,
+        receipt: false,
         cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,
     }
@@ -610,14 +669,9 @@ fn fire_call(
 /// Bounded, so a seam that stops answering fails the test instead of hanging
 /// the suite.
 fn within<T>(work: impl Future<Output = T>) -> T {
-    smol::block_on(async {
-        let work = async { Some(work.await) };
-        let give_up = async {
-            smol::Timer::after(DISPATCH_TIMEOUT).await;
-            None
-        };
-        smol::future::or(work, give_up).await.expect(NEVER_ANSWERED)
-    })
+    runtime()
+        .block_on(async { timeout(DISPATCH_TIMEOUT, work).await })
+        .expect(NEVER_ANSWERED)
 }
 
 /// Fires one stage the way `tool_dispatch::run` does, with the authority the
@@ -1882,8 +1936,9 @@ fn wildcard_layers_wrap_every_tool_outside_the_specific_ones() {
     );
 }
 
-#[test]
-fn output_ctx_carries_the_input_and_kind() {
+#[test_case(false ; "final_result")]
+#[test_case(true  ; "receipt_of_a_moved_call")]
+fn output_ctx_carries_the_input_kind_and_receipt(receipt: bool) {
     const KIND: &str = "execute";
     let (reg, host) = host();
     slotted_tool(&host);
@@ -1894,7 +1949,7 @@ fn output_ctx_carries_the_input_and_kind() {
             ANY_TOOL,
             HookStage::Output,
             &format!(
-                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD}; return prev(value, ctx)"#,
+                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD} .. ":" .. tostring(ctx.receipt); return prev(value, ctx)"#,
                 text = hook::OUTPUT_TEXT
             ),
         ),
@@ -1904,6 +1959,7 @@ fn output_ctx_carries_the_input_and_kind() {
     let call = HookCall {
         tool_kind: Some(KIND),
         input: Some(&tool_input),
+        receipt,
         ..call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel)
     };
 
@@ -1916,7 +1972,10 @@ fn output_ctx_carries_the_input_and_kind() {
     let Verdict::Replaced(value) = verdict else {
         panic!("the layer rewrote the output, got {verdict:?}");
     };
-    assert_eq!(value[hook::OUTPUT_TEXT], format!("{KIND}:{COMMAND}"));
+    assert_eq!(
+        value[hook::OUTPUT_TEXT],
+        format!("{KIND}:{COMMAND}:{receipt}")
+    );
 }
 
 /// Handing the value back untouched is a pass through and not a rewrite, so

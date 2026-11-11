@@ -6,8 +6,8 @@ use crate::terminal;
 use arboard::Clipboard;
 #[cfg(target_os = "linux")]
 use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
-use flume::Receiver;
 use shell_words::split;
+use tokio::sync::oneshot::Receiver;
 
 pub(crate) enum CopyResult {
     Copied,
@@ -61,6 +61,12 @@ pub(crate) fn read_primary_selection() -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn read_primary_selection() -> Option<String> {
     None
+}
+
+/// Blocks, so never call it on the UI thread.
+pub(crate) fn read_text() -> Option<String> {
+    let text = Clipboard::new().ok()?.get_text().ok()?;
+    (!text.is_empty()).then_some(text)
 }
 
 pub(crate) struct ClipboardState {
@@ -154,11 +160,9 @@ impl ClipboardState {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::time::Duration;
     use test_case::test_case;
 
     const DUMMY_TEXT: &str = "hello";
-    const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[test]
     fn empty_text_is_noop_and_skips_both_backends() {
@@ -265,7 +269,7 @@ mod tests {
         let Ok(CopyResult::Pending(rx)) = state.copy_text(DUMMY_TEXT) else {
             panic!("a configured command must run asynchronously");
         };
-        assert_eq!(rx.recv_timeout(RECV_TIMEOUT).expect("result").is_ok(), ok);
+        assert_eq!(rx.blocking_recv().expect("result").is_ok(), ok);
     }
 
     #[test]

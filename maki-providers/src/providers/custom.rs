@@ -5,6 +5,7 @@ use maki_config::providers::{
     resolve_base_url, resolve_protocol,
 };
 use serde_json::{Value, json};
+use tokio::task::spawn_blocking;
 use tracing::warn;
 
 use super::ResolvedAuth;
@@ -13,6 +14,7 @@ use super::catalog;
 use super::codec::{CodecOptions, protocol_spec};
 use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
+use crate::model_registry::{self, DeclaredTiers};
 use crate::provider::Provider;
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
@@ -177,7 +179,7 @@ fn model_from_def(
         .find(|m| m.id == model_id)
         .map(ModelEntry::from)
         .unwrap_or_default();
-    let discovered = crate::model_registry::discovered(slug, model_id);
+    let discovered = model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
     row.max_output_tokens = row
         .max_output_tokens
@@ -221,13 +223,20 @@ fn model_from_def(
     // rates -- it is free at the point of use -- so fall back to the
     // published list price purely as the reference shown alongside the $0
     // bill.
-    let pricing = row.pricing.take().unwrap_or_default();
+    let declared_pricing = row.pricing.take();
+    let using_discovered_pricing = declared_pricing.is_none();
+    let discovered_pricing = discovered.and_then(|d| d.pricing.as_ref());
+    let pricing = declared_pricing
+        .or_else(|| discovered_pricing.cloned())
+        .unwrap_or_default();
     row.pricing = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
         .and_then(|base_id| catalog::model_meta_if_available(super::anthropic::SLUG, base_id))
         .and_then(|meta| meta.pricing)
         .or(Some(pricing));
     Model {
         subsidised_by: subsidy_source.map(Arc::from),
+        discovered_free: using_discovered_pricing
+            && discovered_pricing.is_some_and(ModelPricing::is_zero),
         ..row.to_model(slug, base, model_id.to_string())
     }
 }
@@ -253,6 +262,29 @@ fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
     specs
 }
 
+/// The declared specs, plus the providers whose list they fully describe.
+/// A `discover_models` provider is left out of the second list: its declared
+/// specs show before discovery finishes, but only a successful probe proves
+/// which models it still serves.
+pub fn declared_batch() -> (Vec<String>, Vec<String>) {
+    declared_batch_from(&ProvidersConfig::load())
+}
+
+fn declared_batch_from(config: &ProvidersConfig) -> (Vec<String>, Vec<String>) {
+    let specs = declared_specs_from(config);
+    let providers = config
+        .providers
+        .iter()
+        .filter(|(slug, def)| {
+            !def.discover_models
+                && !is_builtin_slug(slug)
+                && resolve_protocol(slug, Some(*def)).is_some()
+        })
+        .map(|(slug, _)| slug.clone())
+        .collect();
+    (specs, providers)
+}
+
 /// Models a custom provider can start on: its own `default_model`, then one
 /// declared model per tier. Never the protocol's default model, because a local
 /// server or proxy rarely serves it. Sorted by slug, since `providers.toml` is a
@@ -262,6 +294,42 @@ pub fn startup_specs(tiers: &[ModelTier]) -> Vec<String> {
 }
 
 fn startup_specs_from(config: &ProvidersConfig, tiers: &[ModelTier]) -> Vec<String> {
+    custom_entries(config)
+        .into_iter()
+        .flat_map(|(slug, def)| {
+            let declared = tiers.iter().filter_map(move |&tier| {
+                declared_at(def, tier).map(|m| format!("{slug}/{}", m.id))
+            });
+            def.default_model.clone().into_iter().chain(declared)
+        })
+        .collect()
+}
+
+/// The tier table [`model_registry`] keeps for custom providers. A broken
+/// `providers.toml` reads as no declarations rather than exiting.
+pub(crate) fn declared_tiers() -> DeclaredTiers {
+    declared_tiers_from(&ProvidersConfig::load_or_default())
+}
+
+/// The first model declared at a tier wins, as in [`declared_at`].
+fn declared_tiers_from(config: &ProvidersConfig) -> DeclaredTiers {
+    let mut declared = DeclaredTiers::new();
+    for (slug, def) in custom_entries(config) {
+        for model in &def.models {
+            declared
+                .entry(slug.clone())
+                .or_default()
+                .entry(model.tier)
+                .or_insert_with(|| model.id.clone());
+        }
+    }
+    declared
+}
+
+/// Custom entries [`lookup_model`] can build a model for. Sorted by slug,
+/// because `providers.toml` loads into a `HashMap` and a startup pick must not
+/// change from one run to the next.
+fn custom_entries(config: &ProvidersConfig) -> Vec<(&String, &ProviderDef)> {
     let mut entries: Vec<_> = config
         .providers
         .iter()
@@ -269,17 +337,10 @@ fn startup_specs_from(config: &ProvidersConfig, tiers: &[ModelTier]) -> Vec<Stri
         .collect();
     entries.sort_unstable_by_key(|(slug, _)| *slug);
     entries
-        .into_iter()
-        .flat_map(|(slug, def)| {
-            let declared = tiers.iter().filter_map(move |&tier| {
-                def.models
-                    .iter()
-                    .find(|m| m.tier == tier)
-                    .map(|m| format!("{slug}/{}", m.id))
-            });
-            def.default_model.clone().into_iter().chain(declared)
-        })
-        .collect()
+}
+
+fn declared_at(def: &ProviderDef, tier: ModelTier) -> Option<&ModelDef> {
+    def.models.iter().find(|m| m.tier == tier)
 }
 
 /// Outcome of resolving a tier against `providers.toml` in a single read.
@@ -305,7 +366,7 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
         return TierLookup::Unknown;
     };
     let base = protocol_spec(protocol);
-    match def.models.iter().find(|m| m.tier == tier) {
+    match declared_at(def, tier) {
         Some(declared) => TierLookup::Model(model_from_def(def, base, slug, &declared.id)),
         None => TierLookup::NoModelForTier(base),
     }
@@ -313,9 +374,13 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 
 /// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
 /// goes through here, so an empty `discover_models = false` provider returns
-/// nothing and never hits the network.
-pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
-    let config = ProvidersConfig::load();
+/// nothing and never hits the network. The declared tiers reach the registry
+/// from this same read, so tier lookups notice edits to `providers.toml`.
+pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
+    let config = spawn_blocking(ProvidersConfig::load)
+        .await
+        .expect("providers config load panicked");
+    model_registry::set_declared(declared_tiers_from(&config));
     let mut all_specs = Vec::new();
     for slug in config.providers.keys() {
         if is_builtin_slug(slug) {
@@ -331,11 +396,11 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         match create(slug, timeouts) {
             Ok(provider) => {
                 let slug_c = slug.clone();
-                let result = smol::block_on(provider.list_models());
+                let result = provider.list_models().await;
                 match result {
                     Ok(mut models) => {
                         overlay_declared_tiers(def, &mut models);
-                        crate::model_registry::set_known_models(&slug_c, models.clone());
+                        model_registry::set_known_models(&slug_c, models.clone());
                         for m in models {
                             all_specs.push(format!("{slug_c}/{}", m.id));
                         }
@@ -367,6 +432,8 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use maki_storage::sessions::Effort::High;
     use test_case::test_case;
 
@@ -416,6 +483,23 @@ mod tests {
         assert_eq!(model.provider.as_ref(), "opencode");
     }
 
+    /// A `discover_models` provider's declared specs still show before its
+    /// probe lands, but the batch must not claim it answered: a failed probe
+    /// would otherwise mark its undiscovered recents retired.
+    #[test]
+    fn declared_batch_leaves_discovering_providers_out() {
+        let mut config = ProvidersConfig::default();
+        config.upsert("declared".to_string(), openai_def("small"));
+        let mut discovering = openai_def("small");
+        discovering.discover_models = true;
+        config.upsert("discovering".to_string(), discovering);
+
+        let (specs, providers) = declared_batch_from(&config);
+        assert!(specs.contains(&"declared/small".to_string()));
+        assert!(specs.contains(&"discovering/small".to_string()));
+        assert_eq!(providers, ["declared"]);
+    }
+
     #[test_case("[localai]", &[] ; "entry_without_protocol_is_skipped")]
     #[test_case("[openai]\nprotocol = \"openai\"\ndefault_model = \"openai/gpt-5\"", &[] ; "builtin_slug_is_skipped")]
     #[test_case("[local]\nprotocol = \"openai\"\ndiscover_models = true", &[] ; "protocol_default_is_never_guessed")]
@@ -436,6 +520,25 @@ mod tests {
     fn startup_specs_only_name_models_the_user_declared(toml_src: &str, expected: &[&str]) {
         let config: ProvidersConfig = toml::from_str(toml_src).unwrap();
         assert_eq!(startup_specs_from(&config, &STARTUP_TIERS), expected);
+    }
+
+    #[test]
+    fn declared_tiers_keep_the_first_model_per_tier() {
+        let config: ProvidersConfig = toml::from_str(
+            "[local]\nprotocol = \"openai\"\n\
+             [[local.models]]\nid = \"first\"\ntier = \"compaction\"\n\
+             [[local.models]]\nid = \"second\"\ntier = \"compaction\"\n\
+             [[local.models]]\nid = \"big\"\ntier = \"strong\"",
+        )
+        .unwrap();
+        let local = BTreeMap::from([
+            (ModelTier::Compaction, "first".to_owned()),
+            (ModelTier::Strong, "big".to_owned()),
+        ]);
+        assert_eq!(
+            declared_tiers_from(&config),
+            DeclaredTiers::from([("local".to_owned(), local)])
+        );
     }
 
     // The exact regression this fixes: discovery parsed context_window but
@@ -460,6 +563,64 @@ mod tests {
         let model = model_from_def(&def, openai_spec(), slug, model_id);
         assert_eq!(model.context_window, expected_window);
         assert_eq!(model.max_output_tokens, Some(expected_output));
+    }
+
+    const ENDPOINT_INPUT_PRICE: f64 = 0.5;
+    const ENDPOINT_OUTPUT_PRICE: f64 = 1.5;
+    const DECLARED_INPUT_PRICE: f64 = 3.0;
+    const DECLARED_OUTPUT_PRICE: f64 = 15.0;
+
+    fn seed_discovered_pricing(slug: &str, model_id: &str, pricing: ModelPricing) {
+        crate::model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                pricing: Some(pricing),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+    }
+
+    #[test]
+    fn discovered_pricing_fills_a_model_with_no_declared_rates() {
+        let slug = "custom-discovery-pricing-test";
+        let model_id = "endpoint-priced";
+        seed_discovered_pricing(
+            slug,
+            model_id,
+            ModelPricing::per_million(ENDPOINT_INPUT_PRICE, ENDPOINT_OUTPUT_PRICE, 0.0, 0.0),
+        );
+
+        let model = model_from_def(&openai_def(model_id), openai_spec(), slug, model_id);
+        assert_eq!(model.pricing.input, ENDPOINT_INPUT_PRICE);
+        assert_eq!(model.pricing.output, ENDPOINT_OUTPUT_PRICE);
+    }
+
+    #[test]
+    fn declared_pricing_wins_over_discovered_pricing() {
+        let slug = "custom-declared-pricing-test";
+        let model_id = "declared-price-wins";
+        seed_discovered_pricing(
+            slug,
+            model_id,
+            ModelPricing::per_million(ENDPOINT_INPUT_PRICE, ENDPOINT_OUTPUT_PRICE, 0.0, 0.0),
+        );
+        let mut def = openai_def(model_id);
+        def.models[0].pricing_input = Some(DECLARED_INPUT_PRICE);
+        def.models[0].pricing_output = Some(DECLARED_OUTPUT_PRICE);
+
+        let model = model_from_def(&def, openai_spec(), slug, model_id);
+        assert_eq!(model.pricing.input, DECLARED_INPUT_PRICE);
+        assert_eq!(model.pricing.output, DECLARED_OUTPUT_PRICE);
+    }
+
+    #[test]
+    fn discovered_zero_price_marks_the_model_free() {
+        let slug = "custom-discovery-free-test";
+        let model_id = "endpoint-free";
+        seed_discovered_pricing(slug, model_id, ModelPricing::ZERO);
+
+        let model = model_from_def(&openai_def(model_id), openai_spec(), slug, model_id);
+        assert!(model.is_free());
     }
 
     #[test]
@@ -565,17 +726,19 @@ mod tests {
             }
         }
 
-        fn ask(&self) -> Result<StreamResponse, AgentError> {
+        async fn ask(&self) -> Result<StreamResponse, AgentError> {
             let (tx, _rx) = flume::unbounded();
-            smol::block_on(self.provider.stream_message(
-                &self.model,
-                &[Message::user(PROMPT.to_owned())],
-                "",
-                &json!([]),
-                &tx,
-                RequestOptions::default(),
-                None,
-            ))
+            self.provider
+                .stream_message(
+                    &self.model,
+                    &[Message::user(PROMPT.to_owned())],
+                    "",
+                    &json!([]),
+                    &tx,
+                    RequestOptions::default(),
+                    None,
+                )
+                .await
         }
 
         fn sent_thinking(&self) -> Vec<bool> {
@@ -589,32 +752,33 @@ mod tests {
     }
 
     /// #1302. The last refusal fails the test if the block ever goes out again.
-    #[test]
-    fn a_refused_default_thinking_block_is_dropped_and_remembered() {
+    #[tokio::test]
+    async fn a_refused_default_thinking_block_is_dropped_and_remembered() {
         const SCRIPT: &[Canned] = &[LITELLM_REFUSAL, ANSWER, ANSWER, LITELLM_REFUSAL];
         let gateway = Gateway::serve(Value::Null, SCRIPT);
 
-        assert!(gateway.ask().is_ok());
-        assert!(gateway.ask().is_ok());
+        assert!(gateway.ask().await.is_ok());
+        assert!(gateway.ask().await.is_ok());
         assert_eq!(gateway.sent_thinking(), [true, false, false]);
     }
 
     #[test_case(&[LITELLM_REFUSAL, UNAVAILABLE, LITELLM_REFUSAL, ANSWER] ; "replay_unavailable")]
     #[test_case(&[UNRELATED_REFUSAL, UNRELATED_REFUSAL, LITELLM_REFUSAL, ANSWER] ; "refusal_that_only_mentions_thinking")]
-    fn a_failed_replay_is_not_remembered(script: &'static [Canned]) {
+    #[tokio::test]
+    async fn a_failed_replay_is_not_remembered(script: &'static [Canned]) {
         let gateway = Gateway::serve(Value::Null, script);
 
-        assert!(gateway.ask().is_err());
-        assert!(gateway.ask().is_ok());
+        assert!(gateway.ask().await.is_err());
+        assert!(gateway.ask().await.is_ok());
         assert_eq!(gateway.sent_thinking(), [true, false, true, false]);
     }
 
-    #[test]
-    fn a_declared_thinking_block_is_never_dropped() {
+    #[tokio::test]
+    async fn a_declared_thinking_block_is_never_dropped() {
         const SCRIPT: &[Canned] = &[LITELLM_REFUSAL; 2];
         let gateway = Gateway::serve(json!({"off": {THINKING_FIELD: {"type": "off"}}}), SCRIPT);
 
-        assert!(gateway.ask().is_err());
+        assert!(gateway.ask().await.is_err());
         assert_eq!(gateway.sent_thinking(), [true]);
     }
 

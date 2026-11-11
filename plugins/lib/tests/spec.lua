@@ -82,6 +82,94 @@ case("cut_middle_oversized_first_line_keeps_a_utf8_prefix", function()
   eq(output_limits.cut_middle(string.rep("x", 20) .. "\nok", 1000, 10), cut_middle("xxxxx", 0, 16, "ok"))
 end)
 
+case("cut_middle_unlimited_lines_keeps_tail", function()
+  eq(output_limits.cut_middle("aa\nbb\ncc\ndd\nee", nil, 10), cut_middle("aa", 3, 10, "ee"))
+end)
+
+local function records(n, width)
+  local out = {}
+  for i = 1, n do
+    out[i] = string.rep(string.char(96 + i % 26), (i * 7) % width)
+  end
+  return out
+end
+
+case("cut_middle_drops_lines_over_the_tail_budget", function()
+  local text = "a\n" .. string.rep("x", 50) .. "\nb\n" .. string.rep("y", 50) .. "\nc"
+  eq(output_limits.cut_middle(text, 1000, 20), cut_middle("a", 3, 105, "c"))
+end)
+
+case("collector_result_tracks_the_stream", function()
+  local collector = output_limits.collector(3, 1000)
+  eq(collector:result(), "", "no lines")
+  for _, line in ipairs({ "a", "b", "c", "d", "e" }) do
+    collector:append(line)
+  end
+  eq(collector:result(), output_limits.cut_middle("a\nb\nc\nd\ne", 3, 1000))
+  collector:append("f")
+  eq(collector:result(), cut_middle("a\nb", 3, 7, "f"))
+end)
+
+local function retained_bytes(collector)
+  if not collector.head then
+    return #table.concat(collector.lines, "\n")
+  end
+  return #collector.head + collector.tail_used
+end
+
+case("collector_retention_stays_within_limits", function()
+  local max_bytes = 500
+  local collector = output_limits.collector(20, max_bytes)
+  for i, line in ipairs(records(5000, 40)) do
+    collector:append(line)
+    assert(retained_bytes(collector) <= max_bytes, "over the byte budget after line " .. i)
+  end
+end)
+
+case("collector_full_mode_caps_at_ceiling", function()
+  local mib = string.rep("x", 1024 * 1024)
+  local collector = output_limits.collector(nil, nil)
+  local total = output_limits.FULL_OUTPUT_MAX_BYTES // #mib + 1
+  for _ = 1, total do
+    collector:append(mib)
+  end
+  local out = collector:result()
+  assert(#out <= output_limits.FULL_OUTPUT_MAX_BYTES + 100, "full mode kept " .. #out .. " bytes")
+  th.has(out, "[truncated ")
+end)
+
+case("collector_full_mode_caps_lines", function()
+  local collector = output_limits.collector(nil, nil)
+  for _ = 1, output_limits.FULL_OUTPUT_MAX_LINES + 1 do
+    collector:append("")
+  end
+  th.has(collector:result(), "[truncated 1 lines, ")
+end)
+
+case("collector_counts_the_uncut_bytes_of_a_cut_line", function()
+  local collector = output_limits.collector(1000, 4)
+  collector:append("abcd...", 600)
+  eq(collector:result(), cut_middle("ab", 0, 598))
+end)
+
+case("collector_fits_until_it_would_cut_and_newest_has_no_gap", function()
+  local collector = output_limits.collector(4, 1000)
+  for _, line in ipairs({ "a", "b", "c" }) do
+    collector:append(line)
+  end
+  local newest, before = collector:newest()
+  eq(table.concat(newest, ","), "a,b,c")
+  eq(before, 0)
+  assert(collector:fits(1), "a fourth line fits")
+  collector:append("d")
+  assert(not collector:fits(1), "a fifth line would cut")
+  collector:append("e")
+  collector:append("f")
+  newest, before = collector:newest()
+  eq(table.concat(newest, ","), "e,f")
+  eq(before, 4)
+end)
+
 -- ToolView tests
 
 case("tool_view_line_nr_fmt_right_aligns_to_max_width", function()
@@ -129,10 +217,10 @@ end)
 case("tool_view_header_appears_first", function()
   local buf = mock_buf()
   local view = ToolView.new(buf, { max_lines = 5 })
-  view:set_header({ "cmd", { { "---", "dim" } } })
+  view:set_header({ "cmd" })
   view:append("output1")
   eq(buf.lines[1], "cmd")
-  eq(buf.lines[2][1][1], "---")
+  eq(buf.lines[2][1][1], "──────")
   eq(buf.lines[3], "output1")
 end)
 
@@ -147,6 +235,40 @@ case("tool_view_ring_wraparound", function()
   eq(buf.lines[2], "line8")
   eq(buf.lines[3], "line9")
   eq(buf.lines[4], "line10")
+end)
+
+case("tool_view_zero_lines_shows_only_header_until_expanded", function()
+  for _, keep in ipairs({ "head", "tail" }) do
+    for _, count in ipairs({ 1, 5 }) do
+      local label = keep .. " count=" .. count
+      local buf = mock_buf()
+      local view = ToolView.new(buf, { max_lines = 0, keep = keep })
+      view:set_header({ "cmd" })
+      for i = 1, count do
+        view:append("line" .. i)
+      end
+      view:finish()
+      eq(#buf.lines, 1, label)
+      eq(buf.lines[1], "cmd", label)
+      eq(view:visible_count(), 0, label)
+      view:toggle()
+      eq(#buf.lines, count + 2, label) -- header + separator
+      eq(buf.lines[3], "line1", label)
+    end
+  end
+end)
+
+case("tool_view_expanded_shows_lines_appended_past_the_cap", function()
+  for _, opts in ipairs({ { max_lines = 0, keep = "tail" }, { max_lines = 1, keep = "head" } }) do
+    local label = opts.keep .. " max=" .. opts.max_lines
+    local buf = mock_buf()
+    local view = ToolView.new(buf, opts)
+    view:append("line1")
+    view:toggle()
+    view:append("line2")
+    eq(#buf.lines, 2, label)
+    eq(buf.lines[2], "line2", label)
+  end
 end)
 
 case("tool_view_finish_flushes_head_skipped", function()
@@ -256,13 +378,13 @@ end)
 case("tool_view_header_preserved_after_toggle", function()
   local buf = mock_buf()
   local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
-  view:set_header({ "$ echo hello", { { "---", "dim" } } })
+  view:set_header({ "$ echo hello" })
   for i = 1, 10 do
     view:append("line" .. i)
   end
   view:toggle()
   eq(buf.lines[1], "$ echo hello")
-  eq(buf.lines[2][1][1], "---")
+  eq(buf.lines[2][1][1], "──────")
   eq(buf.lines[3], "line1")
   eq(buf.lines[12], "line10")
 end)
@@ -318,6 +440,32 @@ case("tool_view_max_line_bytes_utf8_safe", function()
   local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 10 })
   view:append("éééééééééé")
   eq(buf.lines[1], string.rep("é", 5) .. "…")
+end)
+
+case("tool_view_max_line_bytes_stores_cut_lines", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 5 })
+  view:append(string.rep("a", 1000))
+  view:append({ { string.rep("b", 1000), "dim" }, "tail" })
+  local cut, span = "aaaaa…", "bbbbb…"
+  eq(view.all_lines[1], cut)
+  eq(#view.all_lines[2], 1, "spans past the cap are not stored")
+  eq(view.all_lines[2][1][1], span)
+  eq(buf.lines[1], cut, "a stored cut line renders unchanged")
+  eq(#buf.lines[2], 1)
+  eq(buf.lines[2][1][1], span)
+  eq(buf.lines[2][1][2], "dim")
+end)
+
+case("tool_view_max_line_bytes_stores_cut_updates", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 5 })
+  view:append("short")
+  view:update_line(1, { { string.rep("c", 1000), "keyword" } })
+  view:flush()
+  eq(view.all_lines[1][1][1], "ccccc…")
+  eq(view.ring[1][1][1], "ccccc…")
+  eq(buf.lines[1][1][1], "ccccc…")
 end)
 
 case("tool_view_max_line_bytes_default_off", function()

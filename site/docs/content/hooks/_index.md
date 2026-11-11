@@ -41,6 +41,17 @@ A call an input layer stopped never reaches the output slot: the reason came
 from a layer, so there is nothing left to filter. A name that resolves to no
 tool fires neither slot.
 
+A call [moved to the background](/docs/background-tasks/) fires `output`
+twice. The first time is on the receipt the model gets at the move, with
+`ctx.receipt = true`. Redact receipts too, since they can carry output such as
+the last lines of a command. The second time is on the final result, before
+the model, the task tab or `task_stop` sees it. A stop or a timeout cuts
+neither layer short, so a stopped call is filtered as well.
+
+If the receipt leaves the layers as an error (a layer returned `nil, reason`
+or set `is_error`), the move is undone. The work stops, and the model gets that
+error and no later result.
+
 Layers take `function(prev, value, ctx)` and answer in one of these ways:
 
 - return a table: it replaces the value for the rest of the call
@@ -66,6 +77,7 @@ already done, so `reason` only replaces the text the model reads.
 | `session_id` | session of the call. A subagent's calls arrive as `"model"` under its own session. |
 | `deadline_ms` | milliseconds left before the layer is dropped |
 | `input` | `output` only: the input the call ran with, after every input layer |
+| `receipt` | `true` when `output` fires on the receipt of a call that moved to the background |
 
 ### Rewriting a command
 
@@ -175,19 +187,27 @@ call, and the first skip shows a warning naming every missing key.
 | Tool | A layer needs |
 | --- | --- |
 | declares a permission, like `bash` | that permission, `session_read` and `session_write` |
-| declares none: `read`, `batch`, MCP tools, ACP client tools, `tool_search` | every permission |
+| declares `permission = {}`, like `todo_write` | `session_read` and `session_write` |
+| leaves `permission` out, like `batch`, or is an MCP tool, ACP client tool or `tool_search` | every permission |
 
-Declaring no capability does not mean a tool uses none. `batch`,
+The [Tools](/docs/tools/) page lists what each built-in declares.
+
+Leaving `permission` out does not mean a tool uses none. `batch`,
 `code_execution` and `task` declare nothing while invoking any other tool, so
 reading undeclared as free would hand a plugin everything. Undeclared costs the
-maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
+maximum instead. Only a tool that declares `permission = {}` is cheap, and its
+owner promises it reaches nothing past the conversation it runs in. See
+[plugin permissions](/docs/lua-api/#plugin-permissions).
 
 **A layer may wait, within a window.** Chains are async, so a layer can read a
 file or run a job before it decides. It runs inside the call it is filtering, so
-cancelling the call cancels the layer too. Each stage gets whatever the call has
-left of its own deadline, capped at 60 seconds. A layer still running when the
-window closes is dropped, and the call proceeds as if that layer had passed the
-value along.
+cancelling the call cancels the layer too, except for a moved call. The `input`
+stage gets whatever the call has left of its own deadline, capped at 60
+seconds. The `output` stage always gets 60 seconds, so a tool that overruns its
+deadline still has its result redacted. A layer still running when the window
+closes is dropped, and the call proceeds as if that layer had passed the value
+along. If the plugin host never answers, during a reload for example, the call
+moves on a few seconds after the window closes.
 
 Cancellation lands differently on the two stages. An input layer cut short stops
 the call, because nothing has run yet and nobody is left to read a result. An
@@ -259,6 +279,15 @@ inside a subagent), `model`, `context_size`, `context_window`, and
 A layer on any of them needs every permission, because it steers what the agent
 does next. The chain gets 30 seconds, then the loop carries on without it.
 
+The verdict strings the host reads off the final value, `continue` and
+`instructions`, are one string shared by every layer, and only the last write
+survives. A layer that has something to say appends its own text to whatever is
+already there, and tolerates the field being absent:
+
+```lua
+value.continue = (value.continue and value.continue .. "\n" or "") .. "Re-read PLAN.md."
+```
+
 ### agent.user_message
 
 `images` is the number of attached images. `source` is `"tui"`, `"acp"`,
@@ -282,14 +311,15 @@ end)
 ### agent.stop
 
 `reason` is `"finished"` or `"max_tokens"`, and `last_message` is the text of
-the final answer. Return `{ continue = text }` to send `text` as the next
-message and keep going:
+the final answer. Append to `continue` to send the text as the next message
+and keep going:
 
 ```lua
 maki.api.set_slot("agent.stop", function(prev, stop, ctx)
   local todo = maki.fs.read("TODO.md")
   if todo and todo:find("%- %[ %]") then
-    return { continue = "TODO.md still has open items. Keep going." }
+    stop.continue = (stop.continue and stop.continue .. "\n" or "")
+      .. "TODO.md still has open items. Keep going."
   end
   return prev(stop, ctx)
 end)
@@ -311,7 +341,7 @@ Return a table with any of:
   cannot be skipped, because the run cannot go on without compacting.
 - `instructions`: appended to the summary prompt, after the configured and
   requested ones.
-- `continue`: appended to the message the agent resumes with.
+- `continue`: text appended to the message the agent resumes with.
 
 ### agent.compact.prepare
 
@@ -468,7 +498,8 @@ end)
 once. An empty list is free for anyone. Leaving `capability` out charges every
 permission, which is what a tool declaring no capability charges: a slot that
 named no price has not promised its default exercises none, only that nobody
-asked. You can only name permissions your own plugin holds.
+asked. You can only name permissions your own plugin holds. `permission = {}` on
+a tool is the same declaration as `capability = {}` on a slot.
 
 The rule is the one the `tool.*` slots use, and it is read the same way: every
 call re-reads what each layer's plugin holds, so a layer registered by a plugin

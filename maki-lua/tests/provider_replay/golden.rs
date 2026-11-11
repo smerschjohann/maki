@@ -33,11 +33,12 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_config::providers::base_url_env_var;
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
 use maki_providers::provider::Provider;
-use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, serve};
+use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, isolated_home, serve};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StreamResponse, ThinkingSupport,
     Timeouts,
@@ -48,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{isolated_state, load_bundled};
+use super::load_bundled;
 
 const GOLDEN_DIR: &str = "tests/goldens";
 const GOLDEN_EXTENSION: &str = "json";
@@ -60,6 +61,9 @@ const UPDATE_ON: &str = "1";
 const HOST_HEADER: &str = "host";
 const USER_AGENT_HEADER: &str = "user-agent";
 const VOLATILE_VALUE: &str = "<volatile>";
+const ACCEPT_ENCODING_POINTER: &str = "/headers/accept-encoding";
+const CODING_SEPARATOR: char = ',';
+const CANONICAL_CODING_SEPARATOR: &str = ", ";
 const REQUESTS_KEY: &str = "requests";
 const BODY_KEY: &str = "body";
 const PATH_KEY: &str = "path";
@@ -323,7 +327,7 @@ impl Replay {
     /// origin a test can set. The declared `base_url` is the real provider, and
     /// `auth.base_url` only comes from an auth hook.
     fn open(slug: &str, script: &'static [Canned]) -> Self {
-        let home = isolated_state();
+        let home = isolated_home();
         let (base_url, requests) = serve(script);
         unsafe { env::set_var(base_url_env_var(slug), base_url) };
         let host = load_bundled(slug);
@@ -350,7 +354,7 @@ impl Replay {
 
     fn usage(&self) -> Value {
         let before = Timestamp::now();
-        let result = smol::block_on(self.provider.fetch_usage());
+        let result = runtime().block_on(self.provider.fetch_usage());
         let after = Timestamp::now();
         let mut observed = json!({
             REQUESTS_KEY: self.recorded(),
@@ -364,7 +368,7 @@ impl Replay {
     }
 
     fn models(&self) -> Value {
-        let listed = smol::block_on(self.provider.list_models());
+        let listed = runtime().block_on(self.provider.list_models());
         json!({
             REQUESTS_KEY: self.recorded(),
             OUTCOME_KEY: listing(&listed),
@@ -376,7 +380,7 @@ impl Replay {
     /// through the request path alone.
     fn discovered(&self, slug: &str, turn: &Turn) -> Value {
         let model = turn.model();
-        let listed = smol::block_on(self.provider.list_models());
+        let listed = runtime().block_on(self.provider.list_models());
         if let Ok(models) = &listed {
             model_registry::set_known_models(slug, models.clone());
         }
@@ -400,7 +404,7 @@ impl Replay {
             .unwrap_or_else(|| vec![Message::user(PROMPT.to_owned())]);
         let tools = turn.tools.clone().unwrap_or_else(tools);
         let (tx, rx) = flume::unbounded();
-        let result = smol::block_on(self.provider.stream_message(
+        let result = runtime().block_on(self.provider.stream_message(
             model,
             &messages,
             SYSTEM,
@@ -584,6 +588,13 @@ fn canonical_observation(observed: &Value) -> Value {
         .and_then(Value::as_array_mut)
         .expect(NO_REQUESTS);
     for request in requests {
+        // The codings a client accepts are a set. How the list is ordered and
+        // spaced is up to its HTTP library, not the provider.
+        if let Some(Value::String(codings)) = request.pointer_mut(ACCEPT_ENCODING_POINTER) {
+            let mut sorted: Vec<_> = codings.split(CODING_SEPARATOR).map(str::trim).collect();
+            sorted.sort_unstable();
+            *codings = sorted.join(CANONICAL_CODING_SEPARATOR);
+        }
         let Some(body) = request.get_mut(BODY_KEY) else {
             continue;
         };

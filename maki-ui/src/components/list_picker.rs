@@ -8,7 +8,7 @@ use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::{BORDER, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
-use crate::components::{hint_footer, is_ctrl};
+use crate::components::{chevron_span, hint_footer, is_ctrl, render_field};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -16,12 +16,12 @@ use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
+const ERROR_LABEL: &str = "Error: ";
 const MIN_WIDTH_PERCENT: u16 = 65;
 /// Fits a long model id next to its tier and price columns.
 const MIN_WIDTH_COLS: u16 = 72;
@@ -299,7 +299,18 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn set_error_text(&mut self, text: Option<String>) {
+        self.error_text = text.map(|text| format!("{ERROR_LABEL}{text}"));
+    }
+
+    /// A line in the error style that is not a failure, such as a question
+    /// to confirm before acting.
+    pub fn set_alert_text(&mut self, text: Option<String>) {
         self.error_text = text;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alert_text(&self) -> Option<&str> {
+        self.error_text.as_deref()
     }
 
     /// A dim line under the list, for state that is not an item.
@@ -467,13 +478,12 @@ impl<T: PickerItem> ListPicker<T> {
         self.state.as_ref().and_then(|s| s.items.get(idx))
     }
 
-    pub fn handle_paste(&mut self, text: &str) -> bool {
+    pub fn handle_paste(&mut self, text: &str) {
         let Some(s) = self.state.as_mut() else {
-            return false;
+            return;
         };
         s.search.insert_text(text);
         s.update_search_and_clamp();
-        true
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -493,10 +503,10 @@ impl<T: PickerItem> ListPicker<T> {
         }
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         let footer = self.footer;
         match self.state.as_mut() {
-            None => Rect::default(),
+            None => (Rect::default(), None),
             Some(s) => render_ready(
                 frame,
                 area,
@@ -536,7 +546,7 @@ fn render_ready<T: PickerItem>(
     max_visible: Option<u16>,
     footer: Hints,
     error_text: Option<&str>,
-) -> Rect {
+) -> (Rect, Option<Position>) {
     let notice = s.notice;
     let content_rows = if s.filtered.is_empty() {
         1
@@ -582,10 +592,7 @@ fn render_ready<T: PickerItem>(
     let mut area_idx = 0;
 
     if let Some(err) = error_text {
-        let line = Line::from(Span::styled(
-            format!("  Error: {err}"),
-            theme::current().error,
-        ));
+        let line = Line::from(Span::styled(format!("  {err}"), theme::current().error));
         frame.render_widget(Paragraph::new(vec![line]), areas[area_idx]);
         area_idx += 1;
     }
@@ -614,7 +621,7 @@ fn render_ready<T: PickerItem>(
         s.viewport_height,
         s.enabled.as_deref(),
     );
-    render_search(frame, search_area, &s.search);
+    let caret = render_search(frame, search_area, &s.search);
 
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
     if total_visual as u16 > viewport_h {
@@ -623,7 +630,7 @@ fn render_ready<T: PickerItem>(
     }
 
     s.inner_area = inner;
-    popup
+    (popup, caret)
 }
 
 fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
@@ -827,22 +834,15 @@ fn render_list<T: PickerItem>(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
-    let query = search.value();
-    let cursor_x = search.x();
-    let chars: Vec<char> = query.chars().collect();
-    let before: String = chars[..cursor_x].iter().collect();
-    let cursor_char = chars.get(cursor_x).copied().unwrap_or(' ');
-    let after_start = cursor_x.saturating_add(1).min(chars.len());
-    let after: String = chars[after_start..].iter().collect();
-
-    let line = Line::from(vec![
-        super::chevron_span(),
-        Span::styled(before, Style::default()),
-        Span::styled(cursor_char.to_string(), theme::current().cursor),
-        Span::styled(after, Style::default()),
-    ]);
-    frame.render_widget(Paragraph::new(vec![line]), area);
+fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) -> Option<Position> {
+    render_field(
+        frame,
+        area,
+        vec![chevron_span()],
+        search.value(),
+        search.cursor_byte(),
+        theme::current().cursor,
+    )
 }
 
 #[cfg(test)]
