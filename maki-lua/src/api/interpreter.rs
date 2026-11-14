@@ -1,5 +1,5 @@
 //! Runs Python in the monty sandbox with Lua fns as tools. Monty blocks on
-//! a `smol::unblock` thread. Stdout and tool-call batches share one FIFO
+//! a `spawn_blocking` thread. Stdout and tool-call batches share one FIFO
 //! channel so ordering is preserved and cancellation (dropped channel) makes
 //! the blocked thread unwind instead of leaking.
 
@@ -17,6 +17,9 @@ use mlua::{
     Function, IntoLuaMulti, Lua, MultiValue, Result as LuaResult, Table, Value as LuaValue,
 };
 use serde_json::Value;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
+use tokio::task::{spawn_blocking, yield_now};
 
 use crate::api::util::convert::{TableExt, json_to_lua, lua_tool_result, required};
 use crate::api::util::pair::Pair;
@@ -35,19 +38,19 @@ type FileResult = Result<String, String>;
 
 enum BridgeMsg {
     Line(String),
-    Calls(Vec<PendingCall>, flume::Sender<CallResults>),
-    File(FileOp, flume::Sender<FileResult>),
+    Calls(Vec<PendingCall>, oneshot::Sender<CallResults>),
+    File(FileOp, oneshot::Sender<FileResult>),
 }
 
 fn forward_calls(
-    tx: &flume::Sender<BridgeMsg>,
+    tx: &UnboundedSender<BridgeMsg>,
     calls: Vec<PendingCall>,
 ) -> Result<CallResults, InterpreterError> {
-    let (reply_tx, reply_rx) = flume::bounded(1);
+    let (reply_tx, reply_rx) = oneshot::channel();
     tx.send(BridgeMsg::Calls(calls, reply_tx))
         .map_err(|_| InterpreterError::Runtime(BRIDGE_CLOSED.into()))?;
     reply_rx
-        .recv()
+        .blocking_recv()
         .map_err(|_| InterpreterError::Runtime(BRIDGE_CLOSED.into()))
 }
 
@@ -175,8 +178,8 @@ async fn interpreter_run(
     let timeout = Duration::from_secs(timeout_secs);
     let limits = runner::limits(timeout, max_memory_mb * 1024 * 1024);
 
-    let (tx, rx) = flume::unbounded::<BridgeMsg>();
-    let run = smol::unblock(move || {
+    let (tx, mut rx) = unbounded_channel::<BridgeMsg>();
+    let run = spawn_blocking(move || {
         let tools: HashMap<String, ToolFn> = names
             .into_iter()
             .map(|name| {
@@ -206,10 +209,12 @@ async fn interpreter_run(
         let files: FileFn = {
             let tx = tx.clone();
             Box::new(move |op| {
-                let (reply_tx, reply_rx) = flume::bounded(1);
+                let (reply_tx, reply_rx) = oneshot::channel();
                 tx.send(BridgeMsg::File(op, reply_tx))
                     .map_err(|_| BRIDGE_CLOSED.to_owned())?;
-                reply_rx.recv().map_err(|_| BRIDGE_CLOSED.to_owned())?
+                reply_rx
+                    .blocking_recv()
+                    .map_err(|_| BRIDGE_CLOSED.to_owned())?
             })
         };
 
@@ -239,13 +244,13 @@ async fn interpreter_run(
 
     let recv_loop = async {
         let mut lines = 0usize;
-        while let Ok(msg) = rx.recv_async().await {
+        while let Some(msg) = rx.recv().await {
             match msg {
                 BridgeMsg::Line(line) => {
                     on_output.call::<()>(line)?;
                     lines += 1;
                     if lines.is_multiple_of(LINES_PER_YIELD) {
-                        smol::future::yield_now().await;
+                        yield_now().await;
                     }
                 }
                 BridgeMsg::Calls(batch, reply) => {
@@ -289,11 +294,12 @@ async fn interpreter_run(
 
     // A cancel comes back as a pair error, not a raise, so the caller can
     // still report the lines it streamed before the cut.
-    let (result, cb) = match cancel.race(futures_lite::future::zip(run, recv_loop)).await {
+    let (result, cb) = match cancel.race(async { tokio::join!(run, recv_loop) }).await {
         Ok(v) => v,
         Err(e) => return Ok((None, Some(e))),
     };
     cb?;
+    let result = result.map_err(mlua::Error::external)?;
 
     let tbl = lua.create_table()?;
     match result {

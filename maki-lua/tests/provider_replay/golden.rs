@@ -21,23 +21,26 @@
 //! slug), so [`every_golden_replays`] runs each file in a child process of
 //! this binary. Nothing one case leaves behind can reach the next.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::iter;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{env, fs, thread};
+use tokio::sync::mpsc::unbounded_channel;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_config::providers::base_url_env_var;
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
 use maki_providers::provider::Provider;
-use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, serve};
+use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, isolated_home, serve};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StreamResponse, ThinkingSupport,
     Timeouts,
@@ -45,10 +48,10 @@ use maki_providers::{
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::StoredThinking;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tempfile::TempDir;
 
-use super::{isolated_state, load_bundled};
+use super::load_bundled_with_opts;
 
 const GOLDEN_DIR: &str = "tests/goldens";
 const GOLDEN_EXTENSION: &str = "json";
@@ -60,6 +63,9 @@ const UPDATE_ON: &str = "1";
 const HOST_HEADER: &str = "host";
 const USER_AGENT_HEADER: &str = "user-agent";
 const VOLATILE_VALUE: &str = "<volatile>";
+const ACCEPT_ENCODING_POINTER: &str = "/headers/accept-encoding";
+const CODING_SEPARATOR: char = ',';
+const CANONICAL_CODING_SEPARATOR: &str = ", ";
 const REQUESTS_KEY: &str = "requests";
 const BODY_KEY: &str = "body";
 const PATH_KEY: &str = "path";
@@ -103,6 +109,10 @@ const NO_MIDNIGHT: &str = "the day after a sampled one is representable";
 struct GoldenFile {
     call: Value,
     script: Value,
+    /// The `plugins` table from `maki.setup`, so a case can load its plugin
+    /// with the options a user who set them would have.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    plugins: HashMap<String, Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected: Option<Value>,
 }
@@ -275,7 +285,7 @@ fn replay(path: &Path) {
         .and_then(|slug| slug.to_str())
         .expect(NO_SLUG);
 
-    let replay = Replay::open(slug, script.leak());
+    let replay = Replay::open(slug, script.leak(), golden.plugins.clone());
     let observed = match &call {
         Call::Stream(turn) => replay.stream(turn),
         Call::Discovered(turn) => replay.discovered(slug, turn),
@@ -322,11 +332,15 @@ impl Replay {
     /// The recorded server goes in `<SLUG>_BASE_URL` because it is the only
     /// origin a test can set. The declared `base_url` is the real provider, and
     /// `auth.base_url` only comes from an auth hook.
-    fn open(slug: &str, script: &'static [Canned]) -> Self {
-        let home = isolated_state();
+    fn open(
+        slug: &str,
+        script: &'static [Canned],
+        opts: HashMap<String, Map<String, Value>>,
+    ) -> Self {
+        let home = isolated_home();
         let (base_url, requests) = serve(script);
         unsafe { env::set_var(base_url_env_var(slug), base_url) };
-        let host = load_bundled(slug);
+        let host = load_bundled_with_opts(slug, opts);
         let key_env = plugin::spec(slug).expect(NOT_DECLARED).api_key_env;
         unsafe { env::set_var(key_env, API_KEY) };
         let provider = plugin::create(slug, Timeouts::default()).expect(CREATE_FAILED);
@@ -350,7 +364,7 @@ impl Replay {
 
     fn usage(&self) -> Value {
         let before = Timestamp::now();
-        let result = smol::block_on(self.provider.fetch_usage());
+        let result = runtime().block_on(self.provider.fetch_usage());
         let after = Timestamp::now();
         let mut observed = json!({
             REQUESTS_KEY: self.recorded(),
@@ -364,7 +378,7 @@ impl Replay {
     }
 
     fn models(&self) -> Value {
-        let listed = smol::block_on(self.provider.list_models());
+        let listed = runtime().block_on(self.provider.list_models());
         json!({
             REQUESTS_KEY: self.recorded(),
             OUTCOME_KEY: listing(&listed),
@@ -376,7 +390,7 @@ impl Replay {
     /// through the request path alone.
     fn discovered(&self, slug: &str, turn: &Turn) -> Value {
         let model = turn.model();
-        let listed = smol::block_on(self.provider.list_models());
+        let listed = runtime().block_on(self.provider.list_models());
         if let Ok(models) = &listed {
             model_registry::set_known_models(slug, models.clone());
         }
@@ -399,8 +413,8 @@ impl Replay {
             .clone()
             .unwrap_or_else(|| vec![Message::user(PROMPT.to_owned())]);
         let tools = turn.tools.clone().unwrap_or_else(tools);
-        let (tx, rx) = flume::unbounded();
-        let result = smol::block_on(self.provider.stream_message(
+        let (tx, mut rx) = unbounded_channel();
+        let result = runtime().block_on(self.provider.stream_message(
             model,
             &messages,
             SYSTEM,
@@ -413,7 +427,7 @@ impl Replay {
             turn.session.as_ref(),
         ));
         drop(tx);
-        (rx.drain().collect(), result)
+        (iter::from_fn(|| rx.try_recv().ok()).collect(), result)
     }
 
     /// Arrival order, unless the script is routed. Routed requests raced each
@@ -584,6 +598,13 @@ fn canonical_observation(observed: &Value) -> Value {
         .and_then(Value::as_array_mut)
         .expect(NO_REQUESTS);
     for request in requests {
+        // The codings a client accepts are a set. How the list is ordered and
+        // spaced is up to its HTTP library, not the provider.
+        if let Some(Value::String(codings)) = request.pointer_mut(ACCEPT_ENCODING_POINTER) {
+            let mut sorted: Vec<_> = codings.split(CODING_SEPARATOR).map(str::trim).collect();
+            sorted.sort_unstable();
+            *codings = sorted.join(CANONICAL_CODING_SEPARATOR);
+        }
         let Some(body) = request.get_mut(BODY_KEY) else {
             continue;
         };

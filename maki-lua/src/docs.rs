@@ -83,6 +83,10 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::model::DOCS,
         &api::net::DOCS,
         &api::net::CONN_DOCS,
+        #[cfg(unix)]
+        &api::net::unix::DOCS,
+        #[cfg(unix)]
+        &api::net::unix::LISTENER_DOCS,
         &api::provider::DOCS,
         &api::provider::AUTH_DOCS,
         &api::session::DOCS,
@@ -101,6 +105,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::ui::win::DOCS,
         &api::ui::buf::DOCS,
         &api::uv::DOCS,
+        &api::version::DOCS,
         &api::yaml::DOCS,
     ]
 }
@@ -111,6 +116,8 @@ mod tests {
     use std::sync::Arc;
 
     use mlua::{Lua, Table, Value};
+    use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::{DocKind, api_docs};
     use crate::api::{Owner, create_maki_global};
@@ -143,14 +150,10 @@ mod tests {
         keys
     }
 
-    /// Docs and registration live side by side; this test keeps them equal so
-    /// the generated reference can never drift from the real API.
-    #[test]
-    fn docs_match_registered_api() {
-        let lua = Lua::new();
-        let (ui_tx, _ui_rx) = flume::unbounded();
-        let maki = create_maki_global(
-            &lua,
+    fn global(lua: &Lua, permissions: PluginPermissions) -> Table {
+        let (ui_tx, _ui_rx) = unbounded_channel();
+        create_maki_global(
+            lua,
             Arc::default(),
             Arc::default(),
             Owner {
@@ -159,11 +162,33 @@ mod tests {
                 granted_providers: Arc::from(Vec::new()),
             },
             Some(ui_tx),
-            &PluginReach::new(PluginPermissions::trusted()),
+            &PluginReach::new(permissions),
             Arc::default(),
         )
-        .unwrap();
+        .unwrap()
+    }
 
+    #[test_case("maki.version.parse('1.2.3').major", "1" ; "version_parse")]
+    #[test_case("maki.version.cmp('1.2.3', '1.2.4')", "-1" ; "version_cmp")]
+    #[test_case("maki.version().major ~= nil", "true" ; "version_call")]
+    fn pure_helpers_need_no_permissions(call: &str, expected: &str) {
+        let lua = Lua::new();
+        lua.globals()
+            .set("maki", global(&lua, PluginPermissions::denied()))
+            .unwrap();
+        let result: String = lua
+            .load(format!("return tostring(({call}))"))
+            .eval()
+            .unwrap();
+        assert_eq!(result, expected);
+    }
+
+    /// Docs and registration live side by side; this test keeps them equal so
+    /// the generated reference can never drift from the real API.
+    #[test]
+    fn docs_match_registered_api() {
+        let lua = Lua::new();
+        let maki = global(&lua, PluginPermissions::trusted());
         let mut documented: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for module in api_docs() {
             if module.kind == DocKind::Table {

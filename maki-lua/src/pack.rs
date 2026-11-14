@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use maki_pack::approvals::Entry;
+use tokio::task::spawn_blocking;
 
 use crate::error::PluginError;
 use crate::loader::is_bundled;
@@ -103,18 +104,12 @@ pub struct DiscoveredPackage {
 
 /// `pack-lock.json`, beside the user's configuration so it can be committed.
 ///
-/// `config_search_dirs` returns candidates in the order `init.lua` is searched
-/// for, so the first that exists is the one whose `maki.pack.add` declared
-/// these packages, and a custom config directory keeps its lockfile rather than
-/// leaving it behind in XDG. With none of them created yet there is nothing to
-/// sit beside, and the last candidate is the one `append_permission_rule`
-/// already treats as writable.
+/// The config dir is where `init.lua` ran, so it is the directory whose
+/// `maki.pack.add` declared these packages, and it keeps its lockfile rather
+/// than leaving it behind.
 pub fn lockfile_path() -> Option<PathBuf> {
-    let dirs = maki_storage::paths::config_search_dirs();
-    dirs.iter()
-        .find(|dir| dir.is_dir())
-        .cloned()
-        .or_else(|| dirs.into_iter().next_back())
+    maki_storage::paths::config_dir()
+        .ok()
         .map(|dir| dir.join("pack-lock.json"))
 }
 
@@ -259,7 +254,7 @@ pub struct InstallReport {
 /// Both halves matter. A recorded revision only describes the source it was
 /// recorded for, so a name pointed at a different repository is neither
 /// installed nor covered by the decision that trusted the old one.
-fn installed_from_declared_source(
+async fn installed_from_declared_source(
     declared: &crate::api::pack::Declared,
     lock: &maki_pack::lockfile::Lockfile,
     manager: &maki_pack::manager::Manager,
@@ -267,7 +262,7 @@ fn installed_from_declared_source(
     let spec = &declared.spec;
     lock.get(&spec.name)
         .is_some_and(|entry| entry.src == spec.src)
-        && manager.resolve(lock, &spec.name).is_some()
+        && manager.resolve_async(lock, &spec.name).await.is_some()
 }
 
 /// A declared package that recorded state says is on disk, together with the
@@ -572,7 +567,7 @@ fn grant_installed(
 /// Lua call would wait on a message that cannot be processed until it returns.
 /// One unreachable repository is reported and skipped so a network problem
 /// does not stop Maki from starting.
-pub fn install_declared(
+pub async fn install_declared(
     specs: &[crate::api::pack::Declared],
     interaction: Interaction,
 ) -> InstallReport {
@@ -593,7 +588,7 @@ pub fn install_declared(
     // durability but not isolation: without this, two processes could each read
     // the same lockfile and the second write would discard the first's entries.
     let _guard = match lock_path.as_deref().map(maki_pack::paths::sidecar_lock) {
-        Some(path) => match maki_pack::lock::Lock::acquire_retrying(&path) {
+        Some(path) => match maki_pack::lock::Lock::acquire_retrying_async(path).await {
             Ok(guard) => Some(guard),
             Err(e) => {
                 // The kernel releases the lock when its process exits,
@@ -605,19 +600,24 @@ pub fn install_declared(
                 // no managed packages at all, because discovery skips the
                 // managed group, so a second maki started during a clone
                 // would come up with every package the user has missing.
-                if let Some(lock) = read_lockfile(lock_path.as_deref()) {
-                    let manual = discover(&site);
-                    let runnable = runnable_declarations(specs, &manual, &mut report);
-                    report.packages =
-                        resolved_on_disk(&runnable, &site, &lock, &mut report.failures);
-                }
-                return report;
+                let specs = specs.to_vec();
+                return blocking(move || {
+                    if let Some(lock) = read_lockfile(lock_path.as_deref()) {
+                        let manual = discover(&site);
+                        let runnable = runnable_declarations(&specs, &manual, &mut report);
+                        report.packages =
+                            resolved_on_disk(&runnable, &site, &lock, &mut report.failures);
+                    }
+                    report
+                })
+                .await;
             }
         },
         None => None,
     };
 
-    let mut lock = match read_lockfile(lock_path.as_deref()) {
+    let read_path = lock_path.clone();
+    let mut lock = match blocking(move || read_lockfile(read_path.as_deref())).await {
         Some(lock) => lock,
         None => {
             report
@@ -628,14 +628,16 @@ pub fn install_declared(
     };
 
     let manager = maki_pack::manager::Manager::new(&site);
-    for error in manager.prune(&lock) {
+    let (pruner, recorded) = (manager.clone(), lock.clone());
+    for error in blocking(move || pruner.prune(&recorded)).await {
         tracing::warn!(error = %error, "could not prune a stale package revision");
         report.failures.push(redact_error(&error));
     }
     if specs.is_empty() {
         return report;
     }
-    let manual = discover(&site);
+    let walked = site.clone();
+    let manual = blocking(move || discover(&walked)).await;
     let runnable = runnable_declarations(specs, &manual, &mut report);
     let mut changed = false;
 
@@ -643,13 +645,17 @@ pub fn install_declared(
     // already recorded at the revision it asks for is not a new trust
     // decision, so only a fresh source prompts. Credentials are redacted,
     // because the prompt is the one place a source is shown in full.
+    let mut fresh = Vec::new();
+    for declared in runnable.iter().copied() {
+        fresh.push(
+            declared.confirm && !installed_from_declared_source(declared, &lock, &manager).await,
+        );
+    }
     let new_sources: Vec<String> = runnable
         .iter()
-        .copied()
-        .filter(|declared| {
-            declared.confirm && !installed_from_declared_source(declared, &lock, &manager)
-        })
-        .map(|declared| {
+        .zip(&fresh)
+        .filter(|(_, fresh)| **fresh)
+        .map(|(declared, _)| {
             format!(
                 "{} from {}",
                 declared.spec.name,
@@ -657,25 +663,21 @@ pub fn install_declared(
             )
         })
         .collect();
-    let confirmed = new_sources.is_empty()
-        || interaction.confirm(&format!(
-            "Install these packages?\n  {}",
-            new_sources.join("\n  ")
-        ));
+    let confirmed = new_sources.is_empty() || {
+        let prompt = format!("Install these packages?\n  {}", new_sources.join("\n  "));
+        blocking(move || interaction.confirm(&prompt)).await
+    };
 
-    for declared in runnable.iter().copied() {
+    for (declared, fresh) in runnable.iter().copied().zip(fresh) {
         let spec = &declared.spec;
-        if declared.confirm
-            && !installed_from_declared_source(declared, &lock, &manager)
-            && !confirmed
-        {
+        if fresh && !confirmed {
             report.failures.push(format!(
                 "{}: installation requires confirmation; set confirm = false for a non-interactive install",
                 spec.name
             ));
             continue;
         }
-        let result = match smol::block_on(manager.ensure_installed(spec, &mut lock)) {
+        let result = match manager.ensure_installed(spec, &mut lock).await {
             Ok(result) => result,
             Err(e) => {
                 let message = redact_error(&e);
@@ -689,23 +691,28 @@ pub fn install_declared(
         changed |= result.changed;
     }
 
-    // Written once, after the installs, and only when something moved.
-    if changed {
-        let recorded = lock_path.is_some_and(|path| write_lockfile(&path, &lock));
-        if !recorded {
-            // The packages are on disk but nothing records where. The next
-            // start reads the old lockfile and would not find them, so they
-            // must not be reported as installed either.
-            report.packages.clear();
-            report
-                .failures
-                .push("the pack lockfile could not be written, so no package was used".to_owned());
-            return report;
+    let runnable: Vec<crate::api::pack::Declared> = runnable.into_iter().cloned().collect();
+    blocking(move || {
+        // Written once, after the installs, and only when something moved.
+        if changed {
+            let recorded = lock_path.is_some_and(|path| write_lockfile(&path, &lock));
+            if !recorded {
+                // The packages are on disk but nothing records where. The next
+                // start reads the old lockfile and would not find them, so they
+                // must not be reported as installed either.
+                report.packages.clear();
+                report.failures.push(
+                    "the pack lockfile could not be written, so no package was used".to_owned(),
+                );
+                return report;
+            }
         }
-    }
 
-    grant_installed(&runnable, &site, &manager, &lock, interaction, &mut report);
-    report
+        let runnable: Vec<&crate::api::pack::Declared> = runnable.iter().collect();
+        grant_installed(&runnable, &site, &manager, &lock, interaction, &mut report);
+        report
+    })
+    .await
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -744,9 +751,12 @@ impl PackReport {
     }
 }
 
-pub fn installed_names() -> Option<Vec<String>> {
-    read_lockfile(lockfile_path().as_deref())
-        .map(|lock| lock.install_order().map(str::to_owned).collect())
+pub async fn installed_names() -> Option<Vec<String>> {
+    blocking(|| {
+        read_lockfile(lockfile_path().as_deref())
+            .map(|lock| lock.install_order().map(str::to_owned).collect())
+    })
+    .await
 }
 
 /// A parsed package command. Parsing already turned away the malformed shapes,
@@ -990,7 +1000,7 @@ struct PendingApproval {
     providers: Vec<String>,
 }
 
-pub fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> PackPreparation {
+pub async fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> PackPreparation {
     let operations = match plan_command(command, &context.declared, &context.installed) {
         Ok(operations) => operations,
         Err(error) => return PackPreparation::failed(error),
@@ -1015,9 +1025,10 @@ pub fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> Pac
         &site,
         &lock_path,
     )
+    .await
 }
 
-fn prepare_pack_ops_at(
+async fn prepare_pack_ops_at(
     ops: &[PlannedOp],
     declared: &[crate::api::pack::Declared],
     active: &BTreeSet<String>,
@@ -1025,15 +1036,19 @@ fn prepare_pack_ops_at(
     lock_path: &Path,
 ) -> PackPreparation {
     let mut report = PackReport::default();
-    let guard =
-        match maki_pack::lock::Lock::acquire_retrying(&maki_pack::paths::sidecar_lock(lock_path)) {
-            Ok(guard) => guard,
-            Err(error) => {
-                report.failures.push(redact_error(&error));
-                return PackPreparation::Complete(report);
-            }
-        };
-    let lock = match read_lockfile(Some(lock_path)) {
+    let guard = match maki_pack::lock::Lock::acquire_retrying_async(maki_pack::paths::sidecar_lock(
+        lock_path,
+    ))
+    .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            report.failures.push(redact_error(&error));
+            return PackPreparation::Complete(report);
+        }
+    };
+    let read_path = lock_path.to_path_buf();
+    let lock = match blocking(move || read_lockfile(Some(&read_path))).await {
         Some(lock) => lock,
         None => {
             report
@@ -1049,7 +1064,8 @@ fn prepare_pack_ops_at(
     drop(guard);
     let manager = maki_pack::manager::Manager::new(site);
     let approval_path = site.join(APPROVALS_FILE);
-    let manual_names = discover(site).known_names();
+    let walked = site.to_path_buf();
+    let manual_names = blocking(move || discover(&walked).known_names()).await;
     let mut prepared = Vec::new();
     let mut review = Vec::new();
     let mut approvals = None;
@@ -1078,9 +1094,7 @@ fn prepare_pack_ops_at(
                 let approved = if options.force {
                     None
                 } else {
-                    let store =
-                        approvals.get_or_insert_with(|| read_approvals_file(&approval_path));
-                    let Some(store) = store else {
+                    let Some(store) = approval_store(&mut approvals, &approval_path).await else {
                         report.failures.push(format!(
                             "{name}: the pack approval store is unreadable, so the update cannot be reviewed"
                         ));
@@ -1095,11 +1109,10 @@ fn prepare_pack_ops_at(
                             .unwrap_or_default(),
                     )
                 };
-                let proposal = match smol::block_on(manager.prepare_update(
-                    spec,
-                    &lock,
-                    options.target == UpdateTarget::Lockfile,
-                )) {
+                let proposal = match manager
+                    .prepare_update(spec, &lock, options.target == UpdateTarget::Lockfile)
+                    .await
+                {
                     Ok(proposal) => proposal,
                     Err(error) => {
                         report
@@ -1192,23 +1205,26 @@ fn prepare_pack_ops_at(
     }
 }
 
-pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
+pub async fn apply_pack_plan(plan: PackPlan) -> PackReport {
     let PackPlan {
         operations,
         site,
         lock_path,
         mut report,
     } = plan;
-    let _guard = match maki_pack::lock::Lock::acquire_retrying(&maki_pack::paths::sidecar_lock(
-        &lock_path,
-    )) {
+    let _guard = match maki_pack::lock::Lock::acquire_retrying_async(
+        maki_pack::paths::sidecar_lock(&lock_path),
+    )
+    .await
+    {
         Ok(guard) => guard,
         Err(error) => {
             report.failures.push(redact_error(&error));
             return report;
         }
     };
-    let mut lock = match read_lockfile(Some(&lock_path)) {
+    let read_path = lock_path.clone();
+    let mut lock = match blocking(move || read_lockfile(Some(&read_path))).await {
         Some(lock) => lock,
         None => {
             report
@@ -1230,12 +1246,12 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
                 name,
                 update,
                 approve,
-            } => match smol::block_on(manager.apply_update(&update, &mut lock)) {
+            } => match manager.apply_update(&update, &mut lock).await {
                 Ok(installed) => {
                     report.updated.push((name.clone(), installed.rev));
                     let Some(approve) = approve else { continue };
                     let failure = format!("{name}: {SAVE_APPROVAL_FAILURE}");
-                    match approval_store(&mut approvals, &approval_path) {
+                    match approval_store(&mut approvals, &approval_path).await {
                         Some(store) => {
                             store.approve(
                                 &maki_pack::approvals::ApprovalKey::new(&name, &approve.src),
@@ -1252,11 +1268,11 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
                     .failures
                     .push(format!("{name}: {}", redact_error(&error))),
             },
-            PreparedPackOp::Delete { name } => match manager.remove(&name, &mut lock) {
+            PreparedPackOp::Delete { name } => match manager.remove(&name, &mut lock).await {
                 Ok(()) => {
                     report.removed.push(name.clone());
                     let failure = format!("{name}: {REVOKE_APPROVAL_FAILURE}");
-                    match approval_store(&mut approvals, &approval_path) {
+                    match approval_store(&mut approvals, &approval_path).await {
                         Some(store) => {
                             if store.revoke(&name) {
                                 unsaved.push(failure);
@@ -1272,36 +1288,50 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
         }
     }
 
-    if !unsaved.is_empty()
-        && let Some(store) = approvals.as_ref().and_then(Option::as_ref)
-        && !write_approvals_at(&approval_path, store)
-    {
-        report.failures.append(&mut unsaved);
-    }
+    blocking(move || {
+        if !unsaved.is_empty()
+            && let Some(store) = approvals.as_ref().and_then(Option::as_ref)
+            && !write_approvals_at(&approval_path, store)
+        {
+            report.failures.append(&mut unsaved);
+        }
 
-    if report.changed() {
-        if !write_lockfile(&lock_path, &lock) {
-            report
-                .failures
-                .push("packages changed but the lockfile could not be written".to_owned());
-        } else {
-            for error in manager.prune(&lock) {
-                report.failures.push(redact_error(&error));
+        if report.changed() {
+            if !write_lockfile(&lock_path, &lock) {
+                report
+                    .failures
+                    .push("packages changed but the lockfile could not be written".to_owned());
+            } else {
+                for error in manager.prune(&lock) {
+                    report.failures.push(redact_error(&error));
+                }
             }
         }
-    }
-    report
+        report
+    })
+    .await
 }
 
 /// Reads the approval file at most once per run, so a batch touching several
 /// packages cannot lose an earlier edit by reloading the file mid-run.
-fn approval_store<'a>(
+async fn approval_store<'a>(
     cache: &'a mut Option<Option<maki_pack::approvals::Approvals>>,
     path: &Path,
 ) -> Option<&'a mut maki_pack::approvals::Approvals> {
-    cache
-        .get_or_insert_with(|| read_approvals_file(path))
-        .as_mut()
+    if cache.is_none() {
+        let path = path.to_path_buf();
+        *cache = Some(blocking(move || read_approvals_file(&path)).await);
+    }
+    cache.as_mut().and_then(Option::as_mut)
+}
+
+/// Runs one blocking job, disk work or a terminal prompt, on the blocking
+/// pool. Work that touches many files goes in as one job, so it costs one hop
+/// instead of one per call.
+async fn blocking<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> T {
+    spawn_blocking(job)
+        .await
+        .expect("package disk job panicked")
 }
 
 fn short_revision(revision: &str) -> &str {
@@ -1957,14 +1987,14 @@ mod tests {
     /// a name the user already trusts somewhere else: matching on the name
     /// alone skipped the prompt and cloned the new source on the strength of
     /// the old decision.
-    #[test]
-    fn a_package_is_only_installed_when_the_recorded_source_matches() {
+    #[tokio::test]
+    async fn a_package_is_only_installed_when_the_recorded_source_matches() {
         let src = "https://example.com/demo";
         let (site, lock) = installed_site("demo", src);
         let manager = maki_pack::manager::Manager::new(site.path());
 
         assert!(
-            installed_from_declared_source(&declared_pack("demo", src), &lock, &manager),
+            installed_from_declared_source(&declared_pack("demo", src), &lock, &manager).await,
             "same name, same source, and on disk"
         );
         assert!(
@@ -1972,7 +2002,8 @@ mod tests {
                 &declared_pack("demo", "https://elsewhere.example/demo"),
                 &lock,
                 &manager
-            ),
+            )
+            .await,
             "a name pointed at another repository is a new trust decision"
         );
     }
@@ -2193,6 +2224,8 @@ mod tests {
         }
     }
 
+    /// A declared package checked out at `old_rev` whose remote already has
+    /// `new_rev`.
     struct UpdateFixture {
         _temp: tempfile::TempDir,
         site: PathBuf,
@@ -2202,19 +2235,20 @@ mod tests {
         new_rev: String,
     }
 
-    fn run_git(repo: &Path, args: &[&str]) -> maki_pack::git::GitOutput {
-        smol::block_on(maki_pack::git::run(
+    async fn run_git(repo: &Path, args: &[&str]) -> maki_pack::git::GitOutput {
+        maki_pack::git::run(
             args.iter().map(|arg| (*arg).to_owned()).collect(),
             repo.to_path_buf(),
-        ))
+        )
+        .await
         .unwrap()
     }
 
-    fn update_fixture() -> UpdateFixture {
-        update_fixture_with_manifests(None, None)
+    async fn update_fixture() -> UpdateFixture {
+        update_fixture_with_manifests(None, None).await
     }
 
-    fn update_fixture_with_manifests(
+    async fn update_fixture_with_manifests(
         old_manifest: Option<&str>,
         new_manifest: Option<&str>,
     ) -> UpdateFixture {
@@ -2225,20 +2259,20 @@ mod tests {
         if let Some(manifest) = old_manifest {
             fs::write(origin.join(PLUGIN_MANIFEST), manifest).unwrap();
         }
-        run_git(&origin, &["init", "--quiet"]);
-        run_git(&origin, &["config", "user.email", "test@example.com"]);
-        run_git(&origin, &["config", "user.name", "test"]);
-        run_git(&origin, &["add", "."]);
-        run_git(&origin, &["commit", "--quiet", "-m", "first"]);
+        run_git(&origin, &["init", "--quiet"]).await;
+        run_git(&origin, &["config", "user.email", "test@example.com"]).await;
+        run_git(&origin, &["config", "user.name", "test"]).await;
+        run_git(&origin, &["add", "."]).await;
+        run_git(&origin, &["commit", "--quiet", "-m", "first"]).await;
 
         let site = temp.path().join("site");
         let lock_path = temp.path().join("pack-lock.json");
         let spec = maki_pack::Spec::new(origin.display().to_string()).with_name("demo");
         let mut lock = maki_pack::lockfile::Lockfile::default();
-        let installed = smol::block_on(
-            maki_pack::manager::Manager::new(&site).ensure_installed(&spec, &mut lock),
-        )
-        .unwrap();
+        let installed = maki_pack::manager::Manager::new(&site)
+            .ensure_installed(&spec, &mut lock)
+            .await
+            .unwrap();
         assert!(write_lockfile(&lock_path, &lock));
 
         fs::write(origin.join("plugin").join("later.lua"), "-- later\n").unwrap();
@@ -2249,9 +2283,10 @@ mod tests {
             }
             None => {}
         }
-        run_git(&origin, &["add", "."]);
-        run_git(&origin, &["commit", "--quiet", "-m", "later"]);
+        run_git(&origin, &["add", "."]).await;
+        run_git(&origin, &["commit", "--quiet", "-m", "later"]).await;
         let new_rev = run_git(&origin, &["rev-parse", "HEAD"])
+            .await
             .stdout
             .trim()
             .to_owned();
@@ -2314,11 +2349,13 @@ mod tests {
         }
     }
 
-    fn finish_preparation(preparation: PackPreparation) -> (super::PackReport, Option<String>) {
+    async fn finish_preparation(
+        preparation: PackPreparation,
+    ) -> (super::PackReport, Option<String>) {
         match preparation {
             PackPreparation::Complete(report) => (report, None),
-            PackPreparation::Ready(plan) => (apply_pack_plan(plan), None),
-            PackPreparation::Review { prompt, plan } => (apply_pack_plan(plan), Some(prompt)),
+            PackPreparation::Ready(plan) => (apply_pack_plan(plan).await, None),
+            PackPreparation::Review { prompt, plan } => (apply_pack_plan(plan).await, Some(prompt)),
         }
     }
 
@@ -2342,22 +2379,27 @@ mod tests {
     /// package now reaches every host rather than read like it narrowed.
     #[test_case(NARROW_HOSTS_MANIFEST, NET_MANIFEST, "+net host *" ; "a_dropped_list_widens_to_every_host")]
     #[test_case(NET_MANIFEST, NARROW_HOSTS_MANIFEST, "-net host *" ; "a_new_list_narrows_from_every_host")]
-    fn update_review_shows_the_reach_that_changed(
+    #[tokio::test]
+    async fn update_review_shows_the_reach_that_changed(
         old_manifest: &str,
         new_manifest: &str,
         expected: &str,
     ) {
-        let fixture = update_fixture_with_manifests(Some(old_manifest), Some(new_manifest));
+        let fixture = update_fixture_with_manifests(Some(old_manifest), Some(new_manifest)).await;
         let approved_hosts: &[&str] = &[APPROVED_HOST];
         let reach = (old_manifest == NARROW_HOSTS_MANIFEST).then_some(approved_hosts);
         approve_reaching(&fixture, &["net"], reach);
-        let (_, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (_, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         let prompt = prompt.expect("a normal update needs review");
         assert!(
@@ -2366,16 +2408,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn accepted_update_review_applies_the_prepared_revision() {
-        let fixture = update_fixture();
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+    #[tokio::test]
+    async fn accepted_update_review_applies_the_prepared_revision() {
+        let fixture = update_fixture().await;
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
         let prompt = prompt.expect("a normal update needs review");
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -2431,38 +2477,47 @@ mod tests {
         "+run";
         "unchanged_manifest_still_needs_missing_approval"
     )]
-    fn update_review_shows_permission_changes(
+    #[tokio::test]
+    async fn update_review_shows_permission_changes(
         approved: &[&str],
         old_manifest: Option<&str>,
         new_manifest: Option<&str>,
         expected: &str,
     ) {
-        let fixture = update_fixture_with_manifests(old_manifest, new_manifest);
+        let fixture = update_fixture_with_manifests(old_manifest, new_manifest).await;
         approve(&fixture, approved);
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
         let prompt = prompt.expect("a normal update needs review");
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert!(prompt.contains(&format!("permissions: {expected}")));
     }
 
-    #[test]
-    fn invalid_proposed_manifest_prevents_forced_apply() {
-        let fixture = update_fixture_with_manifests(None, Some("permissions = ["));
+    #[tokio::test]
+    async fn invalid_proposed_manifest_prevents_forced_apply() {
+        let fixture = update_fixture_with_manifests(None, Some("permissions = [")).await;
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(true)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(true)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert!(report.updated.is_empty());
@@ -2479,36 +2534,46 @@ mod tests {
         assert!(!maki_pack::paths::revision_dir(&fixture.site, "demo", &fixture.new_rev).exists());
     }
 
-    #[test]
-    fn invalid_previous_manifest_is_display_only() {
-        let fixture = update_fixture_with_manifests(Some("permissions = ["), Some(NET_MANIFEST));
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+    #[tokio::test]
+    async fn invalid_previous_manifest_is_display_only() {
+        let fixture =
+            update_fixture_with_manifests(Some("permissions = ["), Some(NET_MANIFEST)).await;
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
         let prompt = prompt.expect("a normal update needs review");
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert!(prompt.contains("permissions: +net"));
     }
 
-    #[test]
-    fn unavailable_previous_manifest_is_reported_in_review() {
+    #[tokio::test]
+    async fn unavailable_previous_manifest_is_reported_in_review() {
         let fixture =
-            update_fixture_with_manifests(Some("[permissions]\nrun = true\n"), Some(NET_MANIFEST));
+            update_fixture_with_manifests(Some("[permissions]\nrun = true\n"), Some(NET_MANIFEST))
+                .await;
         let mut lock = read_lockfile(Some(&fixture.lock_path)).unwrap();
         lock.record("demo", &fixture.declared[0].spec.src, TEST_REV);
         assert!(write_lockfile(&fixture.lock_path, &lock));
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
         let prompt = prompt.expect("a normal update needs review");
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -2516,16 +2581,17 @@ mod tests {
         assert!(prompt.contains("permissions: +net"));
     }
 
-    #[test]
-    fn declined_update_review_changes_no_managed_state() {
-        let fixture = update_fixture();
+    #[tokio::test]
+    async fn declined_update_review_changes_no_managed_state() {
+        let fixture = update_fixture().await;
         let preparation = prepare_pack_ops_at(
             &[update_operation(false)],
             &fixture.declared,
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-        );
+        )
+        .await;
         let PackPreparation::Review { plan, .. } = preparation else {
             panic!("a normal update needs review");
         };
@@ -2541,17 +2607,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn forced_update_skips_review_and_applies_the_revision() {
-        let fixture = update_fixture();
+    #[tokio::test]
+    async fn forced_update_skips_review_and_applies_the_revision() {
+        let fixture = update_fixture().await;
         let approvals = fixture.site.join(APPROVALS_FILE);
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(true)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(true)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -2564,15 +2634,20 @@ mod tests {
 
     #[test_case(false, &["net"]; "accepted_review_grants_what_it_showed")]
     #[test_case(true, &[]; "force_grants_nothing")]
-    fn applied_update_records_only_reviewed_permissions(force: bool, expected: &[&str]) {
-        let fixture = update_fixture_with_manifests(None, Some(NET_MANIFEST));
-        let (report, _) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(force)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+    #[tokio::test]
+    async fn applied_update_records_only_reviewed_permissions(force: bool, expected: &[&str]) {
+        let fixture = update_fixture_with_manifests(None, Some(NET_MANIFEST)).await;
+        let (report, _) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(force)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         let approvals = read_approvals_file(&fixture.site.join(APPROVALS_FILE))
@@ -2587,39 +2662,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unreadable_approval_store_stops_before_git() {
-        let fixture = update_fixture();
+    #[tokio::test]
+    async fn unreadable_approval_store_stops_before_git() {
+        let fixture = update_fixture().await;
         let approval_path = fixture.site.join(APPROVALS_FILE);
         fs::create_dir_all(&fixture.site).unwrap();
         fs::write(&approval_path, "not json").unwrap();
         let work = maki_pack::paths::package_root(&fixture.site, "demo").join(".work");
         let before = run_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
+            .await
             .stdout
             .trim()
             .to_owned();
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert!(report.updated.is_empty());
         assert_eq!(report.failures.len(), 1);
         assert!(report.failures[0].contains("approval store is unreadable"));
         let after = run_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
+            .await
             .stdout
             .trim()
             .to_owned();
         assert_eq!(before, after, "the work clone must not fetch");
     }
 
-    #[test]
-    fn delete_batch_removes_inactive_packages_and_keeps_active_ones() {
+    #[tokio::test]
+    async fn delete_batch_removes_inactive_packages_and_keeps_active_ones() {
         let fixture = managed_site(&[("inactive", TEST_REV), ("active", OTHER_REV)]);
         let active = BTreeSet::from(["active".to_owned()]);
         let operations = [
@@ -2627,13 +2708,10 @@ mod tests {
             delete_operation("active", false),
         ];
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &operations,
-            &[],
-            &active,
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(&operations, &[], &active, &fixture.site, &fixture.lock_path).await,
+        )
+        .await;
 
         assert_eq!(
             prompt,
@@ -2655,8 +2733,8 @@ mod tests {
 
     /// The whole point of the review: a declined plan is a plan that never
     /// touched the disk.
-    #[test]
-    fn deletion_is_reviewed_before_anything_is_removed() {
+    #[tokio::test]
+    async fn deletion_is_reviewed_before_anything_is_removed() {
         let fixture = managed_site(&[("orphan", TEST_REV)]);
 
         let preparation = prepare_pack_ops_at(
@@ -2665,7 +2743,8 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-        );
+        )
+        .await;
 
         let PackPreparation::Review { prompt, .. } = preparation else {
             panic!("a delete needs review");
@@ -2677,17 +2756,21 @@ mod tests {
         assert!(maki_pack::paths::package_root(&fixture.site, "orphan").is_dir());
     }
 
-    #[test]
-    fn forced_deletion_skips_review_and_removes_the_package() {
+    #[tokio::test]
+    async fn forced_deletion_skips_review_and_removes_the_package() {
         let fixture = managed_site(&[("orphan", TEST_REV)]);
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[delete_operation("orphan", true)],
-            &[],
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[delete_operation("orphan", true)],
+                &[],
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -2695,22 +2778,26 @@ mod tests {
         assert!(!maki_pack::paths::package_root(&fixture.site, "orphan").exists());
     }
 
-    #[test]
-    fn updates_refuse_bundled_and_manual_package_owners() {
+    #[tokio::test]
+    async fn updates_refuse_bundled_and_manual_package_owners() {
         let fixture = managed_site(&[]);
         make_package(&fixture.site, "vendor", "start", "manual");
 
         for name in ["bash", "manual"] {
-            let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-                &[PlannedOp::Update {
-                    name: name.to_owned(),
-                    options: UpdateOptions::default(),
-                }],
-                &[declaration(name)],
-                &Default::default(),
-                &fixture.site,
-                &fixture.lock_path,
-            ));
+            let (report, prompt) = finish_preparation(
+                prepare_pack_ops_at(
+                    &[PlannedOp::Update {
+                        name: name.to_owned(),
+                        options: UpdateOptions::default(),
+                    }],
+                    &[declaration(name)],
+                    &Default::default(),
+                    &fixture.site,
+                    &fixture.lock_path,
+                )
+                .await,
+            )
+            .await;
 
             assert!(prompt.is_none());
             assert_eq!(
@@ -2720,17 +2807,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deletion_refuses_a_declared_package_before_removing_files() {
+    #[tokio::test]
+    async fn deletion_refuses_a_declared_package_before_removing_files() {
         let fixture = managed_site(&[("demo", TEST_REV)]);
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[delete_operation("demo", false)],
-            &[declaration("demo")],
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[delete_operation("demo", false)],
+                &[declaration("demo")],
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert_eq!(

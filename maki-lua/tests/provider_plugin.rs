@@ -12,17 +12,22 @@
 //! every test its own process.
 
 use std::fs;
+use std::iter;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
+use maki_lua::test_support::runtime;
 use maki_lua::{DiscoveredPackage, Origin, PluginHost, PluginPermissions, Requested};
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::Provider;
 use maki_providers::retry::RetryKind;
-use maki_providers::test_support::{Canned, JSON_HEADERS, Recorded, Requests, serve};
+use maki_providers::test_support::{
+    Canned, JSON_HEADERS, Recorded, Requests, isolated_home, serve,
+};
 use maki_providers::{
     AgentError, Effort, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
     ThinkingConfig, Timeouts, plugin,
@@ -32,6 +37,7 @@ use maki_storage::auth::{load_plugin_auth, lock_plugin_store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::sync::mpsc::unbounded_channel;
 
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
@@ -57,6 +63,17 @@ const INLINE_PLUGIN: &str = "acme_inline";
 const RESPONSES_SLUG: &str = "acmeresponses";
 const RESPONSES_MODEL: &str = "acme-r1";
 const RESPONSES_MARKER: &str = "responses";
+
+const OVERRIDE_SLUG: &str = "acmeoverride";
+const OVERRIDE_MODEL: &str = "acme-o1";
+/// Headers maki sets on every codec's request, each answered by the auth hook
+/// with a value of its own.
+const OVERRIDDEN_HEADERS: [(&str, &str); 2] = [
+    ("user-agent", "acme-gateway/1.0"),
+    ("content-type", "application/json; charset=utf-8"),
+];
+const REJECTED_SCRIPT: &[Canned] = &[Canned::json(400, r#"{"error":{"message":"rejected"}}"#)];
+const NOTHING_SENT: &str = "the provider never reached the server";
 
 const PARKING_SLUG: &str = "acmeparked";
 const PARKING_HOST: &str = "api.acme.example";
@@ -180,22 +197,6 @@ const OVERLOADED_SCRIPT: &[Canned] = &[Canned {
     path: None,
 }];
 
-/// Points every base directory at a throwaway tree, so the credentials the
-/// fixture's `login` and `auth` store never touch the real state dir.
-fn isolated_state() -> TempDir {
-    let dir = TempDir::new().expect(TEMPDIR_FAILED);
-    for var in [
-        "HOME",
-        "XDG_STATE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CACHE_HOME",
-    ] {
-        unsafe { std::env::set_var(var, dir.path()) };
-    }
-    dir
-}
-
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider_plugin/init.lua")
 }
@@ -227,22 +228,23 @@ fn load_inline(host: &PluginHost, source: &str, net_host: &str, slugs: &[&str]) 
 }
 
 /// The fixture plugin, loaded from disk with the grant its `plugin.toml`
-/// declares, talking to a recorded server instead of Acme.
+/// declares, talking to a recorded server instead of Acme. Fields drop in
+/// order, so the host goes before the home it may write to on its way out.
 struct Fixture {
     provider: Box<dyn Provider>,
     server: Requests,
-    _state: TempDir,
     _host: PluginHost,
+    _home: TempDir,
 }
 
 impl Fixture {
     fn start(script: &'static [Canned]) -> Self {
+        let home = isolated_home();
         let (base_url, server) = serve(script);
-        Self::at(&base_url, server)
+        Self::at(home, &base_url, server)
     }
 
-    fn at(base_url: &str, server: Requests) -> Self {
-        let state = isolated_state();
+    fn at(home: TempDir, base_url: &str, server: Requests) -> Self {
         unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
 
         let host = plugin_host();
@@ -252,8 +254,8 @@ impl Fixture {
         Self {
             provider: plugin::create(SLUG, Timeouts::default()).expect(CREATE_FAILED),
             server,
-            _state: state,
             _host: host,
+            _home: home,
         }
     }
 
@@ -293,8 +295,8 @@ fn stream(
     thinking: ThinkingConfig,
 ) -> (Vec<ProviderEvent>, Result<StreamResponse, AgentError>) {
     let messages = [Message::user(PROMPT.to_owned())];
-    let (tx, rx) = flume::unbounded();
-    let result = smol::block_on(provider.stream_message(
+    let (tx, mut rx) = unbounded_channel();
+    let result = runtime().block_on(provider.stream_message(
         model,
         &messages,
         SYSTEM,
@@ -307,7 +309,7 @@ fn stream(
         None,
     ));
     drop(tx);
-    (rx.drain().collect(), result)
+    (iter::from_fn(|| rx.try_recv().ok()).collect(), result)
 }
 
 /// One turn, both ways round: the events a transcript produces in the order the
@@ -369,7 +371,9 @@ fn the_auth_hooks_drive_the_credential_lifecycle() {
     let fixture = Fixture::start(REFRESH_SCRIPT);
 
     fixture.stream(ThinkingConfig::Off).1.expect(STREAM_FAILED);
-    smol::block_on(fixture.provider.reload_auth()).expect(HOOK_FAILED);
+    runtime()
+        .block_on(fixture.provider.reload_auth())
+        .expect(HOOK_FAILED);
     fixture.stream(ThinkingConfig::Off).1.expect(STREAM_FAILED);
 
     assert_eq!(
@@ -390,7 +394,9 @@ fn the_auth_hooks_drive_the_credential_lifecycle() {
 fn a_refresh_hook_persists_the_token_it_minted() {
     let fixture = Fixture::start(NO_REQUESTS);
 
-    smol::block_on(fixture.provider.refresh_auth()).expect(HOOK_FAILED);
+    runtime()
+        .block_on(fixture.provider.refresh_auth())
+        .expect(HOOK_FAILED);
 
     let dir = StateDir::resolve().expect(NO_STATE_DIR);
     let stored = load_plugin_auth(&dir, SLUG).expect(NO_CREDENTIALS);
@@ -405,7 +411,9 @@ fn a_refresh_hook_persists_the_token_it_minted() {
 fn list_models_and_fetch_usage_answer_from_their_hooks() {
     let fixture = Fixture::start(MODELS_SCRIPT);
 
-    let models = smol::block_on(fixture.provider.list_models()).expect(HOOK_FAILED);
+    let models = runtime()
+        .block_on(fixture.provider.list_models())
+        .expect(HOOK_FAILED);
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, MODEL);
     assert_eq!(models[0].context_window, Some(LISTED_WINDOW));
@@ -417,7 +425,8 @@ fn list_models_and_fetch_usage_answer_from_their_hooks() {
     assert_eq!(asked[0].authorization(), bearer(ANON_TOKEN));
     drop(asked);
 
-    let usage = smol::block_on(fixture.provider.fetch_usage())
+    let usage = runtime()
+        .block_on(fixture.provider.fetch_usage())
         .expect(HOOK_FAILED)
         .expect(NO_USAGE);
     assert_eq!(usage.plan.as_deref(), Some("team"));
@@ -459,7 +468,9 @@ fn map_error_restates_the_status_and_keeps_retry_after(
 fn a_refused_side_request_is_the_native_error() {
     let fixture = Fixture::start(OVERLOADED_SCRIPT);
 
-    let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
+    let error = runtime()
+        .block_on(fixture.provider.list_models())
+        .unwrap_err();
 
     assert!(
         matches!(error, AgentError::Api { status: 503, .. }),
@@ -476,11 +487,13 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
     let closed = TcpListener::bind((LOOPBACK_HOST, 0)).expect(IO_FAILED);
     let base_url = format!("http://{}", closed.local_addr().expect(IO_FAILED));
     drop(closed);
-    let fixture = Fixture::at(&base_url, Requests::default());
+    let fixture = Fixture::at(isolated_home(), &base_url, Requests::default());
 
-    let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
+    let error = runtime()
+        .block_on(fixture.provider.list_models())
+        .unwrap_err();
 
-    assert!(matches!(error, AgentError::Http(_)), "{error:?}");
+    assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");
 }
 
 /// There is no `has_auth` flag: defining `login` is the whole of what makes a
@@ -494,8 +507,11 @@ fn a_login_hook_is_what_makes_the_slug_an_auth_target() {
         "{:?}",
         plugin::auth_providers()
     );
-    plugin::login(SLUG).expect(HOOK_FAILED);
-    assert!(plugin::logout(SLUG).expect(HOOK_FAILED), "{HOOK_FAILED}");
+    runtime().block_on(plugin::login(SLUG)).expect(HOOK_FAILED);
+    assert!(
+        runtime().block_on(plugin::logout(SLUG)).expect(HOOK_FAILED),
+        "{HOOK_FAILED}"
+    );
 }
 
 fn responses_plugin(base_url: &str) -> String {
@@ -520,7 +536,7 @@ maki.provider.register({{
 /// branch builds its body somewhere else entirely, so it gets its own case.
 #[test]
 fn the_responses_codec_applies_the_body_hook_too() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let (base_url, server) = serve(RESPONSES_SCRIPT);
     let host = plugin_host();
     load_inline(
@@ -549,6 +565,58 @@ fn the_responses_codec_applies_the_body_hook_too() {
     let sent = server.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].json()["acme_marker"], json!(RESPONSES_MARKER));
+}
+
+fn overriding_plugin(codec: &str, base_url: &str) -> String {
+    let headers: String = OVERRIDDEN_HEADERS
+        .iter()
+        .map(|(name, value)| format!(r#"["{name}"] = "{value}", "#))
+        .collect();
+    format!(
+        r#"
+maki.provider.register({{
+  slug = "{OVERRIDE_SLUG}",
+  display_name = "Acme Overrides",
+  codec = "{codec}",
+  base_url = "{base_url}",
+  models = {{ {{ prefixes = {{ "{OVERRIDE_MODEL}" }} }} }},
+  auth = function()
+    return {{ headers = {{ {headers}}} }}
+  end,
+}})
+"#
+    )
+}
+
+/// A header the plugin's credentials name goes out once, with the plugin's
+/// value, whichever codec builds the request. Two copies would leave the
+/// server to guess which one counts (RFC 9110, section 5.3).
+#[test_case("openai" ; "openai")]
+#[test_case("openai-responses" ; "openai_responses")]
+#[test_case("anthropic" ; "anthropic")]
+#[test_case("google" ; "google")]
+fn a_header_the_auth_hook_sets_replaces_makis_own(codec: &str) {
+    let _home = isolated_home();
+    let (base_url, server) = serve(REJECTED_SCRIPT);
+    let host = plugin_host();
+    load_inline(
+        &host,
+        &overriding_plugin(codec, &base_url),
+        LOOPBACK_HOST,
+        &[OVERRIDE_SLUG],
+    );
+    plugin::commit_load();
+
+    let provider = plugin::create(OVERRIDE_SLUG, Timeouts::default()).expect(CREATE_FAILED);
+    let model =
+        Model::from_spec(&format!("{OVERRIDE_SLUG}/{OVERRIDE_MODEL}")).expect(UNKNOWN_MODEL);
+    let _ = stream(provider.as_ref(), &model, ThinkingConfig::Off);
+
+    let sent = server.lock().unwrap();
+    let request = sent.first().expect(NOTHING_SENT);
+    for (name, value) in OVERRIDDEN_HEADERS {
+        assert_eq!(request.headers.values(name), [value], "{name}");
+    }
 }
 
 /// One provider whose `login` runs `body`. The registration is the same every
@@ -622,7 +690,7 @@ fn wait_for(path: &Path) {
 /// A parked host would otherwise hang the test for good instead of failing it.
 #[test]
 fn a_credential_write_does_not_park_the_plugin_host() {
-    let state = isolated_state();
+    let state = isolated_home();
     let entered = state.path().join("entered");
     let done = state.path().join("done");
 
@@ -637,11 +705,11 @@ fn a_credential_write_does_not_park_the_plugin_host() {
 
     let dir = StateDir::resolve().expect(NO_STATE_DIR);
     let held = lock_plugin_store(&dir, LOCKED_SLUG).expect(NO_TOKEN_LOCK);
-    let locked = std::thread::spawn(|| plugin::login(LOCKED_SLUG));
+    let locked = std::thread::spawn(|| runtime().block_on(plugin::login(LOCKED_SLUG)));
     wait_for(&entered);
 
-    let (served, free_login) = flume::bounded(1);
-    std::thread::spawn(move || served.send(plugin::login(FREE_SLUG)));
+    let (served, free_login) = sync_channel(1);
+    std::thread::spawn(move || served.send(runtime().block_on(plugin::login(FREE_SLUG))));
     free_login
         .recv_timeout(STUCK_AFTER)
         .expect(HOST_THREAD_PARKED)
@@ -657,7 +725,7 @@ fn a_credential_write_does_not_park_the_plugin_host() {
 /// on belong to the handle and go only once nobody holds it.
 #[test]
 fn an_in_flight_hook_call_survives_a_plugin_reload() {
-    let state = isolated_state();
+    let state = isolated_home();
     let started = state.path().join("started");
     let release = state.path().join("release");
 
@@ -666,7 +734,7 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
     load_inline(&host, &parking, PARKING_HOST, &[PARKING_SLUG]);
     plugin::commit_load();
 
-    let login = std::thread::spawn(|| plugin::login(PARKING_SLUG));
+    let login = std::thread::spawn(|| runtime().block_on(plugin::login(PARKING_SLUG)));
     wait_for(&started);
     load_inline(&host, RELOADED_SOURCE, PARKING_HOST, &[PARKING_SLUG]);
     std::fs::write(&release, "1").expect(IO_FAILED);
@@ -680,7 +748,7 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
 /// maki ships stays reserved, even when its bundled plugin is turned off.
 #[test]
 fn a_third_party_plugin_cannot_take_a_builtin_slug() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let host = plugin_host();
     plugin::begin_load();
 
@@ -722,7 +790,7 @@ fn takeover_catalog_cached() {
 /// holds no grant at all.
 #[test]
 fn every_registered_slug_needs_the_grant_a_package_load_carries() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     takeover_catalog_cached();
 
     let site = TempDir::new().expect(TEMPDIR_FAILED);
@@ -784,7 +852,7 @@ fn every_registered_slug_needs_the_grant_a_package_load_carries() {
 /// does.
 #[test]
 fn a_failed_package_load_keeps_its_granted_slug_owned() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     takeover_catalog_cached();
 
     let site = TempDir::new().expect(TEMPDIR_FAILED);

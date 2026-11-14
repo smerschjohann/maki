@@ -2,9 +2,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
+use reqwest::header::HeaderMap;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
@@ -14,7 +15,7 @@ use crate::spec::{
     ProviderRegistry, ProviderSpec,
 };
 use crate::types::ThinkingFallback;
-use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -46,6 +47,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed(""),
     max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: true,
+    usage_cost: false,
     provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
@@ -57,9 +59,10 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
-    adaptive_effort,
+    sends_thinking,
     thinking_fields_fallback,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
@@ -115,18 +118,23 @@ fn load_overrides() -> Overrides {
 
 /// Runs on every frame of the status bar, so a broken `providers.toml` reads
 /// as no overrides instead of exiting.
-fn adaptive_effort(model: &Model) -> Option<Effort> {
+fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     let config = ProvidersConfig::load_or_default();
     let overrides = config.get(SLUG).map(|def| &def.overrides);
-    routed_adaptive_effort(overrides.unwrap_or(&Overrides::new()), model)
+    routed_sends_thinking(overrides.unwrap_or(&Overrides::new()), model, choice)
 }
 
 /// The routed provider builds the request, so it answers, about the model as
 /// its own: a plugin codec finds its declaration and discovery by its slug.
 /// A model that routes nowhere takes the generic path, which sends no effort.
-fn routed_adaptive_effort(overrides: &Overrides, model: &Model) -> Option<Effort> {
-    let (spec, routed) = routed_model(overrides, model)?;
-    (spec.adaptive_effort)(&routed)
+fn routed_sends_thinking(
+    overrides: &Overrides,
+    model: &Model,
+    choice: ThinkingConfig,
+) -> ThinkingConfig {
+    routed_model(overrides, model).map_or(choice, |(spec, routed)| {
+        (spec.sends_thinking)(&routed, choice)
+    })
 }
 
 fn thinking_fields_fallback(model: &Model) -> Option<ThinkingFallback> {
@@ -415,7 +423,7 @@ impl Provider for Aperture {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -447,7 +455,7 @@ impl Provider for Aperture {
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
         })
     }
@@ -485,6 +493,7 @@ impl Provider for Aperture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Effort;
     use crate::model::ModelFamily;
     use crate::test_support::register_bundled;
     use serde_json::json;
@@ -601,7 +610,10 @@ mod tests {
                 },
             )
         }));
-        assert_eq!(routed_adaptive_effort(&overrides, &model), expected);
+        assert_eq!(
+            routed_sends_thinking(&overrides, &model, ThinkingConfig::Adaptive).level(),
+            expected
+        );
     }
 
     #[test]

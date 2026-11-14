@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+
+use arc_swap::ArcSwap;
 
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
@@ -122,18 +124,14 @@ pub fn ansi_color_index(name: &str) -> Option<u8> {
 }
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
-static UI_STYLES: OnceLock<RwLock<HashMap<String, UiStyle>>> = OnceLock::new();
-static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
+static THEME: LazyLock<ArcSwap<Theme>> = LazyLock::new(ArcSwap::default);
+static UI_STYLES: LazyLock<ArcSwap<HashMap<String, UiStyle>>> = LazyLock::new(ArcSwap::default);
+static BLOCK_CACHE: LazyLock<RwLock<BlockCache>> = LazyLock::new(RwLock::default);
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
-
-fn theme_lock() -> &'static RwLock<Arc<Theme>> {
-    THEME.get_or_init(|| RwLock::new(Arc::new(Theme::default())))
-}
 
 pub fn warmup() {
     syntax_set();
-    theme_lock();
+    LazyLock::force(&THEME);
     let mut hl = Highlighter::for_token("bash");
     hl.highlight_line("x");
 }
@@ -143,11 +141,11 @@ pub fn is_ready() -> bool {
 }
 
 pub fn set_theme(theme: Theme) {
-    *theme_lock().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(theme);
+    THEME.store(Arc::new(theme));
     // Bump first: a highlight already in flight read the old generation, so its
     // insert lands under a key nobody will look up again.
     THEME_GEN.fetch_add(1, Ordering::Release);
-    block_cache_lock()
+    BLOCK_CACHE
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -158,10 +156,6 @@ pub fn set_theme(theme: Theme) {
 /// this changes.
 pub fn theme_generation() -> u64 {
     THEME_GEN.load(Ordering::Acquire)
-}
-
-fn block_cache_lock() -> &'static RwLock<BlockCache> {
-    BLOCK_CACHE.get_or_init(RwLock::default)
 }
 
 /// The byte length rides along with the hash, so an accidental hit needs both
@@ -246,26 +240,15 @@ impl BlockCache {
 }
 
 pub fn theme() -> Arc<Theme> {
-    theme_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-fn ui_styles_lock() -> &'static RwLock<HashMap<String, UiStyle>> {
-    UI_STYLES.get_or_init(RwLock::default)
+    THEME.load_full()
 }
 
 pub fn set_ui_styles(styles: HashMap<String, UiStyle>) {
-    *ui_styles_lock().write().unwrap_or_else(|e| e.into_inner()) = styles;
+    UI_STYLES.store(Arc::new(styles));
 }
 
 pub fn ui_style(name: &str) -> Option<UiStyle> {
-    ui_styles_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(name)
-        .cloned()
+    UI_STYLES.load().get(name).cloned()
 }
 
 /// Colors the syntax theme names itself. UI styles live in [`ui_style`].
@@ -426,12 +409,19 @@ fn bounded_prefix(prefix: &str) -> &str {
         .map_or("", |newline| &prefix[start + newline + 1..])
 }
 
-/// Prefix context is limited to the nearest lines that fit in 16 KiB.
-/// Parser state opened before that window cannot be reconstructed.
+/// `prefix` is the lines before `code`, with or without a trailing newline.
+/// Only the nearest lines that fit in 16 KiB are parsed, so a comment or
+/// string opened before them is missed.
 pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSegment>> {
     let mut hl = Highlighter::for_token(lang);
     for line in LinesWithEndings::from(bounded_prefix(prefix)) {
-        hl.advance(line);
+        // Syntaxes close a line comment on its `\n`. Without one, a comment
+        // just above `code` would swallow the first line of `code` too.
+        if line.ends_with('\n') {
+            hl.advance(line);
+        } else {
+            hl.advance(&format!("{line}\n"));
+        }
     }
     LinesWithEndings::from(code)
         .map(|raw| hl.highlight_line(raw))
@@ -447,7 +437,7 @@ pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSeg
 /// it is incremental, and would miss this cache on every token.
 pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
     let key = BlockKey::new(lang, code);
-    if let Some(hit) = block_cache_lock()
+    if let Some(hit) = BLOCK_CACHE
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(key)
@@ -455,7 +445,7 @@ pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
         return hit;
     }
     let segments: BlockSegments = Arc::new(highlight_code(lang, code, ""));
-    block_cache_lock()
+    BLOCK_CACHE
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, Arc::clone(&segments), BLOCK_CACHE_MAX_BYTES);
@@ -759,6 +749,17 @@ mod tests {
         );
     }
 
+    #[test_case(PYTHON, "# note"; "python")]
+    #[test_case("js", "// note"; "javascript")]
+    fn line_comment_ending_the_prefix_stays_on_its_line(lang: &str, comment: &str) {
+        let _globals = exclusive_globals();
+        let code = "x = 1\n";
+        assert_eq!(
+            highlight_code(lang, code, comment),
+            highlight_code(lang, code, "")
+        );
+    }
+
     #[test]
     fn highlight_lines_independent_ignores_cross_line_state() {
         warmup();
@@ -943,17 +944,16 @@ mod tests {
 
         set_theme(Theme::default());
         assert_eq!(
-            block_cache_lock().read().unwrap().bytes,
+            BLOCK_CACHE.read().unwrap().bytes,
             0,
             "set_theme must clear the cache"
         );
 
         let racing = one_line();
-        block_cache_lock().write().unwrap().insert(
-            stale_key,
-            Arc::clone(&racing),
-            BLOCK_CACHE_MAX_BYTES,
-        );
+        BLOCK_CACHE
+            .write()
+            .unwrap()
+            .insert(stale_key, Arc::clone(&racing), BLOCK_CACHE_MAX_BYTES);
         assert!(
             !Arc::ptr_eq(&racing, &highlight_block(RUST, CODE)),
             "an insert under a key minted before the bump must be unreachable"
@@ -1125,7 +1125,7 @@ mod tests {
             });
         });
 
-        assert_bytes_match_entries(&block_cache_lock().read().unwrap());
+        assert_bytes_match_entries(&BLOCK_CACHE.read().unwrap());
     }
 
     #[test_case("jsx", "js"; "jsx_alias")]

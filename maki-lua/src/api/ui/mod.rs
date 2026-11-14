@@ -8,9 +8,13 @@ use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::{MakiId, MakiIdParseError};
 use mlua::{Lua, Result as LuaResult, Table};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use crate::api::action::run_plugin_action;
-use crate::api::keymap::{InputMode, accept_key, switch_mode};
+use crate::api::keymap::{
+    CursorShape, CursorStyle, InputMode, accept_key, switch_cursor, switch_mode,
+};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintEntry, HintWriter,
     InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit, Split, TextEdit, TitlePos,
@@ -262,7 +266,8 @@ fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 /// already takes as a string ("dim", "item_selected", "keybind_section",
 /// "diff_old", ...), so `{ text, "dim" }` and `theme_style("dim")` paint the
 /// same. Reach for the table when you need the parts, say to keep a style's
-/// foreground over a background of your own.
+/// foreground over a background of your own. A span styled "cursor" also marks
+/// the caret of a focused window, see the `focus` option of `maki.ui.open_win`.
 ///
 /// @param name string Style name, the same spelling a span accepts.
 /// @return (table|nil) `{fg?, bg?, bold?, italic?, underline?, dim?,
@@ -312,7 +317,7 @@ fn theme_style(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 /// @param lang string Language identifier, e.g. "rust", "python".
 /// @param opts table? Options. Fields:
 ///   - independent (boolean): highlight each line without cross-line context. Default false.
-///   - prefix (string): preceding source used as token context. Only the nearest lines fitting within 16 KiB are parsed, so earlier comments or strings may affect coloring. Default "".
+///   - prefix (string): the lines before `code`, used as token context. A trailing newline is optional. Only the nearest lines fitting within 16 KiB are parsed, so a comment or string opened before them is missed. Default "".
 /// @return (table) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
 /// @example
 /// local lines = maki.ui.highlight("fn main() {}", "rust")
@@ -439,7 +444,7 @@ fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> 
 #[lua_fn]
 fn flash(
     _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     msg: String,
 ) -> LuaResult<()> {
@@ -466,7 +471,7 @@ fn flash(
 #[lua_fn]
 fn set_window_title(
     _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     title: String,
 ) -> LuaResult<()> {
     let _ = ui_send(tx.as_ref(), UiAction::SetWindowTitle(title));
@@ -494,6 +499,47 @@ fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
     Ok(())
 }
 
+const SET_CURSOR_SHAPE: &str = "set_cursor_shape";
+const CURSOR_SHAPE_OPTIONS: &[&str] = &["blink"];
+
+/// Sets the shape of the chat input's cursor, like Neovim's `guicursor`.
+///
+/// Until a plugin calls this, the cursor looks the way you set up your
+/// terminal. `"default"` restores that look, and so does unloading the
+/// plugin that set the current shape.
+///
+/// Terminals set shape and blink together, so any shape other than
+/// `"default"` also sets blinking. Leave out `blink` for a steady cursor.
+///
+/// Throws on an unknown shape or option.
+///
+/// @param shape string `"block"`, `"bar"`, `"underline"` or `"default"`.
+/// @param opts table? Optional. `blink` (boolean) blinks the cursor, default false.
+/// @return
+/// @example
+/// maki.api.create_autocmd("ModeChanged", {
+///   callback = function(ev)
+///     maki.ui.set_cursor_shape(ev.data.new_mode == "n" and "block" or "bar")
+///   end,
+/// })
+#[lua_fn]
+fn set_cursor_shape(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    shape: String,
+    opts: Option<Table>,
+) -> LuaResult<()> {
+    if let Some(opts) = &opts {
+        reject_unknown_fields(opts, CURSOR_SHAPE_OPTIONS, SET_CURSOR_SHAPE)?;
+    }
+    let style = CursorStyle::new(
+        CursorShape::parse(&shape)?,
+        opts.and_then(|t| t.opt_bool("blink")).unwrap_or(false),
+    );
+    switch_cursor(lua, style, &plugin);
+    Ok(())
+}
+
 /// Runs a built-in or plugin action by name, and returns whether it handled
 /// the request.
 ///
@@ -515,13 +561,15 @@ fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
 /// | `"undo"`, `"redo"` | Undoes or redoes one input edit | nothing to undo or redo |
 /// | `"history_prev"`, `"history_next"` | Recalls the previous or next prompt | at either end of the history |
 /// | `"newline"` | Inserts a new line | |
+/// | `"background"` | Moves running calls to the background, like `Ctrl+B` | no call is running |
 ///
 /// `"undo"`, `"redo"`, `"history_prev"`, `"history_next"` and `"newline"`
 /// edit the chat input, also in normal mode. They need the `input`, `agent`
 /// and `session_write` permissions, see [chat input](#chat-input), and throw
 /// without them like any gated call. They return `false` in a finished subagent's chat, which has
 /// no input. `"pop_queue"` needs `session_write`, because it throws away a
-/// queued prompt. The other built-ins need no permission.
+/// queued prompt. `"background"` needs `agent`, because each call it moves
+/// wakes the chat with its result. The other built-ins need no permission.
 ///
 /// A built-in runs in the UI after your earlier `maki.ui` calls, and
 /// `action` waits for its answer. While your plugin loads, it returns `nil`
@@ -559,7 +607,7 @@ fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
 #[lua_fn]
 async fn action(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     #[ctx] caller: PluginReach,
     name: String,
@@ -583,7 +631,7 @@ async fn action(
 
 async fn input_roundtrip(
     lua: Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
     req: InputRequest,
 ) -> LuaResult<Pair<mlua::Value>> {
     ui_json_roundtrip(&lua, tx, |reply_tx| UiAction::Input { req, reply_tx }).await
@@ -623,7 +671,7 @@ fn input_marks(func: &str, ns: String, marks: Table) -> LuaResult<InputMarks> {
 #[lua_fn(guard = SessionRead)]
 async fn input(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Pair<mlua::Value>> {
     input_roundtrip(lua, tx.as_ref(), InputRequest::Read).await
 }
@@ -718,7 +766,7 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 #[lua_fn(guard = [Input, SessionRead])]
 async fn input_edit(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     #[ctx] caller: PluginReach,
     opts: Table,
@@ -806,7 +854,7 @@ async fn input_edit(
 #[lua_fn]
 async fn input_decorate(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
@@ -885,7 +933,7 @@ async fn input_decorate(
 #[lua_fn]
 async fn input_submit(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] caller: PluginReach,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
@@ -1007,7 +1055,7 @@ fn text_edit(edit: &Table) -> LuaResult<TextEdit> {
 #[lua_fn]
 async fn open_editor(
     _lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     path: String,
 ) -> LuaResult<i32> {
     let path = PathBuf::from(path);
@@ -1061,7 +1109,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 ///   - reserved_bottom (integer): rows reserved at the bottom of the content area. Default 0.
 ///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
-///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
+///   - focus (boolean): whether the window takes keyboard focus on open. Default true. A focused window parks the terminal cursor on its first span styled `cursor`, which is where an input method (IME) shows the text being composed. With no such span on screen, the cursor is not parked.
 ///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. `maki.keymap.set` with `{ buffer = buf }` is the newer way to give a popup keys, with a handler per key, a mode, and `ev.fallback()`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or global `maki.keymap.set` bindings. The window's buffer bindings are asked first. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
 ///   - visible (boolean): whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
@@ -1081,7 +1129,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 #[lua_fn]
 fn open_win(
     lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     buf: mlua::AnyUserData,
     opts: Table,
@@ -1150,8 +1198,8 @@ fn open_win(
     // worse, a Close command, leaving a zombie modal. Producers are human- or
     // plugin-rate and both ends are drained every tick, so growth is bounded
     // in practice.
-    let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
-    let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+    let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     let waker = lua.app_data_ref::<UiWaker>().map(|waker| waker.clone());
     if let Some(waker) = &waker {
         buf_handle.buf.wake_on_change(waker);
@@ -1222,7 +1270,7 @@ lua_table! {
     ///   Plugin actions still run.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
-    /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
+    /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode`, `set_cursor_shape` and `input_rules` have no effect.
     ///   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
     ///
     /// ### Chat input
@@ -1238,6 +1286,7 @@ lua_table! {
     /// | Send the input, as Enter does | [`input_submit`](#maki-ui-input_submit) |
     /// | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
     /// | Switch to normal mode for a vim mode | [`set_mode`](#maki-ui-set_mode), see [Modes](/docs/lua-api/#modes) |
+    /// | Change the cursor shape, like a block in normal mode | [`set_cursor_shape`](#maki-ui-set_cursor_shape) |
     ///
     /// A key that types `TODO: ` at the cursor:
     ///
@@ -1382,7 +1431,7 @@ lua_table! {
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual set_mode, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
+        manual set_mode, manual set_cursor_shape, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
         manual set_window_title, manual input, manual input_rules, manual input_decorate,
         manual input_edit, manual input_submit,
     ]
@@ -1390,7 +1439,7 @@ lua_table! {
 
 pub(crate) fn create_ui_table(
     lua: &Lua,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
     plugin: Arc<str>,
     reach: PluginReach,
 ) -> LuaResult<Table> {
@@ -1400,6 +1449,7 @@ pub(crate) fn create_ui_table(
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
     set_mode__register(&t, lua, Arc::clone(&plugin))?;
+    set_cursor_shape__register(&t, lua, Arc::clone(&plugin))?;
     action__register(
         &t,
         lua,
@@ -1628,6 +1678,8 @@ mod tests {
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
@@ -2351,8 +2403,8 @@ mod tests {
     #[test]
     fn unloading_a_plugin_closes_the_windows_it_opened() {
         let mut store = WinStore::default();
-        let (mine, mine_rx) = flume::unbounded::<WinCommand>();
-        let (theirs, theirs_rx) = flume::unbounded::<WinCommand>();
+        let (mine, mut mine_rx) = unbounded_channel::<WinCommand>();
+        let (theirs, mut theirs_rx) = unbounded_channel::<WinCommand>();
         store.track(Arc::from(WIN_PLUGIN), WinSender::new(mine, None));
         store.track(Arc::from(OTHER_WIN_PLUGIN), WinSender::new(theirs, None));
 
@@ -2370,11 +2422,11 @@ mod tests {
     #[test]
     fn a_window_already_gone_is_forgotten_on_the_next_open() {
         let mut store = WinStore::default();
-        let (gone, gone_rx) = flume::unbounded::<WinCommand>();
+        let (gone, gone_rx) = unbounded_channel::<WinCommand>();
         store.track(Arc::from(WIN_PLUGIN), WinSender::new(gone, None));
         drop(gone_rx);
 
-        let (live, _live_rx) = flume::unbounded::<WinCommand>();
+        let (live, _live_rx) = unbounded_channel::<WinCommand>();
         store.track(Arc::from(WIN_PLUGIN), WinSender::new(live, None));
 
         assert_eq!(store.open[WIN_PLUGIN].len(), 1);
@@ -2398,9 +2450,9 @@ mod tests {
 
     /// [`ui_with_input`] for a plugin whose load is gone.
     fn ui_with_input_of_unloaded(edit: fn(InputEdit) -> UiReply, grants: PluginPermissions) -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            while let Ok(UiAction::Input { req, reply_tx }) = rx.recv() {
+            while let Some(UiAction::Input { req, reply_tx }) = rx.blocking_recv() {
                 let reply = match req {
                     InputRequest::Read => Ok(serde_json::json!({
                         "session_id": READ_SESSION_ID,
@@ -2423,11 +2475,14 @@ mod tests {
         lua_with_ui_granted(Some(tx), grants)
     }
 
-    fn lua_with_ui(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_ui(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         lua_with_ui_granted(tx, PluginPermissions::trusted())
     }
 
-    fn lua_with_ui_granted(tx: Option<flume::Sender<UiAction>>, grants: PluginPermissions) -> Lua {
+    fn lua_with_ui_granted(
+        tx: Option<UnboundedSender<UiAction>>,
+        grants: PluginPermissions,
+    ) -> Lua {
         let lua = Lua::new();
         let reach = PluginReach::new(grants).owned_by(Arc::from(INPUT_PLUGIN));
         let t = create_ui_table(&lua, tx, Arc::from(INPUT_PLUGIN), reach).unwrap();
@@ -2489,9 +2544,10 @@ mod tests {
     /// claim another plugin's.
     #[test_case(decorate_script(PUSHED_MARKS) ; "input_decorate")]
     #[test_case(edit_script(&format!(r#"start = 0, stop = 0, text = "x", {PUSHED_MARKS}"#)) ; "input_edit")]
-    fn marks_reach_the_ui_with_the_guards_and_the_plugin(script: String) {
+    #[tokio::test]
+    async fn marks_reach_the_ui_with_the_guards_and_the_plugin(script: String) {
         let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, &script);
+        let (val, err) = eval(&lua, &script).await;
         assert_eq!(err, None);
         assert_eq!(
             serde_json::json!({
@@ -2519,9 +2575,10 @@ mod tests {
     /// marks pushed after it would stay for good.
     #[test_case(decorate_script(PUSHED_MARKS) ; "input_decorate")]
     #[test_case(edit_script(&format!(r#"start = 0, stop = 0, text = "x", {PUSHED_MARKS}"#)) ; "input_edit")]
-    fn a_plugin_whose_load_is_gone_pushes_no_marks(script: String) {
+    #[tokio::test]
+    async fn a_plugin_whose_load_is_gone_pushes_no_marks(script: String) {
         let lua = ui_with_input_of_unloaded(echo_edit, PluginPermissions::trusted());
-        let (val, err) = eval(&lua, &script);
+        let (val, err) = eval(&lua, &script).await;
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(UNLOADED_MARKS_ERR));
     }
@@ -2545,18 +2602,20 @@ mod tests {
     #[test_case(edit_script(r#"start = 0, stop = 0, text = "x", strcit = true"#), UNKNOWN_FIELD_ERR ; "edit_a_misspelled_option")]
     #[test_case(edit_script(r#"edits = { { start = 0, stop = 0, text = "x", cursor = 1 } }"#), UNKNOWN_FIELD_ERR ; "edit_an_option_inside_an_edit")]
     #[test_case(r#"return ui.input_submit({ version = 7, session_id = "s", text = "hi" })"#.to_owned(), UNKNOWN_FIELD_ERR ; "submit_a_text_to_send")]
-    fn input_calls_throw_on(script: String, expected: &str) {
+    #[tokio::test]
+    async fn input_calls_throw_on(script: String, expected: &str) {
         let lua = ui_with_input(echo_edit);
-        let err = eval_err(&lua, &script);
+        let err = eval_err(&lua, &script).await;
         assert!(err.contains(expected), "{err}");
     }
 
     #[test_case(r#"ui.input_decorate({ ns = "a", marks = {}, version = 0, session_id = "s" })"# ; "input_decorate")]
     #[test_case(r#"ui.input_submit({ version = 0, session_id = "s" })"# ; "input_submit")]
-    fn without_a_ui_answers_the_error_slot(call: &str) {
+    #[tokio::test]
+    async fn without_a_ui_answers_the_error_slot(call: &str) {
         let lua = lua_with_ui(None);
         mark_loaded(&lua, INPUT_PLUGIN);
-        let (val, err) = eval(&lua, &format!("return {call}"));
+        let (val, err) = eval(&lua, &format!("return {call}")).await;
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
@@ -2567,11 +2626,14 @@ mod tests {
     #[test_case(r#"start = 0, stop = 0, text = "x""# => true ; "inserting_text")]
     #[test_case(r#"start = 0, stop = 5, text = """# => true ; "deleting_text")]
     #[test_case(r#"edits = {}, cursor = 2"# => false ; "moving_the_cursor")]
-    fn changing_the_text_needs_what_a_message_needs(range: &str) -> bool {
+    #[tokio::test]
+    async fn changing_the_text_needs_what_a_message_needs(range: &str) -> bool {
         let grants = PluginPermissions::from_approved(["input", "session_read"]);
         let lua = ui_with_input_granted(echo_edit, grants);
         let denied = denied_error(Permission::Agent).to_string();
-        smol::block_on(lua.load(edit_script(range)).eval_async::<mlua::Value>())
+        lua.load(edit_script(range))
+            .eval_async::<mlua::Value>()
+            .await
             .is_err_and(|err| err.to_string().contains(&denied))
     }
 
@@ -2586,22 +2648,24 @@ mod tests {
         )
     }
 
-    fn eval(lua: &Lua, script: &str) -> (serde_json::Value, Option<String>) {
+    async fn eval(lua: &Lua, script: &str) -> (serde_json::Value, Option<String>) {
         let (val, err): (mlua::Value, Option<String>) =
-            smol::block_on(lua.load(script).eval_async()).unwrap();
+            lua.load(script).eval_async().await.unwrap();
         (lua_to_json(lua, &val).unwrap(), err)
     }
 
-    fn eval_err(lua: &Lua, script: &str) -> String {
-        smol::block_on(lua.load(script).eval_async::<mlua::Value>())
+    async fn eval_err(lua: &Lua, script: &str) -> String {
+        lua.load(script)
+            .eval_async::<mlua::Value>()
+            .await
             .unwrap_err()
             .to_string()
     }
 
-    #[test]
-    fn input_reports_text_cursor_and_version() {
+    #[tokio::test]
+    async fn input_reports_text_cursor_and_version() {
         let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, "return ui.input()");
+        let (val, err) = eval(&lua, "return ui.input()").await;
         assert_eq!(err, None);
         assert_eq!(val["text"], "hello");
         assert_eq!(val["cursor"], 5);
@@ -2628,9 +2692,10 @@ mod tests {
         serde_json::json!({ "edits": [], "cursor": 2, "strict": false })
         ; "no_edits_with_a_cursor"
     )]
-    fn input_edit_forwards_the_edits_and_options(fields: &str, expected: serde_json::Value) {
+    #[tokio::test]
+    async fn input_edit_forwards_the_edits_and_options(fields: &str, expected: serde_json::Value) {
         let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, &edit_script(fields));
+        let (val, err) = eval(&lua, &edit_script(fields)).await;
         assert_eq!(err, None);
         assert_eq!(
             serde_json::json!({ "edits": val["edits"], "cursor": val["cursor"], "strict": val["strict"] }),
@@ -2644,7 +2709,8 @@ mod tests {
     #[test_case("version" ; "version")]
     #[test_case("session_id" ; "session_id")]
     #[test_case("text" ; "text")]
-    fn input_edit_refuses_to_write_without_a_required_key(missing: &str) {
+    #[tokio::test]
+    async fn input_edit_refuses_to_write_without_a_required_key(missing: &str) {
         let lua = ui_with_input(echo_edit);
         let kept = [
             "version = st.version",
@@ -2662,16 +2728,17 @@ mod tests {
                 r#"local st = ui.input()
                    return ui.input_edit({{ start = 0, stop = 5, {kept} }})"#
             ),
-        );
+        )
+        .await;
         assert!(err.contains(missing), "the error has to name it: {err}");
     }
 
     /// A handler writes after the key that woke it, so a range the user has
     /// typed past comes back as an error instead of landing somewhere else.
-    #[test]
-    fn input_edit_answers_a_stale_range_in_the_error_slot() {
+    #[tokio::test]
+    async fn input_edit_answers_a_stale_range_in_the_error_slot() {
         let lua = ui_with_input(|_| Err(STALE_RANGE_ERR.into()));
-        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\""));
+        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\"")).await;
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(STALE_RANGE_ERR));
     }
@@ -2681,28 +2748,28 @@ mod tests {
     #[test_case("plan_toggle", None ; "plan_toggle_is_free")]
     #[test_case("pop_queue", Some(Permission::SessionWrite) ; "pop_queue_needs_session_write")]
     #[test_case("file_picker", None ; "file_picker_is_free")]
-    fn action_charges_what_its_api_would(name: &str, needed: Option<Permission>) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+    #[tokio::test]
+    async fn action_charges_what_its_api_would(name: &str, needed: Option<Permission>) {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            while let Ok(action) = rx.recv() {
+            while let Some(action) = rx.blocking_recv() {
                 if let UiAction::Builtin { reply_tx, .. } = action {
                     let _ = reply_tx.send(true);
                 }
             }
         });
-        let run = |perms: &PluginPermissions| {
+        let run = async |perms: &PluginPermissions| {
             let lua = Lua::new();
             let reach = PluginReach::new(perms.clone());
             let t =
                 create_ui_table(&lua, Some(tx.clone()), Arc::from(INPUT_PLUGIN), reach).unwrap();
             lua.globals().set("ui", t).unwrap();
-            smol::block_on(
-                lua.load(format!("return ui.action('{name}')"))
-                    .eval_async::<Option<bool>>(),
-            )
-            .map_err(|e| e.to_string())
+            lua.load(format!("return ui.action('{name}')"))
+                .eval_async::<Option<bool>>()
+                .await
+                .map_err(|e| e.to_string())
         };
-        let denied = run(&PluginPermissions::denied());
+        let denied = run(&PluginPermissions::denied()).await;
         let Some(perm) = needed else {
             assert_eq!(denied, Ok(Some(true)));
             return;
@@ -2711,6 +2778,6 @@ mod tests {
         assert!(err.contains(&denied_error(perm).to_string()), "{err}");
         let mut granted = PluginPermissions::denied();
         granted.set(perm, true);
-        assert_eq!(run(&granted), Ok(Some(true)));
+        assert_eq!(run(&granted).await, Ok(Some(true)));
     }
 }
