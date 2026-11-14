@@ -63,7 +63,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task` | `*` | Subagent spawning always allowed |
-| `read` | `<state>/tasks/<session>/**` | The calling session's [bash logs](/docs/background-tasks/#bash-logs). Subagents share their parent's session. Other sessions' logs prompt like any path outside cwd |
+| `read` | `<state>/sessions/data/<session>/bash/**` | The calling session's [bash logs](/docs/background-tasks/#bash-logs). Subagents share their parent's session. Other sessions' logs prompt like any path outside cwd |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
 
@@ -181,8 +181,9 @@ When a gated tool needs permission, Maki asks you.
 Session and always-allow / always-deny choices need a second key (`Enter` or `y`) so a fat-finger does not rewrite your rules. Deny-once with `n` lets you type a short reason the agent will see.
 
 The keys are the same in a folder you have not
-[trusted](/docs/folder-trust/), where `a` and `d` last for the session instead
-of reaching `.maki/permissions.toml`.
+[trusted](/docs/folder-trust/#in-an-untrusted-folder), even one with no `.maki`
+files. There `a` and `d` last for the session instead of reaching
+`.maki/permissions.toml`.
 
 ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder

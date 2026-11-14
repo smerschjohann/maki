@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
 use futures::future::join_all;
 use maki_storage::id::SessionRef;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use maki_config::providers::{Protocol, ProvidersConfig};
@@ -153,7 +154,7 @@ impl Provider for LocalEndpoint {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -163,12 +164,13 @@ impl Provider for LocalEndpoint {
             if matches!(self.protocol, Some(Protocol::OpenaiResponses)) {
                 let mut buf = String::new();
                 let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-                let mut body = responses::build_body(model, messages, system, tools);
+                let mut body = responses::build_body(model, messages, system, tools, false);
                 body["return_progress"] = serde_json::Value::Bool(true);
                 // TODO: wire thinking budget into responses API when llama.cpp supports it
                 return responses::do_stream(
                     self.compat.client(),
                     model,
+                    &HeaderMap::new(),
                     &body,
                     event_tx,
                     &auth,
@@ -187,7 +189,7 @@ impl Provider for LocalEndpoint {
                 .apply_thinking(&mut body, model, self.thinking_fallback);
 
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
         })
     }
@@ -220,11 +222,7 @@ impl Provider for LocalEndpoint {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 }
 
@@ -700,6 +698,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
         base_url: Cow::Borrowed(OLLAMA_BASE_URL),
         max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
+        usage_cost: false,
         provider_name: Cow::Borrowed("Ollama"),
     },
     // Ollama ignores the budget field, so effort is the only thing it hears.
@@ -721,6 +720,7 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
         base_url: Cow::Borrowed(LLAMACPP_BASE_URL),
         max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
+        usage_cost: false,
         provider_name: Cow::Borrowed("LlamaCpp"),
     },
     thinking_fallback: ThinkingFallback::BudgetField,
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn local_slugs_read_their_declared_thinking_keys() {
         for cfg in [OLLAMA, LLAMACPP] {
-            assert!(maki_config::providers::overlays_local_thinking(cfg.slug));
+            assert!(maki_config::providers::is_local_endpoint(cfg.slug));
         }
     }
 
@@ -763,7 +763,7 @@ mod tests {
         .unwrap();
         let auth = ep.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("http://x:1234/v1"));
-        assert!(auth.headers.is_empty());
+        assert!(auth.header_list().is_empty());
     }
 
     #[test]
@@ -773,8 +773,8 @@ mod tests {
             LocalEndpoint::build(&OLLAMA, Timeouts::default(), Some(pool), None, None).unwrap();
         let auth = ep.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("https://ollama.com/v1"));
-        assert_eq!(auth.headers.len(), 1);
-        assert_eq!(auth.headers[0].1, "Bearer test-key");
+        assert_eq!(auth.header_list().len(), 1);
+        assert_eq!(auth.header_list()[0].1, "Bearer test-key");
     }
 
     #[test]
@@ -790,8 +790,8 @@ mod tests {
         .unwrap();
         let auth = ep.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("http://local:1234/v1"));
-        assert_eq!(auth.headers.len(), 1);
-        assert_eq!(auth.headers[0].1, "Bearer test-key");
+        assert_eq!(auth.header_list().len(), 1);
+        assert_eq!(auth.header_list()[0].1, "Bearer test-key");
     }
 
     #[test]
@@ -816,7 +816,7 @@ mod tests {
         .unwrap();
         let auth = ep.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("http://x:1234/v1"));
-        assert!(auth.headers.is_empty());
+        assert!(auth.header_list().is_empty());
     }
 
     #[test]
@@ -854,6 +854,46 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ep.discovery_mode, DiscoveryMode::LlamaCpp));
+    }
+
+    /// `ignored_builtin_fields` in maki-config stays quiet about these values
+    /// on a local slug, so each one has to pick its wire here.
+    mod protocol_wire {
+        use test_case::test_case;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        use super::super::*;
+        use crate::Timeouts;
+        use crate::test_support::{Canned, serve};
+
+        const PROMPT: &str = "hi";
+        const REJECTED: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
+
+        #[test_case(Some(Protocol::OpenaiResponses), "/v1/responses" ; "responses_api")]
+        #[test_case(Some(Protocol::Openai), "/v1/chat/completions" ; "openai_is_chat")]
+        #[test_case(None, "/v1/chat/completions" ; "default_is_chat")]
+        #[tokio::test]
+        async fn protocol_picks_the_path(protocol: Option<Protocol>, expected: &str) {
+            let (base_url, requests) = serve(REJECTED);
+            let host = base_url.strip_suffix("/v1").map(str::to_owned);
+            let ep =
+                LocalEndpoint::build(&LLAMACPP, Timeouts::default(), None, host, protocol).unwrap();
+            let model = Model::from_spec("llama-cpp/default").unwrap();
+            let (tx, _rx) = unbounded_channel();
+            let _ = ep
+                .stream_message(
+                    &model,
+                    &[Message::user(PROMPT.to_owned())],
+                    "",
+                    &json!([]),
+                    &tx,
+                    RequestOptions::default(),
+                    None,
+                )
+                .await;
+
+            assert_eq!(requests.lock().unwrap()[0].path, expected);
+        }
     }
 
     mod extract_ctx {

@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -13,25 +14,28 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, InputSource, McpConfigErrors,
-    ModelSlot, ToolDoneEvent, ToolOutputLines,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, InputSource, ModelSlot,
+    ToolDoneEvent, ToolOutputLines,
 };
-use maki_config::{ModelPolicy, PermissionsConfig, PluginsConfig, ProjectConfig};
+use maki_config::project::{self, TrustMode};
+use maki_config::{PermissionsConfig, PluginsConfig};
+use maki_lua::test_support::{wait_next, wait_reply};
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, ThinkingConfig, Timeouts, TokenUsage,
+    StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use tokio::runtime::EnterGuard;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::agent::AgentHandles;
 use crate::agent::shared_queue::{QueueItem, QueuedInput};
 use crate::app::tests::enter_runtime;
 
-use super::push_prompt;
+use super::{push_prompt, test_deps};
 
 const WAIT: Duration = Duration::from_secs(30);
 const PLUGIN: &str = "background_e2e";
@@ -192,7 +196,7 @@ fn assert_append_only(prev: &SeenRequest, next: &SeenRequest) {
 
 struct Step {
     response: StreamResponse,
-    hold: Option<flume::Receiver<()>>,
+    hold: Option<UnboundedReceiver<()>>,
 }
 
 impl Step {
@@ -204,7 +208,7 @@ impl Step {
     }
 
     /// The model answers only once the test sends on the paired sender.
-    fn held(mut self, hold: flume::Receiver<()>) -> Self {
+    fn held(mut self, hold: UnboundedReceiver<()>) -> Self {
         self.hold = Some(hold);
         self
     }
@@ -260,7 +264,7 @@ fn stop_call() -> StreamResponse {
 
 struct ScriptedProvider {
     steps: Mutex<VecDeque<Step>>,
-    requests: flume::Sender<SeenRequest>,
+    requests: Sender<SeenRequest>,
 }
 
 impl Provider for ScriptedProvider {
@@ -270,7 +274,7 @@ impl Provider for ScriptedProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        _event_tx: &'a flume::Sender<ProviderEvent>,
+        _event_tx: &'a UnboundedSender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -291,8 +295,8 @@ impl Provider for ScriptedProvider {
                     message: SCRIPT_EXHAUSTED.into(),
                 });
             };
-            if let Some(hold) = step.hold {
-                let _ = hold.recv_async().await;
+            if let Some(mut hold) = step.hold {
+                let _ = hold.recv().await;
             }
             Ok(step.response)
         })
@@ -316,8 +320,8 @@ fn expected_display(outcome: &str) -> String {
 struct World {
     handles: AgentHandles,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
-    requests: flume::Receiver<SeenRequest>,
+    ui: UnboundedReceiver<UiAction>,
+    requests: Receiver<SeenRequest>,
     seen: Vec<AgentEvent>,
     _serial: MutexGuard<'static, ()>,
     _runtime: EnterGuard<'static>,
@@ -331,10 +335,9 @@ impl World {
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .and_then(|()| host.load_source(PLUGIN, PLUGIN_SRC))
             .expect(PLUGINS_LOAD);
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
+        let ui = host.take_ui_action_rx().unwrap();
 
-        let (seen_requests, requests) = flume::unbounded();
+        let (seen_requests, requests) = channel();
         let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
             steps: Mutex::new(steps.into()),
             requests: seen_requests,
@@ -346,7 +349,7 @@ impl World {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            project::resolve_noninteractive(Path::new("/tmp"), TrustMode::Session).project_config,
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(
@@ -355,11 +358,8 @@ impl World {
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
-            Timeouts::default(),
             host.event_handle(),
-            None,
-            McpConfigErrors::new(PathBuf::new()),
-            Arc::new(ModelPolicy::default()),
+            test_deps(),
         );
         Self {
             handles,
@@ -379,7 +379,7 @@ impl World {
     /// What the event loop does for an idle chat whose mailbox holds a wake:
     /// claim it and start a run with the notices as its preamble.
     fn claim_wake(&self) -> Vec<Message> {
-        self.handles.claim_mailbox_wake()
+        self.handles.mailbox().claim_wake()
     }
 
     fn start_wake_run(&self, run_id: u64, preamble: Vec<Message>) {
@@ -406,11 +406,11 @@ impl World {
     fn wait_for(&mut self, is_wanted: impl Fn(&AgentEvent) -> bool) {
         let deadline = Instant::now() + WAIT;
         loop {
-            let envelope = self
-                .handles
-                .agent_rx
-                .recv_deadline(deadline)
-                .expect(NO_EVENT);
+            let envelope = wait_next(
+                &mut self.handles.agent_rx,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .expect(NO_EVENT);
             let wanted = is_wanted(&envelope.event);
             self.seen.push(envelope.event);
             if wanted {
@@ -429,12 +429,8 @@ impl World {
         self.wait_for(
             |event| matches!(event, AgentEvent::ToolMovable { id: movable, movable: true } if movable == id),
         );
-        let outcome = self
-            .host
-            .event_handle()
-            .request_background(id.to_owned())
-            .recv_timeout(WAIT)
-            .expect(NO_OUTCOME);
+        let answer = self.host.event_handle().request_background(id.to_owned());
+        let outcome = wait_reply(answer, WAIT).expect(NO_OUTCOME);
         assert_eq!(outcome, MoveOutcome::Moved);
     }
 
@@ -464,10 +460,14 @@ impl World {
 
     /// The final reply of the moved call, as its task tab gets it. The chat
     /// was told before this is sent.
-    fn task_done(&self) -> ToolDoneEvent {
+    fn task_done(&mut self) -> ToolDoneEvent {
         let deadline = Instant::now() + WAIT;
         loop {
-            let action = self.ui.recv_deadline(deadline).expect(NO_TASK_EVENT);
+            let action = wait_next(
+                &mut self.ui,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .expect(NO_TASK_EVENT);
             if let UiAction::PluginTaskEvent { envelope, .. } = action
                 && let AgentEvent::ToolDone(done) = envelope.event
             {
@@ -594,7 +594,7 @@ fn a_moved_call_whose_turn_ends_wakes_the_chat_with_its_result() {
 
 #[test]
 fn a_result_landing_mid_run_follows_the_next_tool_results_without_a_new_request() {
-    let (release_model, model_gate) = flume::unbounded::<()>();
+    let (release_model, model_gate) = unbounded_channel::<()>();
     let mut world = World::start(vec![
         Step::new(park_call()),
         Step::new(noop_call()).held(model_gate),
@@ -720,7 +720,7 @@ fn a_task_stop_by_the_model_returns_the_partial_output_and_sends_no_notice() {
 /// other.
 #[test]
 fn esc_leaves_moved_work_running() {
-    let (_model_gate_open, model_gate) = flume::unbounded::<()>();
+    let (_model_gate_open, model_gate) = unbounded_channel::<()>();
     let mut world = World::start(vec![
         Step::new(park_call()),
         Step::new(answer(WAITING_TEXT)).held(model_gate),

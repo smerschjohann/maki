@@ -51,7 +51,7 @@ The rules:
 
 - No `plugin.toml` at all: every permission is denied, and maki logs a
   warning at load time.
-- `plugin.toml` exists: permissions default to granted; set a key to
+- `plugin.toml` exists: permissions default to granted. Set a key to
   `false` to revoke it. An empty file grants everything.
 - Invalid TOML: everything denied, with a warning in the log.
 - A package, or a plugin maki ships, is read the other way round: a key it
@@ -98,8 +98,7 @@ reference is at the end of this document.
 
 Plugins live in the maki config dir. There are two of them, same layout:
 
-- `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
-  that one first)
+- `~/.config/maki/` - global, every project
 - `<project>/.maki/` - this project only
 
 ```
@@ -110,8 +109,12 @@ plugin.toml     permission grants for every Lua file in the dir
 
 Nothing under `lua/` loads on its own. A module name is its path under `lua/`
 without the extension: `lua/browser.lua` is `require("browser")`,
-`lua/acme/tools.lua` is `require("acme.tools")`. `require` is sandboxed to
-that directory, you cannot reach files outside it.
+`lua/acme/tools.lua` is `require("acme.tools")`. `require` cannot reach files
+outside that directory.
+
+A module can call `maki.fs` and the other async APIs at its top level. In a
+`require` cycle, the `require` that closes the cycle returns `true` rather than
+the module.
 
 ## Creating a plugin
 
@@ -168,9 +171,10 @@ with full debug info.
 
 {AGENT_NOTES}## Conventions
 
-- Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
+- Fallible runtime calls return a `(value, err)` pair. Check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
+- Give each parameter its own schema field. Models copy a usage line like `` `write path content` `` into a string field.
 - Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example
@@ -192,8 +196,6 @@ const AGENT_NOTES: &str = r#"## Notes for the agent
   of the maki repo holds the plugins that ship with maki, compiled into the
   binary, so a file dropped there does nothing until maki is rebuilt. That
   holds even when the project you have open is a maki checkout.
-- Both global config dirs can exist, and `~/.maki/` wins, so look before you
-  write.
 - The config dir sits outside the project, but it is an ordinary directory:
   create files there with the normal write and edit tools.
 - You cannot run slash commands or restart maki, so ask the user to run
@@ -393,7 +395,7 @@ fn is_export(line: &str) -> bool {
     let Some((lhs, rhs)) = line.split_once(" = ") else {
         return false;
     };
-    if rhs.is_empty() || rhs.ends_with('{') {
+    if rhs.is_empty() {
         return false;
     }
     let Some((table, field)) = lhs.split_once('.') else {
@@ -407,6 +409,8 @@ fn is_export(line: &str) -> bool {
     ident(table) && ident(field)
 }
 
+/// A table export keeps its body, so a preset like `ListNav.KEYS` shows its
+/// keys to the reader. The body ends at the first `}` in column 0.
 fn skeleton(src: &str) -> String {
     fn flush(out: &mut String, pending: &mut Vec<&str>) {
         for line in pending.drain(..) {
@@ -417,7 +421,14 @@ fn skeleton(src: &str) -> String {
     let mut out = String::new();
     let mut pending: Vec<&str> = Vec::new();
     let mut leading = true;
+    let mut in_table = false;
     for line in src.lines() {
+        if in_table {
+            out.push_str(line);
+            out.push('\n');
+            in_table = !line.starts_with('}');
+            continue;
+        }
         if line.starts_with("--") {
             pending.push(line);
             continue;
@@ -433,6 +444,7 @@ fn skeleton(src: &str) -> String {
             flush(&mut out, &mut pending);
             out.push_str(line);
             out.push('\n');
+            in_table = line.ends_with('{');
         } else {
             pending.clear();
         }
@@ -488,11 +500,16 @@ fn instance_name(module: &ModuleDoc) -> &'static str {
     module.name.rsplit('.').next().unwrap_or(module.name)
 }
 
-fn first_sentence(desc: &str) -> &str {
-    let first_line = desc.lines().next().unwrap_or_default();
-    match first_line.find(". ") {
-        Some(i) => &first_line[..=i],
-        None => first_line,
+fn first_sentence(desc: &str) -> String {
+    let paragraph = desc
+        .lines()
+        .map(str::trim)
+        .take_while(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match paragraph.find(". ") {
+        Some(i) => paragraph[..=i].to_owned(),
+        None => paragraph,
     }
 }
 
@@ -754,11 +771,11 @@ mod tests {
 
     const AGENT_VOICE: &str = "ask the user";
 
-    const MODULE: &str = "-- Header line one.\n-- Header line two.\nlocal M = {}\nM.__index = M\nM.CONST = \"x\"\nM.specs = {\n  a = 1,\n}\nlocal function private()\nend\n-- Doc for pub.\nfunction M.pub(a, b)\n  local inner = 1\nend\nfunction M:_hidden()\nend\nfunction M:method()\nend\nreturn M\n";
+    const MODULE: &str = "-- Header line one.\n-- Header line two.\nlocal M = {}\nM.__index = M\nM.CONST = \"x\"\n-- Doc for specs.\nM.specs = {\n  a = 1,\n}\nlocal function private()\nend\n-- Doc for pub.\nfunction M.pub(a, b)\n  local inner = 1\nend\nfunction M:_hidden()\nend\nfunction M:method()\nend\nreturn M\n";
 
     #[test]
     fn skeleton_keeps_public_surface_only() {
-        let expected = "-- Header line one.\n-- Header line two.\nM.CONST = \"x\"\n\n-- Doc for pub.\nfunction M.pub(a, b)\nfunction M:method()\n";
+        let expected = "-- Header line one.\n-- Header line two.\nM.CONST = \"x\"\n\n-- Doc for specs.\nM.specs = {\n  a = 1,\n}\n\n-- Doc for pub.\nfunction M.pub(a, b)\nfunction M:method()\n";
         assert_eq!(skeleton(MODULE), expected);
     }
 

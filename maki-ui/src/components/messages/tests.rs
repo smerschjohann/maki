@@ -13,13 +13,15 @@ use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use maki_config::DEFAULT_THINKING_LINES;
+use maki_markdown::render::CODE_BAR;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Duration;
 use test_case::test_case;
+use tokio::sync::mpsc::unbounded_channel;
 
 const UNDECODABLE_IMAGE: &str = "invalid image";
 const VIEW_WIDTH: u16 = 80;
@@ -825,6 +827,18 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
         !seg_search(&panel, "t1").contains(BODY),
         "the parent tool renders the code, not the instructions it carried"
     );
+}
+
+#[test_case("fix src/__init__.py" ; "underscores")]
+#[test_case("--- a/x\n+++ b/x\n- old\n+ new" ; "pasted_diff")]
+#[test_case("    indented\n# not a heading" ; "indentation_and_hash")]
+fn user_message_shows_as_typed(text: &str) {
+    let message = DisplayMessage::new(DisplayRole::User, text.into());
+    let rows: Vec<String> = build_message_lines(&message, VIEW_WIDTH)
+        .iter()
+        .map(|row| row.to_string())
+        .collect();
+    assert_eq!(rows.join("\n"), format!("{}{text}", user_style().prefix));
 }
 
 #[test]
@@ -1700,7 +1714,7 @@ fn second_register_live_buf_replaces_first() {
 #[test_case(true ; "error_finish")]
 fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     finish_with_live_buf(&mut panel, "t1", "body", is_error);
@@ -1738,7 +1752,7 @@ fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
 #[test]
 fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_clicks() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = finish_with_live_buf(&mut panel, "t0", "before", false);
@@ -1783,7 +1797,7 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
 #[test]
 fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let mut ev = start("t1", BASH_TOOL_NAME);
@@ -1813,7 +1827,7 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
 #[test]
 fn cancel_in_progress_retires_live_buf_to_watched() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -1856,7 +1870,7 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
 #[test]
 fn restore_reply_stops_watching_buf() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = finish_with_live_buf(&mut panel, "t1", "old-theme", false);
@@ -1899,7 +1913,7 @@ fn restore_reply_stops_watching_buf() {
 #[test]
 fn rebake_request_stops_watching_buf() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     finish_with_live_buf(&mut panel, "t1", "old-theme", false);
@@ -2080,7 +2094,7 @@ fn superseded_rebake_reply_is_dropped() {
 }
 
 fn test_event_sender() -> maki_agent::EventSender {
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     maki_agent::EventSender::new(tx, 0)
 }
 
@@ -2122,6 +2136,26 @@ fn header_snapshot_stamps_gen_on_top_level() {
     assert_eq!(panel.snapshot_gen_of("t1"), Some(5), "{HEADER_GEN_MSG}");
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert!(msg.render_header.is_some(), "render_header must be set");
+}
+
+/// A headless session stores no tool outputs, so a reopened failed call has
+/// its error only in the row text. The header must keep it, and a body view
+/// must replace it, or a tail view of a long error draws it twice.
+#[test]
+fn restored_row_text_stays_until_a_body_view_lands() {
+    const ERROR_BODY: &str = "error: path not found";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.find_tool_msg_mut("t1").unwrap().text = format!("t1\n{ERROR_BODY}");
+
+    panel.tool_header_snapshot("t1", rendered_snapshot(), Some(1));
+    assert_eq!(
+        panel.find_tool_msg_mut("t1").unwrap().text,
+        format!("rendered\n{ERROR_BODY}")
+    );
+
+    panel.tool_snapshot("t1", rendered_snapshot(), Some(1));
+    assert_eq!(panel.find_tool_msg_mut("t1").unwrap().text, "rendered");
 }
 
 #[test]
@@ -2810,17 +2844,63 @@ const FOLLOW_UP_TEXT: &str = "and then deploy";
 const STALE_BUBBLE_MSG: &str = "the superseded bubble must disappear from the viewport";
 const UNTOUCHED_MSG: &str = "a rejected replace must leave the transcript untouched";
 
-fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
+fn row_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> u16 {
     let buf = terminal.backend().buffer();
     for y in 0..buf.area.height {
         let row: String = (0..buf.area.width)
             .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
             .collect();
-        if let Some(col) = row.find(text) {
-            return buf.cell((col as u16, y)).unwrap().style();
+        if row.contains(text) {
+            return y;
         }
     }
     panic!("{text} was never rendered");
+}
+
+fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
+    let buf = terminal.backend().buffer();
+    let y = row_of(terminal, text);
+    let row: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+        .collect();
+    let col = row.find(text).expect("row_of found the text");
+    buf.cell((col as u16, y)).unwrap().style()
+}
+
+const USER_BG_THEME: &str = r##"
+[palette]
+background = "#000000"
+surface = "#1d2021"
+assistant_fg = "#111111"
+user_fg = "#eeeeee"
+[ui]
+assistant = { fg = "assistant_fg" }
+user_text = { fg = "user_fg" }
+user_bg = { bg = "surface" }
+"##;
+
+#[test]
+fn user_message_uses_user_bg_and_user_text() {
+    crate::theme::set(Theme::from_toml(USER_BG_THEME).unwrap());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "hello\nworld".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "reply".into()));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let buf = terminal.backend().buffer();
+    let user_bg = Color::Rgb(0x1d, 0x20, 0x21);
+    let user_fg = Color::Rgb(0xee, 0xee, 0xee);
+    let assistant_fg = Color::Rgb(0x11, 0x11, 0x11);
+    for row in [row_of(&terminal, "you> hello"), row_of(&terminal, "world")] {
+        assert_eq!(buf.cell((0, row)).unwrap().bg, user_bg);
+        assert_eq!(buf.cell((VIEW_WIDTH - 2, row)).unwrap().bg, user_bg);
+    }
+    assert_eq!(style_of(&terminal, "hello").fg, Some(user_fg));
+    assert_eq!(style_of(&terminal, "reply").fg, Some(assistant_fg));
+    let reply_row = row_of(&terminal, "reply");
+    assert_ne!(buf.cell((VIEW_WIDTH - 2, reply_row)).unwrap().bg, user_bg);
 }
 
 /// `Chat::mark_finished` corrects a bubble long after it was drawn, with the
@@ -3182,6 +3262,41 @@ fn a_moved_row_keeps_its_head_and_follows_it() {
     assert!(view_text(&mut panel).contains(NEW_COMMAND));
 }
 
+/// A long moved call outlives many quick calls after it, and those must not
+/// evict it from what the panel polls before its outcome lands. A move that
+/// races Esc lands on a row Esc already ended, and streams again all the same.
+#[test_case(false ; "moved_while_running")]
+#[test_case(true ; "moved_after_esc")]
+fn a_moved_row_follows_its_buf_until_its_outcome(esc_first: bool) {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines_with_head(vec![snap_line(COMMAND)], 1);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(MOVABLE_ID, BASH_TOOL_NAME));
+    panel.register_live_buf(MOVABLE_ID.into(), Arc::clone(&buf));
+    if esc_first {
+        panel.cancel_in_progress();
+    }
+    panel.tool_done(backgrounded_done(RECEIPT));
+    for i in 0..=WARM_TOOL_CAP {
+        finish_with_live_buf(&mut panel, &format!("quick{i}"), STREAMED, false);
+    }
+
+    buf.set_lines_with_head(vec![snap_line(NEW_COMMAND)], 1);
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
+    let snapshot = panel
+        .find_tool_msg(MOVABLE_ID)
+        .unwrap()
+        .render_snapshot
+        .as_ref();
+    assert_eq!(
+        snapshot.map(BufferSnapshot::text).as_deref(),
+        Some(NEW_COMMAND)
+    );
+
+    panel.set_background_outcome(MOVABLE_ID, BackgroundOutcome::Done);
+    assert!(!panel.live_bufs.contains_key(MOVABLE_ID));
+}
+
 fn unstruck_cancelled(theme: &Theme) -> Style {
     theme.todo_cancelled.remove_modifier(Modifier::CROSSED_OUT)
 }
@@ -3229,7 +3344,10 @@ fn moved_row_shows_elapsed_since_the_move() {
 fn notice_panel(detail: Option<&str>) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let mut notice = DisplayMessage::new(DisplayRole::Notice, NOTICE_TEXT.into());
-    notice.detail = detail.map(str::to_owned);
+    notice.detail = detail.map(|text| NoticeDetail {
+        text: text.into(),
+        markdown: false,
+    });
     panel.push(notice);
     panel
 }
@@ -3262,9 +3380,59 @@ fn a_task_notice_opens_with_its_ending_dot(
     assert_eq!(dot, style.map(|style| style(&theme::current())));
 }
 
+/// Shell output is not markdown: a diff's `-` lines would turn into bullets.
+#[test_case(false, "- removed line", &format!("{NOTICE_DETAIL_INDENT}- removed line") ; "plain_output_stays_as_written")]
+#[test_case(true, "```\nlet answer = 42;\n```", &format!("{NOTICE_DETAIL_INDENT}{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]
+fn notice_detail_follows_its_format(markdown: bool, text: &str, expected_row: &str) {
+    let detail = NoticeDetail {
+        text: text.into(),
+        markdown,
+    };
+    let rows: Vec<String> = notice_detail_lines(&detail, VIEW_WIDTH)
+        .map(|row| row.to_string())
+        .collect();
+    assert!(rows.iter().any(|row| row == expected_row), "{rows:?}");
+}
+
 #[test]
 fn notice_without_detail_does_not_toggle() {
     let mut panel = notice_panel(None);
     render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
     assert_eq!(panel.handle_click(0, 0, view_area()), ClickOutcome::None);
+}
+
+#[test]
+fn scrollbar_sits_on_the_theme_window_background() {
+    let dracula = crate::BUNDLED_THEMES
+        .iter()
+        .find(|e| e.name == "dracula")
+        .unwrap()
+        .toml;
+    crate::theme::set(crate::theme::Theme::from_toml(dracula).unwrap());
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.streaming_text.set_buffer(&"line\n".repeat(40));
+    let backend = TestBackend::new(80, 10);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            ratatui::widgets::Widget::render(
+                ratatui::widgets::Block::default()
+                    .style(ratatui::style::Style::new().bg(crate::theme::current().background)),
+                f.area(),
+                f.buffer_mut(),
+            );
+            panel.view(f, f.area(), false, true, &[]);
+        })
+        .unwrap();
+
+    let theme = crate::theme::current();
+    let buf = terminal.backend().buffer();
+    for y in 0..buf.area.height {
+        let c = buf.cell((buf.area.width - 1, y)).unwrap();
+        assert_eq!(
+            c.bg, theme.background,
+            "the scrollbar column must sit on the theme bg, not the terminal's"
+        );
+    }
 }

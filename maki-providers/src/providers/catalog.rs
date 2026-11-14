@@ -15,35 +15,36 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use serde_json::Value;
 use tokio::sync::OnceCell;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
 use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 
+use crate::headers::HeaderError;
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
-use crate::providers::anthropic::shared;
+use crate::providers::anthropic::{self, shared};
+use crate::providers::codec::SessionCarrier;
 use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
 };
 use crate::providers::{
-    ResolvedAuth, Timeouts, body_reader, http_client, opencode, plugin, send_request,
-    status_and_text, user_agent,
+    ResolvedAuth, Timeouts, http_client, ok_sse, ok_text, opencode, plugin, status_and_text,
 };
 use crate::spec::ProviderRegistry;
 use crate::{
-    AgentError, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    ThinkingConfig, dialect,
+    AgentError, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, ThinkingConfig, dialect,
 };
 
 const MESSAGES_PATH: &str = "/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Priced per subscription, so every model in it reads as free. The `zai` entry
 /// carries the pay as you go rates for the same models.
@@ -62,7 +63,10 @@ pub(crate) const CATALOG_BACKED_BUILTINS: &[&str] = opencode::SLUGS;
 const CHAT_DIALECT: EffortDialect<'static> = dialect::PREFER_HIGH;
 
 /// Provider modules own their entry here; the catalog only reads it.
-const QUIRKS: &[(&[&str], ProviderQuirks)] = &[(opencode::SLUGS, opencode::QUIRKS)];
+const QUIRKS: &[(&[&str], ProviderQuirks)] = &[
+    (&[opencode::ZEN_SLUG], opencode::ZEN_QUIRKS),
+    (&[opencode::GO_SLUG], opencode::GO_QUIRKS),
+];
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
@@ -84,10 +88,23 @@ pub enum EndpointType {
 }
 
 /// Behaviour a provider needs beyond what models.dev publishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProviderQuirks {
     pub free_tier: Option<FreeTier>,
-    pub session_header: Option<&'static str>,
+    /// Headers only: the catalog transport builds bodies no quirk reaches.
+    pub session_id: SessionCarrier,
+    /// Quota endpoint a [`CatalogProvider::fetch_usage`] reads, with the
+    /// parser that understands the wire it answers.
+    pub usage: Option<UsageEndpoint>,
+}
+
+/// One provider's quota endpoint. `parse` sits beside `url` so the generic
+/// fetch never has to know a wire shape that belongs to the provider module.
+/// No `PartialEq`: comparing fn pointers is not meaningful equality.
+#[derive(Debug, Clone, Copy)]
+pub struct UsageEndpoint {
+    pub url: &'static str,
+    pub parse: fn(&str) -> Result<ProviderUsage, AgentError>,
 }
 
 /// A no-key tier that unlocks only zero-priced models, and only after the
@@ -114,7 +131,7 @@ fn quirks_for(slug: &str) -> ProviderQuirks {
     QUIRKS
         .iter()
         .find(|(slugs, _)| slugs.contains(&slug))
-        .map(|(_, quirks)| *quirks)
+        .map(|(_, quirks)| quirks.clone())
         .unwrap_or_default()
 }
 
@@ -199,11 +216,11 @@ impl ProviderData {
         &self,
         mut auth: ResolvedAuth,
         session_id: Option<&SessionRef>,
-    ) -> ResolvedAuth {
-        if let (Some(header), Some(sid)) = (self.quirks.session_header, session_id) {
-            auth.set_header(header, sid.to_string());
+    ) -> Result<ResolvedAuth, HeaderError> {
+        if let Some(session) = session_id {
+            self.quirks.session_id.apply_headers(session, &mut auth)?;
         }
-        auth
+        Ok(auth)
     }
 
     fn auth_headers(&self, api_key: &str) -> Vec<(String, String)> {
@@ -458,6 +475,7 @@ static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed(""),
     max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
     include_stream_usage: true,
+    usage_cost: false,
     provider_name: Cow::Borrowed("catalog"),
 };
 
@@ -625,10 +643,7 @@ async fn save_cached_catalog(index: &schema::CatalogIndex) {
 }
 
 async fn fetch_remote_catalog_async(client: &Client) -> Result<schema::CatalogIndex, AgentError> {
-    let request = client
-        .get(CATALOG_URL)
-        .header("user-agent", user_agent())
-        .build()?;
+    let request = client.get(CATALOG_URL).build()?;
 
     let (status, text) = status_and_text(client, request).await.map_err(|e| {
         warn!(error = %e, CATALOG_URL, "failed to fetch catalog");
@@ -774,7 +789,7 @@ impl CatalogTransport {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
@@ -791,7 +806,7 @@ impl CatalogTransport {
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &CHAT_DIALECT, model);
                 self.chat_compat
-                    .do_stream(model, &[], &body, event_tx, auth)
+                    .do_stream(model, &HeaderMap::new(), &body, event_tx, auth)
                     .await
             }
             EndpointType::Messages => {
@@ -810,32 +825,20 @@ impl CatalogTransport {
                 );
                 body["model"] = serde_json::json!(model.id);
                 body["stream"] = serde_json::json!(true);
-                let request = auth
-                    .configure_request(
-                        self.client
-                            .post(format!(
-                                "{}{}",
-                                auth.base_url.as_deref().unwrap_or(""),
-                                MESSAGES_PATH
-                            ))
-                            .header("user-agent", user_agent())
-                            .header("content-type", "application/json")
-                            .header("anthropic-version", ANTHROPIC_VERSION),
-                    )
-                    .body(serde_json::to_vec(&body)?)
-                    .build()?;
+                let request = auth.finish(
+                    self.client
+                        .post(format!(
+                            "{}{}",
+                            auth.base_url.as_deref().unwrap_or(""),
+                            MESSAGES_PATH
+                        ))
+                        .header("content-type", "application/json")
+                        .header("anthropic-version", anthropic::API_VERSION)
+                        .body(serde_json::to_vec(&body)?),
+                )?;
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
-                send_request(&self.client, request, |response| async move {
-                    if response.status().as_u16() == 200 {
-                        crate::providers::anthropic::parse_sse(
-                            body_reader(response),
-                            event_tx,
-                            self.stream_timeout,
-                        )
-                        .await
-                    } else {
-                        Err(AgentError::from_response(response).await)
-                    }
+                ok_sse(&self.client, request, self.stream_timeout, |body| {
+                    anthropic::parse_sse(body, event_tx)
                 })
                 .await
             }
@@ -897,13 +900,13 @@ impl Provider for CatalogProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.unlocked(&self.data.slug)?.clone();
-            let auth = self.data.request_auth(auth, session_id);
+            let auth = self.data.request_auth(auth, session_id)?;
             let meta = self
                 .data
                 .models
@@ -953,6 +956,21 @@ impl Provider for CatalogProvider {
                 .collect())
         })
     }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move {
+            let Some(endpoint) = self.data.quirks.usage else {
+                return Ok(None);
+            };
+            if matches!(self.auth, CatalogAuth::FreeOnly(_)) {
+                return Ok(None);
+            }
+            let auth = self.auth.unlocked(&self.data.slug)?.clone();
+            let request = auth.finish(self.transport.client.get(endpoint.url))?;
+            let body = ok_text(&self.transport.client, request).await?;
+            (endpoint.parse)(&body).map(Some)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -993,7 +1011,6 @@ impl LazyCatalogProvider {
         }
     }
 }
-
 impl Provider for LazyCatalogProvider {
     fn stream_message<'a>(
         &'a self,
@@ -1001,7 +1018,7 @@ impl Provider for LazyCatalogProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1015,6 +1032,10 @@ impl Provider for LazyCatalogProvider {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move { self.resolve().await?.list_models().await })
+    }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move { self.resolve().await?.fetch_usage().await })
     }
 }
 
@@ -1074,6 +1095,9 @@ pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use tokio::sync::OnceCell;
 
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
     use std::sync::Arc;
@@ -1151,16 +1175,16 @@ mod tests {
             ..opencode_go_provider_data("UNUSED")
         };
         let session = SessionRef::generate();
-        let auth = data.request_auth(
-            ResolvedAuth::for_test(None, Vec::new()),
-            with_session.then_some(&session),
+        let auth = data
+            .request_auth(
+                ResolvedAuth::for_test(None, Vec::new()),
+                with_session.then_some(&session),
+            )
+            .unwrap();
+        assert_eq!(
+            auth.header(SESSION_HEADER),
+            expected.then(|| session.as_str())
         );
-        let header = auth
-            .headers
-            .iter()
-            .find(|(key, _)| key == SESSION_HEADER)
-            .map(|(_, value)| value.as_str());
-        assert_eq!(header, expected.then(|| session.to_string()).as_deref());
     }
 
     /// Limits are published so nothing under test reads a default; only the
@@ -1181,7 +1205,7 @@ mod tests {
 
     fn opencode_go_provider_data(env_key: &str) -> ProviderData {
         ProviderData {
-            quirks: opencode::QUIRKS,
+            quirks: opencode::GO_QUIRKS,
             slug: "opencode-go".into(),
             display_name: "Opencode Go".into(),
             env_keys: vec![env_key.into()],
@@ -1193,6 +1217,38 @@ mod tests {
                 ("free-model".into(), priced(0.0)),
             ]),
         }
+    }
+
+    /// The free tier authenticates with the public key, which the quota
+    /// endpoint answers with a 401. There is no quota to show, so it is
+    /// `Ok(None)`, while a missing key stays an error.
+    #[tokio::test]
+    async fn free_only_auth_has_no_usage() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_30518");
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
+        assert!(matches!(provider.auth, super::CatalogAuth::FreeOnly(_)));
+        assert!(provider.fetch_usage().await.unwrap().is_none());
+    }
+
+    /// The wrapper receives `/usage` calls before the catalog has warmed, and
+    /// the trait default would answer `Ok(None)` for a provider that does have
+    /// an endpoint. Gated auth fails inside `fetch_usage`, so the error, not
+    /// `Ok(None)`, is the proof the call was forwarded.
+    #[tokio::test]
+    async fn lazy_provider_forwards_fetch_usage_to_resolution() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_87016");
+        let resolved =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        let lazy = super::LazyCatalogProvider {
+            slug: "opencode-go".into(),
+            timeouts: Timeouts::default(),
+            inner: OnceCell::from(Ok(resolved)),
+        };
+        let error = lazy.fetch_usage().await.unwrap_err();
+        assert!(error.to_string().contains("no API key"), "{error}");
     }
 
     #[tokio::test]
@@ -1220,7 +1276,7 @@ mod tests {
             context_window: 0,
             thinking_fields: None,
         };
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = provider
             .stream_message(
                 &model,
@@ -1472,8 +1528,8 @@ mod tests {
         let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::FreeKey(resolved, _) => {
-                assert_eq!(resolved.headers[0].0, "authorization");
-                assert_eq!(resolved.headers[0].1, "Bearer public");
+                assert_eq!(resolved.header_list()[0].0, "authorization");
+                assert_eq!(resolved.header_list()[0].1, "Bearer public");
             }
             _ => panic!("expected FreeKey"),
         }
@@ -1502,8 +1558,8 @@ mod tests {
         let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::KeyBased(resolved) => {
-                assert_eq!(resolved.headers[0].0, "authorization");
-                assert_eq!(resolved.headers[0].1, "Bearer sk-real-key");
+                assert_eq!(resolved.header_list()[0].0, "authorization");
+                assert_eq!(resolved.header_list()[0].1, "Bearer sk-real-key");
             }
             _ => panic!("expected KeyBased"),
         }
@@ -1533,8 +1589,8 @@ mod tests {
         let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::KeyBased(resolved) => {
-                assert_eq!(resolved.headers[0].0, "x-api-key");
-                assert_eq!(resolved.headers[0].1, "sk-ant-key");
+                assert_eq!(resolved.header_list()[0].0, "x-api-key");
+                assert_eq!(resolved.header_list()[0].1, "sk-ant-key");
             }
             _ => panic!("expected KeyBased"),
         }

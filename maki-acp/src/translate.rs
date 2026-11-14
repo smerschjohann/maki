@@ -379,7 +379,7 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
 pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> SessionUpdate {
     let used = event
         .context_size
-        .unwrap_or_else(|| event.usage.context_tokens()) as u64;
+        .map_or_else(|| event.usage.context_tokens(), u64::from);
     let mut update = UsageUpdate::new(used, u64::from(event.context_window));
     if let Some(cost) = cost_total {
         update = update.cost(Cost::new(cost, CURRENCY));
@@ -562,6 +562,7 @@ mod tests {
                 MsgBlock::Thinking {
                     thinking: "hmm".into(),
                     signature: None,
+                    reasoning_id: None,
                 },
                 MsgBlock::Text {
                     text: "let me check".into(),

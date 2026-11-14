@@ -8,19 +8,21 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
     Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
 };
-use maki_agent::{AgentEvent, AgentSeed, ToolPart};
+use maki_agent::{AgentEvent, AgentSeed, TaskLabel, ToolPart};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::{MakiId, SessionRef};
 use mlua::{
     AnyUserData, Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods,
     Value as LuaValue,
 };
+use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 
-use crate::api::tool::ToolCallReply;
+use crate::api::tool::{LuaOutputFormat, ToolCallReply, extract_format};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, err_pair, pair};
+use crate::background::BackgroundTasks;
 use crate::runtime::{
     MoveOutcome, RestoreReason, SUBAGENT_SELF_MOVE_MSG, TaskHandle, active_task, lock_cell,
     move_self,
@@ -41,6 +43,9 @@ const NESTED_PARTS_MSG: &str =
     "set_parts: only a model's own call is a task, a call nested in another has no parts";
 const PART_STATUS_ERR: &str =
     "set_parts: status must be \"working\", \"done\", \"error\" or \"cancelled\"";
+const NOT_MOVED_PART_MSG: &str = "report_part: the call has not moved to the background";
+const NO_PART_NOW_MSG: &str =
+    "report_part: the call stopped or replied, or nothing waits on it any more";
 const EXPIRE_BACKGROUND: &str = "background";
 const EXPIRE_TIMEOUT: &str = "timeout";
 
@@ -170,7 +175,7 @@ pub(crate) struct LuaCtx {
     /// re-rendered.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
-    pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
+    pub(crate) finish_tx: Option<oneshot::Sender<ToolCallReply>>,
 }
 
 enum Caps {
@@ -432,7 +437,7 @@ impl UserData for LuaCtx {
                 // Made outside the lock: allocating can run the GC, and a
                 // finalizer may want the same cell.
                 let key = lua.create_registry_value(hook)?;
-                lock_cell(&handle).background_hook = Some(key);
+                lock_cell(&handle).background_hook = Some(Arc::new(key));
                 announce_movable(&handle, agent, true);
                 Ok((Some(true), None))
             },
@@ -515,6 +520,27 @@ impl UserData for LuaCtx {
             })
         });
 
+        // In a moved call that runs other tools, a slow one should not hold
+        // back a quick one, so each result can go to the model as it lands.
+        methods.add_method("report_part", |lua, this, part: Table| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("report_part"));
+            };
+            let Some(home) = agent.call.as_ref().and_then(|call| call.home()) else {
+                return Ok(err_pair(NOT_MOVED_PART_MSG));
+            };
+            let tool: String = part.get("tool")?;
+            let name: Option<String> = part.opt("name")?;
+            let output: String = part.opt("output")?.unwrap_or_default();
+            let failed = part.opt_bool("is_error").unwrap_or(false);
+            let markdown = extract_format(&part) == LuaOutputFormat::Markdown;
+            let label = TaskLabel::new(&tool, name.as_deref());
+            if !BackgroundTasks::of(lua).report_part(&home.id, &label, failed, &output, markdown) {
+                return Ok(err_pair(NO_PART_NOW_MSG));
+            }
+            Ok((Some(true), None))
+        });
+
         methods.add_method("backgrounded", |_, this, ()| {
             Ok(this
                 .agent()
@@ -530,18 +556,17 @@ impl UserData for LuaCtx {
                 }
                 let expire = DeadlineExpire::parse(opts.as_ref())?;
                 let handle = active_task(lua);
-                let cell = lock_cell(&handle);
-                if cell.deadline_secs.get().is_some() {
+                let mut cell = lock_cell(&handle);
+                if cell.deadline_secs.is_some() {
                     return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
                 }
                 // Only a model call can move, anything else just times out.
                 if cell.call.is_some() {
-                    cell.deadline_expire.set(expire);
+                    cell.deadline_expire = expire;
                 }
-                cell.deadline_secs.set(Some(secs));
-                cell.deadline
-                    .set(Some(Instant::now() + Duration::from_secs(secs)));
-                cell.deadline_changed.notify(usize::MAX);
+                cell.deadline_secs = Some(secs);
+                cell.deadline = Some(Instant::now() + Duration::from_secs(secs));
+                cell.deadline_changed.send_replace(());
                 Ok((Some(true), None))
             },
         );
@@ -631,6 +656,7 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
@@ -677,7 +703,7 @@ mod tests {
             }),
         );
         ctx.local_tools = Arc::new(tools);
-        ctx.live_sink = Some(flume::unbounded().0);
+        ctx.live_sink = Some(unbounded_channel().0);
         ctx
     }
 

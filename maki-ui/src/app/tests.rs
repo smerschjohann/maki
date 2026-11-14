@@ -9,13 +9,19 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX, L
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{PROMPT_NEEDS, ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
-use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::keybindings::key as kb;
+use crate::components::lua_float::CURSOR_STYLE_NAME;
 use crate::components::messages::{ClickOutcome, ScrollPos};
+use crate::components::permission_prompt::ProjectAnswers;
+use crate::components::plan_form::builtin_menu;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
-use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::components::{
+    BackgroundOutcome, ExitRequest, NoticeDetail, buffer_text, key, test_model,
+};
 use crate::decor_worker;
 use crate::highlight::TAB_SPACES;
+use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::text_buffer::{Decoration, EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR, Mark};
@@ -24,31 +30,34 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
-use maki_agent::permissions::{PermissionAnswer, PermissionManager};
+use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentMode, BackgroundNotice, CallRecord, DoneReason, HistorySnapshot, ImageMediaType,
-    McpConfigErrors, McpPromptArg, McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, RunTotals, SharedBuf, SteerKind, SubagentInbox, TaskLabel, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
+    AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, Cutter, DoneReason, EndReason,
+    HistorySnapshot, ImageMediaType, ImageSource, McpConfigErrors, McpPromptArg, McpPromptInfo,
+    McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, RunTotals, SessionControl,
+    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SteerKind, SubagentInfo, TaskLabel,
+    ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent, result_notice,
 };
-use maki_config::{
-    Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
-};
+use maki_config::project::{self, TrustMode, TrustQuestion, TrustState};
+use maki_config::{Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey, UiConfig};
+use maki_lua::test_support::wait_next;
 use maki_lua::test_support::{
     HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair, keymap_reader_from,
-    probed_event_handle, set_mode,
+    probed_event_handle, runtime, set_mode,
 };
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest, InputRulesReader,
-    InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE,
-    PackCommand, PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
-    SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
+    Border, BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest,
+    InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader,
+    Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
+    PlanActionOutcome, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, UiAction,
+    WinCommand, WinEvent,
 };
+use maki_providers::provider::ProviderStatus;
 use maki_providers::{
-    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskSettled,
-    ThinkingSupport, TokenUsage,
+    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TaskAnswer,
+    TaskSettled, ThinkingSupport, TokenUsage,
 };
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
@@ -59,17 +68,23 @@ use maki_storage::sessions::{
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use std::env;
 use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::runtime::EnterGuard;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{channel, unbounded_channel};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_OUTPUT_CAP: u32 = 8192;
@@ -90,6 +105,7 @@ const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "zai/glm-5";
 const PRIMARY_TEXT: &str = "selected text";
+const CLIPBOARD_TEXT: &str = "copied text";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -130,9 +146,7 @@ const PLAN_MENU_GENERATION: u64 = 7;
 /// or plainly in the past, without any test having to wait for a clock.
 const WAIT_AHEAD: Duration = Duration::from_secs(60);
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
-const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
-const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
-const CURSOR_ON_STYLED_CELL: &str = "the focused input box owns a cell painted as the cursor";
+const CURSOR_ON_INPUT: &str = "the focused input box reports its caret for the cursor";
 const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is a cursor";
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
@@ -186,7 +200,8 @@ fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
             ..Default::default()
         },
         PathBuf::from(PERMISSIONS_CWD),
-        ProjectConfig::for_project(Path::new(PERMISSIONS_CWD)),
+        project::resolve_noninteractive(Path::new(PERMISSIONS_CWD), TrustMode::Session)
+            .project_config,
         Arc::default(),
     ))
 }
@@ -223,7 +238,7 @@ fn build_app_with_session(
 }
 
 fn test_writer(dir: StateDir) -> StorageWriter {
-    StorageWriter::new(dir, flume::unbounded().0)
+    StorageWriter::new(dir, unbounded_channel().0)
 }
 
 /// A synchronous test that spawns tasks or blocks on them the way the UI
@@ -363,7 +378,7 @@ pub(crate) fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
 fn subagent_info_with_tx(
     parent_id: &str,
     name: &str,
-    answer_tx: Option<flume::Sender<String>>,
+    answer_tx: Option<UnboundedSender<String>>,
 ) -> SubagentInfo {
     SubagentInfo {
         parent_tool_use_id: parent_id.into(),
@@ -372,7 +387,7 @@ fn subagent_info_with_tx(
         model: None,
         opts: None,
         answer_tx,
-        inbox: Arc::default(),
+        control: Arc::default(),
         parent_call: None,
     }
 }
@@ -503,6 +518,7 @@ fn a_notice_line_appears_when_the_loop_accepts_it() {
         AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: None,
+            markdown: false,
             end: None,
         },
         app.run_id,
@@ -587,6 +603,7 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
             LiveStep::Accepted(text) => AgentEvent::ObservationLine {
                 text: text.into(),
                 detail: None,
+                markdown: false,
                 end: None,
             },
             LiveStep::Done => done(),
@@ -725,7 +742,7 @@ fn ctrl_c_after_a_copy(between: &[KeyCode]) -> CtrlC {
 #[test_case(AgentEvent::Error { message: "boom".into(), auth: false, totals: RunTotals::default() }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
-    app.exit_on_done = true;
+    app.exit_when_done(None);
     app.status = Status::Streaming;
     app.run_id = 1;
     let actions = app.update(agent_msg(event));
@@ -736,7 +753,7 @@ fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
 #[test]
 fn reset_session_clears_exit_request_source() {
     let mut app = test_app();
-    app.exit_on_done = true;
+    app.exit_when_done(None);
     app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::Done {
@@ -866,7 +883,7 @@ fn paste_normalizes_line_endings(input: &str, expected: &str) {
 fn paste_file_path_triggers_image_load() {
     let mut app = test_app();
     app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
-    assert!(!app.image_paste_rx.is_empty());
+    assert!(!app.paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
@@ -876,7 +893,7 @@ fn paste_loads_every_image_path_in_the_text() {
     app.update(Msg::Paste(
         "file:///tmp/one.png\nnot an image\nfile:///tmp/two.jpg".into(),
     ));
-    assert_eq!(app.image_paste_rx.len(), 2);
+    assert_eq!(app.paste_rx.len(), 2);
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
@@ -884,12 +901,27 @@ fn paste_loads_every_image_path_in_the_text() {
 #[test_case(None,               ""           ; "empty_selection_ignored")]
 fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str) {
     let mut app = test_app();
-    let (tx, rx) = flume::bounded(1);
-    app.primary_paste_rx.push(rx);
+    let (tx, rx) = oneshot::channel();
+    app.mouse_paste_rx.push(rx);
     tx.send(selection.map(String::from)).unwrap();
     assert_eq!(app.tick(), Dirty::YES);
     assert_eq!(app.input_box.buffer.value(), expected);
-    assert!(app.primary_paste_rx.is_empty());
+    assert!(app.mouse_paste_rx.is_empty());
+}
+
+#[test]
+fn clipboard_text_lands_in_input_and_clears_flash() {
+    let mut app = test_app();
+    app.status_bar.flash(READING_CLIPBOARD_MSG.into());
+    let (tx, rx) = oneshot::channel();
+    app.paste_rx.push(rx);
+    assert!(
+        tx.send(Ok(PastedContent::Text(CLIPBOARD_TEXT.into())))
+            .is_ok()
+    );
+    let _ = app.tick();
+    assert_eq!(app.input_box.buffer.value(), CLIPBOARD_TEXT);
+    assert_eq!(app.status_bar.flash_text(), None);
 }
 
 #[test]
@@ -1164,7 +1196,7 @@ fn reset_session_clears_plan() {
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
     app.help_modal.toggle();
-    let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
+    let (_tx, rx) = channel::<BtwEvent>(1);
     app.btw_modal.open("q", rx);
     let actions = app.reset_session();
     assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
@@ -1489,8 +1521,8 @@ fn plan_menu(rows: Vec<maki_lua::PlanFormRow>) -> maki_lua::PlanMenu {
 }
 
 /// Arms the form's answer slot with a wait that has not run out yet.
-fn awaiting_plan_form(app: &mut App) -> flume::Sender<Option<maki_lua::PlanMenu>> {
-    let (tx, rx) = flume::bounded(1);
+fn awaiting_plan_form(app: &mut App) -> oneshot::Sender<Option<maki_lua::PlanMenu>> {
+    let (tx, rx) = oneshot::channel();
     app.plan_answers.form = Some((Instant::now() + WAIT_AHEAD, rx));
     tx
 }
@@ -1562,7 +1594,7 @@ fn a_silent_plan_form_slot_leaves_the_form_closed() {
 #[test]
 fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    let (_tx, rx) = oneshot::channel::<Option<maki_lua::PlanMenu>>();
     app.plan_answers.form = Some((Instant::now() - WAIT_AHEAD, rx));
 
     assert_eq!(app.tick_plan_form(), Dirty::YES);
@@ -1577,8 +1609,8 @@ fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
 fn awaiting_plan_action(
     app: &mut App,
     then: Option<maki_lua::PlanRowAction>,
-) -> flume::Sender<PlanActionOutcome> {
-    let (tx, rx) = flume::bounded(1);
+) -> oneshot::Sender<PlanActionOutcome> {
+    let (tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(PlanAction {
         pick,
@@ -1674,7 +1706,7 @@ fn a_pick_the_host_never_took_is_flashed() {
 #[test]
 fn a_parked_plan_row_handler_gives_up_and_flashes() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded(1);
+    let (_tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     app.plan_answers.action = Some(PlanAction {
         pick,
@@ -1699,7 +1731,7 @@ fn a_parked_plan_row_handler_gives_up_and_flashes() {
 
 /// A pick of a plugin row that kept the implement outcome, stamped with
 /// {pick} so a test can re-arm the same one the user made.
-fn plan_pick_action(pick: u64, answer: flume::Receiver<PlanActionOutcome>) -> PlanAction {
+fn plan_pick_action(pick: u64, answer: oneshot::Receiver<PlanActionOutcome>) -> PlanAction {
     PlanAction {
         pick,
         then: Some(maki_lua::PlanRowAction::Implement),
@@ -1717,9 +1749,10 @@ fn a_stale_pick_answer_cannot_fire_a_second_implement() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
 
     // The user reopens the form and picks a built-in row while the handler is
     // still parked.
@@ -1751,9 +1784,10 @@ fn a_pick_answered_after_a_session_reset_submits_nothing() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
     let before = app.state.session.id;
 
     app.reset_session();
@@ -1789,9 +1823,10 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
     let _menu_tx = awaiting_plan_form(&mut app);
 
     // The session the user switched to is planning too, with a draft of its
@@ -1838,7 +1873,7 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
 #[test]
 fn the_plan_form_fallback_outlasts_the_host_budget() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    let (_tx, rx) = oneshot::channel::<Option<maki_lua::PlanMenu>>();
     // Armed one whole host budget ago, so the chains have just run out of
     // their own time and the answer is still on its way.
     let armed = Instant::now() - PLAN_FORM_SLOT_DEADLINE;
@@ -1862,7 +1897,7 @@ fn the_plan_form_fallback_outlasts_the_host_budget() {
 #[test]
 fn the_plan_action_fallback_outlasts_the_handler_budget() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded(1);
+    let (_tx, rx) = oneshot::channel();
     let pick = app.plan_answers.abandon();
     // Armed one whole handler budget ago, so the handler has just run out of
     // its own time and the answer is still on its way.
@@ -1896,9 +1931,10 @@ fn a_new_draft_flashes_the_pick_it_retires() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = oneshot::channel();
+    let (_parked_tx, parked) = oneshot::channel();
     let pick = app.plan_answers.abandon();
-    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    app.plan_answers.action = Some(plan_pick_action(pick, parked));
 
     app.transition_plan(PlanTrigger::WriteDone);
 
@@ -2119,8 +2155,11 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
 
     assert_eq!(app.state.token_usage.input, 300);
     assert_eq!(app.state.token_usage.output, 125);
-    assert_eq!(app.chats[0].context_size, main_usage.context_tokens());
-    assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
+    assert_eq!(
+        app.chats[0].context_size,
+        main_usage.context_tokens() as u32
+    );
+    assert_eq!(app.chats[1].context_size, sub_usage.context_tokens() as u32);
 }
 
 const SUBAGENT_NAME: &str = "research";
@@ -2641,6 +2680,63 @@ fn tasks_name_the_tool_behind_their_call() {
     assert_eq!(tool(0), None);
     assert_eq!(tool(1), Some(SLOW_TOOL));
     assert_eq!(tool(2), Some(TASK_TOOL));
+}
+
+#[derive(Default)]
+struct WarnCounter(AtomicUsize);
+
+impl Subscriber for WarnCounter {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        *metadata.level() == Level::WARN
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, _: &Event<'_>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
+
+/// A resumed session asks Lua to restore every tool of every chat, and all the
+/// replies come back on one channel. Each must land only in the chat that owns
+/// the tool, or every other chat logs a warning for it.
+#[test]
+fn restore_snapshots_reach_only_their_owning_chat() {
+    const MAIN_TOOL: &str = "main_t1";
+    const SUBAGENT_TOOL: &str = "sub_t1";
+    const PLUGIN_TOOL: &str = "plugin_t1";
+    let mut app = app_with_subagent();
+    app.update(agent_msg(tool_start(MAIN_TOOL, "bash")));
+    app.update(subagent_msg(
+        tool_start(SUBAGENT_TOOL, "bash"),
+        TASK_ID,
+        None,
+    ));
+    plugin_event(&mut app, tool_start(PLUGIN_TOOL, "bash"));
+    let owners = [MAIN_TOOL, SUBAGENT_TOOL, PLUGIN_TOOL];
+    assert_eq!(app.chats.len(), owners.len());
+
+    let restored = |id: &str| format!("restored {id}");
+    let warnings = Arc::new(WarnCounter::default());
+    tracing::subscriber::with_default(Arc::clone(&warnings), || {
+        for id in owners {
+            let event = AgentEvent::ToolHeaderSnapshot {
+                id: id.into(),
+                snapshot: BufferSnapshot::plain_text(restored(id)),
+                theme_gen: Some(theme::generation()),
+            };
+            app.update(agent_msg_with_run_id(event, RESTORE_RUN_ID));
+        }
+    });
+
+    assert_eq!(warnings.0.load(Ordering::Relaxed), 0);
+    for (chat, id) in app.chats.iter().zip(owners) {
+        assert_eq!(chat.last_message_text(), restored(id));
+    }
 }
 
 /// A rewind rebuilds the main chat, not the monitor a plugin runs beside it.
@@ -3195,6 +3291,7 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     assert_owes_one_frame(&mut app, || {
         models.store(Some(Arc::new(ModelList {
             specs: vec![LATE_MODEL_SPEC.into()],
+            providers: HashMap::new(),
             loading: false,
         })));
     });
@@ -3410,39 +3507,29 @@ fn rendered(app: &mut App) -> String {
     buffer_text(&rendered_buffer(app))
 }
 
-/// The event loop parks the terminal cursor on whatever `view` reports, so an
-/// IME anchors its preedit text there. The report has to be the very cell the
-/// input box painted for its software cursor, and the hardware cursor has to
-/// stay hidden: shown, it would invert that cell back to plain text.
+/// The event loop shows the terminal cursor on whatever `view` reports, and
+/// an IME anchors its preedit text there.
 #[test]
-fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
+fn view_reports_the_input_caret_until_an_overlay_takes_the_keyboard() {
     let mut app = test_app();
-    let backend = ratatui::backend::TestBackend::new(80, 24);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    let mut draw = |app: &mut App| {
-        let mut cursor = None;
-        terminal.draw(|frame| cursor = app.view(frame)).unwrap();
-        assert!(
-            !terminal.backend().cursor_visible(),
-            "{CURSOR_STAYS_HIDDEN}"
-        );
-        cursor.map(|pos| {
-            let cell = terminal
-                .backend()
-                .buffer()
-                .cell(pos)
-                .expect(CURSOR_ON_SCREEN);
-            (pos, theme::is_caret_cell(cell))
-        })
-    };
-
-    assert!(
-        matches!(draw(&mut app), Some((_, true))),
-        "{CURSOR_ON_STYLED_CELL}"
-    );
+    assert!(draw_to_buffer(&mut app).0.is_some(), "{CURSOR_ON_INPUT}");
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
-    assert_eq!(draw(&mut app), None, "{OVERLAY_TAKES_THE_CURSOR}");
+    assert_eq!(
+        draw_to_buffer(&mut app).0,
+        None,
+        "{OVERLAY_TAKES_THE_CURSOR}"
+    );
+}
+
+/// Only the chat input stopped painting its caret, so the terminal cursor
+/// shows for it and stays parked under anything else that has the keyboard.
+#[test]
+fn only_the_chat_input_shows_the_terminal_cursor() {
+    let mut app = test_app();
+    assert!(app.shows_terminal_cursor());
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+    assert!(!app.shows_terminal_cursor());
 }
 
 const CARET_FLOAT_MARK: &str = "xqcaret";
@@ -3451,26 +3538,30 @@ const CARET_FLOAT_WIDTH: u16 = 12;
 const CARET_FLOAT_DRAWN: &str = "the caret anchored float has to be on screen";
 const CARET_EXPECTED: &str = "the input box draws a caret with nothing in its way";
 
+fn open_float(app: &mut App, line: SnapshotLine, config: FloatConfig, focus: bool) {
+    let buf = Arc::new(SharedBuf::new());
+    buf.append(line);
+    let (event_tx, _event_rx) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
+    app.float_mgr.open(buf, config, focus, event_tx, cmd_rx);
+}
+
 /// A borderless float for the input caret, holding one line nothing else on
 /// screen says, so a test can find the row it was placed on.
 fn open_caret_float(app: &mut App) {
-    let buf = Arc::new(SharedBuf::new());
-    buf.append(maki_agent::SnapshotLine {
-        spans: vec![maki_agent::SnapshotSpan {
-            text: CARET_FLOAT_MARK.into(),
-            style: maki_agent::SpanStyle::Default,
-        }],
-    });
     let config = FloatConfig {
         width: Dimension::Abs(CARET_FLOAT_WIDTH),
         height: Dimension::Abs(CARET_FLOAT_HEIGHT),
         anchor: maki_lua::Anchor::InputCaret,
-        border: maki_lua::Border::None,
+        border: Border::None,
         ..FloatConfig::default()
     };
-    let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
-    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+    open_float(
+        app,
+        SnapshotLine::plain(CARET_FLOAT_MARK.into()),
+        config,
+        true,
+    );
 }
 
 fn draw_sized(app: &mut App, width: u16, height: u16) -> (Option<Position>, Buffer) {
@@ -3537,6 +3628,458 @@ fn a_caret_anchored_float_falls_back_when_the_input_box_is_off_screen() {
     let (cursor, row) = draw_caret_float(&mut app);
     assert_eq!(cursor, None, "{OVERLAY_TAKES_THE_CURSOR}");
     assert_eq!(row, (TEST_AREA.height - CARET_FLOAT_HEIGHT) / 2);
+}
+
+const IME_TEXT: &str = "a漢b";
+/// Matches no theme, so no key previews one: a preview calls `theme::set`, which is
+/// process-global.
+const IME_UNMATCHED_THEME_TEXT: &str = "漢b";
+const IME_FLOAT_PREFIX: &str = "a漢";
+const IME_CARET_STYLE_REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
+const IME_PICKER_SYMBOL: &str = "b";
+const IME_PROMPT_TEXT: &str = "xyz";
+const IME_PROMPT_SYMBOL: &str = "z";
+const IME_FLOAT_SYMBOL: &str = "f";
+const IME_POPUP_TEXT: &str = "popup";
+const IME_LOGIN_QUERY: &str = "custom";
+const IME_PROMPT_ID: &str = "perm-ime";
+const IME_TOOL: &str = "bash";
+const IME_MODAL_TEXT: &str = "q";
+const IME_NARROW_WIDTH: u16 = 40;
+const IME_NARROW_PROMPT_WIDTH: u16 = 60;
+const IME_SPACED_WORD: &str = "word ";
+const IME_WIDE_CHAR: &str = "漢";
+const IME_REASON_WORDS: usize = 40;
+const IME_SPACE: &str = " ";
+const IME_DENY_KEY: char = 'n';
+const IME_WRAP_BOUNDARY_WIDTH: u16 = 60;
+const IME_BOUNDARY_HEAD: &str = "xxxxx";
+const IME_BOUNDARY_TAIL: char = 'y';
+const IME_BOUNDARY_TAIL_LEN: usize = 30;
+const IME_PICKER_NEVER_SHOWED: &str = "the file picker never became visible";
+const IME_SCOPE: &str = "execute";
+const IME_SCOPE_WORD: &str = "wrapping ";
+const IME_WRAPPED_SCOPE_WORDS: usize = 30;
+const IME_FIELD_DRAWN: &str = "an open text field has to report where it painted its caret";
+const IME_CELL_IS_CARET: &str = "the reported cell has to hold the caret the field painted";
+const IME_FIELD_OVERFLOWS: &str = "a field wider than its row reports no caret";
+const IME_KEYS_OWNER: &str = "the cursor parks on the field the keys reach";
+const IME_FLOAT_WIDTH: u16 = 20;
+const IME_FLOAT_HEIGHT: u16 = 3;
+
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+}
+
+fn press(app: &mut App, code: KeyCode) {
+    app.update(Msg::Key(key(code)));
+}
+
+fn type_ime_text(app: &mut App) {
+    type_text(app, IME_TEXT);
+    press(app, KeyCode::Left);
+}
+
+fn picker_cursor() -> Style {
+    crate::theme::current().cursor
+}
+
+fn open_search_field(app: &mut App) -> Style {
+    open_search(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_painted_file_picker(app: &mut App) {
+    open_file_picker(app);
+    let deadline = Instant::now() + WALK_TIMEOUT;
+    while !app.file_picker.is_visible() {
+        assert!(Instant::now() < deadline, "{IME_PICKER_NEVER_SHOWED}");
+        let _ = app.tick();
+        std::thread::yield_now();
+    }
+}
+
+fn open_file_picker_field(app: &mut App) -> Style {
+    open_painted_file_picker(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_model_picker(app: &mut App) {
+    app.run_builtin(BuiltinAction::ModelPicker);
+}
+
+fn open_list_picker_field(app: &mut App) -> Style {
+    open_model_picker(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_rewind_field(app: &mut App) -> Style {
+    open_rewind(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+/// Types [`IME_UNMATCHED_THEME_TEXT`], so no key previews a theme.
+fn open_theme_field(app: &mut App) -> Style {
+    open_theme(app);
+    type_text(app, IME_UNMATCHED_THEME_TEXT);
+    press(app, KeyCode::Left);
+    picker_cursor()
+}
+
+fn open_mcp_field(app: &mut App) -> Style {
+    open_mcp(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_login_list_field(app: &mut App) -> Style {
+    open_login_provider_list(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_login_name_step(app: &mut App) {
+    open_login_provider_list(app);
+    type_text(app, IME_LOGIN_QUERY);
+    press(app, KeyCode::Enter);
+}
+
+fn open_login_text_field(app: &mut App) -> Style {
+    open_login_name_step(app);
+    type_ime_text(app);
+    picker_cursor()
+}
+
+fn open_deny_prompt(app: &mut App, scope: &str) {
+    app.permission_prompt.push(
+        IME_PROMPT_ID.into(),
+        ToolKey::native(IME_TOOL),
+        vec![scope.into()],
+        None,
+        ProjectAnswers::Saved,
+        None,
+    );
+    press(app, KeyCode::Char(IME_DENY_KEY));
+}
+
+fn open_deny_field_with(app: &mut App, scope: &str, text: &str) -> Style {
+    open_deny_prompt(app, scope);
+    type_text(app, text);
+    press(app, KeyCode::Left);
+    IME_CARET_STYLE_REVERSED
+}
+
+fn open_deny_field(app: &mut App) -> Style {
+    open_deny_field_with(app, IME_SCOPE, IME_TEXT)
+}
+
+fn open_deny_field_under_a_wrapped_scope(app: &mut App) -> Style {
+    let scope = IME_SCOPE_WORD.repeat(IME_WRAPPED_SCOPE_WORDS);
+    open_deny_field_with(app, &scope, IME_TEXT)
+}
+
+fn paints_style(cell: &Cell, style: Style) -> bool {
+    style.fg.is_none_or(|fg| cell.fg == fg)
+        && style.bg.is_none_or(|bg| cell.bg == bg)
+        && cell.modifier.contains(style.add_modifier)
+}
+
+/// The preedit lands on the terminal cursor, so the reported cell has to be the
+/// one the field painted its caret in, past a wide char, and not a guess at it.
+#[test_case(open_search_field as fn(&mut App) -> Style ; "search")]
+#[test_case(open_file_picker_field as fn(&mut App) -> Style ; "file_picker")]
+#[test_case(open_list_picker_field as fn(&mut App) -> Style ; "list_picker")]
+#[test_case(open_rewind_field as fn(&mut App) -> Style ; "rewind_picker")]
+#[test_case(open_theme_field as fn(&mut App) -> Style ; "theme_picker")]
+#[test_case(open_mcp_field as fn(&mut App) -> Style ; "mcp_picker")]
+#[test_case(open_login_list_field as fn(&mut App) -> Style ; "login_list_step")]
+#[test_case(open_login_text_field as fn(&mut App) -> Style ; "login_text_step")]
+#[test_case(open_deny_field as fn(&mut App) -> Style ; "permission_deny_field")]
+#[test_case(open_deny_field_under_a_wrapped_scope as fn(&mut App) -> Style ; "permission_deny_field_under_a_wrapped_line")]
+fn an_overlay_text_field_parks_the_cursor_on_its_caret(open: fn(&mut App) -> Style) {
+    let mut app = test_app();
+    let caret_style = open(&mut app);
+
+    let (cursor, buffer) = draw_to_buffer(&mut app);
+    let cell = buffer
+        .cell(cursor.expect(IME_FIELD_DRAWN))
+        .expect(IME_FIELD_DRAWN);
+    assert_eq!(cell.symbol(), IME_PICKER_SYMBOL, "{IME_CELL_IS_CARET}");
+    assert!(paints_style(cell, caret_style), "{IME_CELL_IS_CARET}");
+}
+
+const ZONE_FIELD_UNSELECTABLE: &str = "a picker's field has to sit in a selectable overlay zone";
+
+/// The mouse selects a picker's text through the overlay zone, which is the
+/// rect the picker hands back from its `view`.
+#[test_case(open_search_field as fn(&mut App) -> Style ; "search")]
+#[test_case(open_file_picker_field as fn(&mut App) -> Style ; "file_picker")]
+#[test_case(open_list_picker_field as fn(&mut App) -> Style ; "list_picker")]
+#[test_case(open_rewind_field as fn(&mut App) -> Style ; "rewind_picker")]
+#[test_case(open_theme_field as fn(&mut App) -> Style ; "theme_picker")]
+#[test_case(open_mcp_field as fn(&mut App) -> Style ; "mcp_picker")]
+#[test_case(open_login_list_field as fn(&mut App) -> Style ; "login_list_step")]
+fn an_open_pickers_field_sits_in_its_overlay_zone(open: fn(&mut App) -> Style) {
+    let mut app = test_app();
+    open(&mut app);
+
+    let caret = draw_to_buffer(&mut app).0.expect(IME_FIELD_DRAWN);
+
+    let zone = app.zone_at(caret.y, caret.x).map(|zone| zone.zone);
+    assert_eq!(
+        zone,
+        Some(SelectionZone::Overlay),
+        "{ZONE_FIELD_UNSELECTABLE}"
+    );
+}
+
+const ZONE_FOLLOWS_THE_TOP_PICKER: &str =
+    "the overlay zone follows the picker painted on top, not the one holding the keys";
+
+/// The search holds the keys over the model picker, which is painted over it.
+#[test]
+fn the_overlay_zone_follows_the_picker_painted_on_top() {
+    let zone_at_the_model_field = |with_search: bool| {
+        let mut app = test_app();
+        open_list_picker_field(&mut app);
+        let field = draw_to_buffer(&mut app).0.expect(IME_FIELD_DRAWN);
+        if with_search {
+            open_search(&mut app);
+            draw_to_buffer(&mut app);
+        }
+        app.zone_at(field.y, field.x)
+            .map(|zone| (zone.zone, zone.area))
+    };
+
+    let alone = zone_at_the_model_field(false);
+    assert_eq!(
+        alone.map(|(zone, _)| zone),
+        Some(SelectionZone::Overlay),
+        "{ZONE_FIELD_UNSELECTABLE}"
+    );
+    assert_eq!(
+        zone_at_the_model_field(true),
+        alone,
+        "{ZONE_FOLLOWS_THE_TOP_PICKER}"
+    );
+}
+
+#[test]
+fn a_login_field_pushed_out_of_its_modal_reports_no_caret() {
+    let mut app = test_app();
+    open_login_text_field(&mut app);
+
+    assert_eq!(
+        draw_sized(&mut app, IME_NARROW_WIDTH, TEST_AREA.height).0,
+        None,
+        "{IME_FIELD_OVERFLOWS}"
+    );
+}
+
+#[test]
+fn an_empty_deny_field_parks_the_cursor_on_the_head_of_its_guidance_in_a_narrow_terminal() {
+    let mut app = test_app();
+    open_deny_field_with(&mut app, IME_SCOPE, "");
+
+    let (cursor, buffer) = draw_sized(&mut app, IME_NARROW_PROMPT_WIDTH, TEST_AREA.height);
+    let cell = buffer
+        .cell(cursor.expect(IME_FIELD_DRAWN))
+        .expect(IME_FIELD_DRAWN);
+    assert_eq!(
+        cell.symbol(),
+        &DEFAULT_DENY_GUIDANCE[..1],
+        "{IME_CELL_IS_CARET}"
+    );
+    assert!(
+        paints_style(cell, IME_CARET_STYLE_REVERSED),
+        "{IME_CELL_IS_CARET}"
+    );
+}
+
+/// The caret is placeable while it is on the field's first row, wherever the
+/// rest of the reason wraps to.
+#[test_case(IME_SPACED_WORD, true => Some("w".to_string()) ; "spaced_reason_with_the_caret_on_the_first_row")]
+#[test_case(IME_SPACED_WORD, false => None ; "spaced_reason_with_the_caret_at_the_wrapped_end")]
+#[test_case(IME_WIDE_CHAR, true => None ; "space_free_reason_wider_than_the_row")]
+fn a_long_deny_reason_parks_the_cursor_only_on_its_first_row(
+    word: &str,
+    home: bool,
+) -> Option<String> {
+    let mut app = test_app();
+    open_deny_prompt(&mut app, IME_SCOPE);
+    type_text(&mut app, &word.repeat(IME_REASON_WORDS));
+    if home {
+        press(&mut app, KeyCode::Home);
+    }
+
+    let (cursor, buffer) = draw_to_buffer(&mut app);
+    cursor.map(|pos| {
+        buffer
+            .cell(pos)
+            .expect(IME_FIELD_DRAWN)
+            .symbol()
+            .to_string()
+    })
+}
+
+/// ratatui drops a space that falls on a soft wrap, so there is no cell to
+/// park on.
+#[test]
+fn a_caret_on_a_space_dropped_at_the_soft_wrap_reports_no_caret() {
+    let mut app = test_app();
+    open_login_name_step(&mut app);
+    type_text(&mut app, IME_BOUNDARY_HEAD);
+    type_text(&mut app, IME_SPACE);
+    type_text(
+        &mut app,
+        &IME_BOUNDARY_TAIL.to_string().repeat(IME_BOUNDARY_TAIL_LEN),
+    );
+    press(&mut app, KeyCode::Home);
+    for _ in IME_BOUNDARY_HEAD.chars() {
+        press(&mut app, KeyCode::Right);
+    }
+
+    assert_eq!(
+        draw_sized(&mut app, IME_WRAP_BOUNDARY_WIDTH, TEST_AREA.height).0,
+        None,
+        "{IME_FIELD_OVERFLOWS}"
+    );
+}
+
+fn open_cursor_float(app: &mut App) {
+    let line = SnapshotLine {
+        spans: [
+            (IME_FLOAT_PREFIX, SpanStyle::Default),
+            (IME_FLOAT_SYMBOL, SpanStyle::Named(CURSOR_STYLE_NAME.into())),
+        ]
+        .map(|(text, style)| SnapshotSpan {
+            text: text.into(),
+            style,
+        })
+        .into(),
+    };
+    let config = FloatConfig {
+        width: Dimension::Abs(IME_FLOAT_WIDTH),
+        height: Dimension::Abs(IME_FLOAT_HEIGHT),
+        border: Border::None,
+        ..FloatConfig::default()
+    };
+    open_float(app, line, config, true);
+}
+
+/// Keys go to the first open picker in `KeyboardOwner` order, whichever one is
+/// painted on top.
+#[test]
+fn with_two_pickers_open_the_cursor_parks_on_the_first_ones_field() {
+    let caret_with = |open: fn(&mut App)| {
+        let mut app = test_app();
+        open(&mut app);
+        draw_to_buffer(&mut app).0.expect(IME_FIELD_DRAWN)
+    };
+    let search_alone = caret_with(|app| _ = open_search_field(app));
+    let model_alone = caret_with(|app| _ = open_list_picker_field(app));
+    let both = caret_with(|app| {
+        open_list_picker_field(app);
+        open_search_field(app);
+    });
+
+    assert_ne!(search_alone, model_alone, "{IME_KEYS_OWNER}");
+    assert_eq!(both, search_alone, "{IME_KEYS_OWNER}");
+}
+
+fn open_typed_deny_prompt(app: &mut App) {
+    open_deny_field_with(app, IME_SCOPE, IME_PROMPT_TEXT);
+}
+
+fn open_unfocused_popup(app: &mut App) {
+    let config = FloatConfig {
+        width: Dimension::Abs(IME_FLOAT_WIDTH),
+        height: Dimension::Abs(IME_FLOAT_HEIGHT),
+        border: Border::None,
+        ..FloatConfig::default()
+    };
+    open_float(
+        app,
+        SnapshotLine::plain(IME_POPUP_TEXT.into()),
+        config,
+        false,
+    );
+}
+
+fn open_usage(app: &mut App) {
+    app.usage_modal.toggle();
+}
+
+fn open_btw(app: &mut App) {
+    let (_tx, rx) = channel::<BtwEvent>(1);
+    app.btw_modal.open(IME_MODAL_TEXT, rx);
+}
+
+fn open_pack_review(app: &mut App) {
+    app.pack_review
+        .open(IME_MODAL_TEXT.into(), PackPlan::default());
+}
+
+/// The first holder of the keyboard, in `KeyboardOwner` order, has the cursor,
+/// whatever the paint order is. The symbol under the cursor names whose caret
+/// it is.
+#[test_case(open_cursor_float as fn(&mut App), IME_FLOAT_SYMBOL ; "focused_float")]
+#[test_case(|app: &mut App| { open_list_picker_field(app); open_unfocused_popup(app); }, IME_PICKER_SYMBOL ; "unfocused_popup_leaves_the_picker")]
+#[test_case(|app: &mut App| { open_list_picker_field(app); open_cursor_float(app); }, IME_FLOAT_SYMBOL ; "focused_float_beats_a_picker")]
+#[test_case(|app: &mut App| { open_list_picker_field(app); open_typed_deny_prompt(app); }, IME_PROMPT_SYMBOL ; "deny_field_beats_a_picker")]
+#[test_case(|app: &mut App| { open_search_field(app); focus_queue(app); }, IME_PICKER_SYMBOL ; "search_beats_the_queue")]
+fn the_cursor_parks_on_the_field_the_keys_reach(setup: fn(&mut App), expected: &str) {
+    let mut app = test_app();
+    setup(&mut app);
+
+    let (cursor, buffer) = draw_to_buffer(&mut app);
+    let cell = buffer
+        .cell(cursor.expect(IME_FIELD_DRAWN))
+        .expect(IME_FIELD_DRAWN);
+    assert_eq!(cell.symbol(), expected, "{IME_KEYS_OWNER}");
+}
+
+/// An owner with no field of its own leaves no caret, not even the one of the
+/// picker it keeps the keys from. The file picker counts here until its first
+/// walk shows it.
+#[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::Permission ; "permission_without_the_deny_field")]
+#[test_case(KeyboardOwner::PackReview ; "pack_review")]
+#[test_case(KeyboardOwner::PlanForm ; "plan_form")]
+#[test_case(KeyboardOwner::Help ; "help")]
+#[test_case(KeyboardOwner::Usage ; "usage")]
+#[test_case(KeyboardOwner::Btw ; "btw")]
+#[test_case(KeyboardOwner::FilePicker ; "unpainted_file_picker")]
+#[test_case(KeyboardOwner::Queue ; "queue")]
+fn an_owner_without_a_field_over_a_picker_reports_no_caret(owner: KeyboardOwner) {
+    let mut app = test_app();
+    open_list_picker_field(&mut app);
+    open_owner(&mut app, owner);
+
+    assert_eq!(
+        draw_to_buffer(&mut app).0,
+        None,
+        "{IME_KEYS_OWNER}: {owner:?}"
+    );
+}
+
+/// The focused queue answers the keys, so the input box under it is not
+/// where anyone types: no caret is reported for it.
+#[test]
+fn a_focused_queue_takes_the_caret_from_the_input_box() {
+    let mut app = test_app();
+    focus_queue(&mut app);
+
+    assert_eq!(draw_to_buffer(&mut app).0, None, "{IME_KEYS_OWNER}");
+
+    app.queue.unfocus();
+    assert!(draw_to_buffer(&mut app).0.is_some(), "{CARET_EXPECTED}");
 }
 
 /// A plugin slices `text` with the Lua string library, which counts bytes, so
@@ -3718,7 +4261,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
 
@@ -3846,8 +4389,8 @@ fn open_overlay_motion_reaches_app_cadence() {
     let mut app = app_without_splash();
     assert_eq!(app.cadence(), Cadence::IDLE);
 
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = unbounded_channel::<maki_lua::WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<maki_lua::WinCommand>();
     app.float_mgr.open(
         Arc::new(maki_agent::SharedBuf::new()),
         maki_lua::FloatConfig::default(),
@@ -4314,51 +4857,6 @@ fn help_modal_consumes_keys_and_esc_closes() {
     assert!(!app.help_modal.is_open());
 }
 
-#[test_case(
-    |_: &mut App| {},
-    &[KeybindContext::General, KeybindContext::Editing],
-    &[KeybindContext::Streaming]
-    ; "idle"
-)]
-#[test_case(
-    |app: &mut App| { app.status = Status::Streaming; },
-    &[KeybindContext::General, KeybindContext::Streaming, KeybindContext::Editing],
-    &[]
-    ; "streaming"
-)]
-#[test_case(
-    |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
-    &[KeybindContext::FormInput],
-    &[KeybindContext::Editing]
-    ; "plan_form"
-)]
-#[test_case(
-    |app: &mut App| { app.status = Status::Streaming; app.run_id = 1; app.queue_and_notify(queued_msg("q")); app.queue.set_focus_at(0); },
-    &[KeybindContext::QueueFocus],
-    &[KeybindContext::Editing]
-    ; "queue_focus"
-)]
-#[test_case(
-    |app: &mut App| {
-        app.state.session_mut().push_message(Message::user("test".into()));
-        app.open_rewind_picker();
-    },
-    &[KeybindContext::RewindPicker],
-    &[KeybindContext::Editing]
-    ; "rewind_picker"
-)]
-fn active_contexts(setup: fn(&mut App), expected: &[KeybindContext], absent: &[KeybindContext]) {
-    let mut app = test_app();
-    setup(&mut app);
-    let contexts = app.active_keybind_contexts();
-    for ctx in expected {
-        assert!(contexts.contains(ctx), "{ctx:?} should be present");
-    }
-    for ctx in absent {
-        assert!(!contexts.contains(ctx), "{ctx:?} should be absent");
-    }
-}
-
 #[test]
 fn submit_exit_quits() {
     let mut app = test_app();
@@ -4434,10 +4932,10 @@ fn checkpoint_persists_observations_without_using_them_as_title() {
 
 fn drain_writer(app: App, writer: Arc<StorageWriter>) {
     drop(app);
-    let unsaved = Arc::try_unwrap(writer)
+    let writer = Arc::try_unwrap(writer)
         .ok()
-        .expect("app must hold the only other writer reference")
-        .shutdown(WRITER_DRAIN_TIMEOUT);
+        .expect("app must hold the only other writer reference");
+    let unsaved = runtime().block_on(writer.shutdown(WRITER_DRAIN_TIMEOUT));
     assert!(unsaved.is_empty(), "{ALL_LANDED}");
 }
 
@@ -4484,7 +4982,7 @@ const STORED_RECEIPT_ID: &str = "toolu_stored";
 const RECEIPTS_KEPT: &str = "a checkpoint must never erase receipts it cannot read";
 
 /// What the agent hands the app, see `AgentHandles::apply_to_app`.
-fn hold_mailbox(app: &mut App) -> SessionMailbox {
+pub(crate) fn hold_mailbox(app: &mut App) -> SessionMailbox {
     let mailbox = SessionMailbox::register(app.state.session.id);
     app.mailbox = Some(mailbox.clone());
     mailbox
@@ -4506,6 +5004,29 @@ fn checkpoint_keeps_pending_background(held: bool, expected: &[&str]) {
         app.state.session.meta.pending_background, expected,
         "{RECEIPTS_KEPT}"
     );
+}
+
+/// Between a result settling and its run starting, the session must still look
+/// busy, or the turn would notify just before the agent works again. Whatever
+/// holds the wake back leaves Maki waiting on the user, except queued input,
+/// which runs on its own and takes the notices with it.
+#[test_case(|_| {}, true, true ; "wake_starts_a_run")]
+#[test_case(|app| app.queue_compact(None), true, false ; "queued_input_runs_first")]
+#[test_case(|app| app.recoverable_queue = vec![RECOVERED_PROMPT.into()], false, false ; "recovery_text_holds_the_wake")]
+#[test_case(|app| app.exit_request = ExitRequest::Error, false, false ; "failed_exit_holds_the_wake")]
+#[test_case(|app| app.chats[MAIN_CHAT].auth_parked = true, false, false ; "prompt_holds_the_wake")]
+fn a_pending_wake_is_work_only_while_it_may_run(
+    hold: fn(&mut App),
+    working: bool,
+    starts_run: bool,
+) {
+    let mut app = test_app();
+    hold_mailbox(&mut app);
+    SessionMailbox::notify(app.state.session.id, NOTICE_LINE.into(), None, true).unwrap();
+    hold(&mut app);
+
+    assert_eq!(app.is_working(), working);
+    assert_eq!(!app.start_woken_run().is_empty(), starts_run);
 }
 
 /// Receipts the stored session left unanswered come back as lost notices,
@@ -4547,12 +5068,10 @@ fn yolo_toggle() {
     assert!(!app.permissions.is_yolo());
     app.execute_command(cmd("/yolo"), 0);
     assert!(app.permissions.is_yolo());
-    let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.contains("enabled"), "flash={flash:?}");
+    assert_eq!(app.status_bar.flash_text().unwrap(), YOLO_ON_MSG);
     app.execute_command(cmd("/yolo"), 0);
     assert!(!app.permissions.is_yolo());
-    let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.contains("disabled"), "flash={flash:?}");
+    assert_eq!(app.status_bar.flash_text().unwrap(), YOLO_OFF_MSG);
 }
 
 /// The toggle is session state like mode and thinking, so a checkpoint has to
@@ -5100,23 +5619,39 @@ fn rewind_recomputes_context_size(measured: u32, floor: u32) {
 
 /// Left at the pre-compaction value, a session compacted just before exit
 /// compacts itself again on resume.
-#[test]
-fn compaction_lowers_the_stored_context_size() {
+#[test_case(false ; "manual")]
+#[test_case(true ; "automatic")]
+fn compaction_feedback_stays_out_of_history_and_updates_context(automatic: bool) {
     const AFTER: u32 = SMALL_HISTORY;
     let mut app = test_app();
     app.run_id = 1;
     app.state.context_size = MEASURED_CONTEXT;
     app.chats[0].context_size = MEASURED_CONTEXT;
+    let history = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    if automatic {
+        app.update(agent_msg(AgentEvent::AutoCompacting {
+            context_size: MEASURED_CONTEXT,
+            context_window: app.state.model.context_window,
+        }));
+    }
+    app.update(agent_msg(AgentEvent::CompactionStarted));
+    assert_eq!(app.chats[0].message_count(), 1);
 
     app.update(agent_msg(AgentEvent::CompactionDone {
         context_size_before: MEASURED_CONTEXT,
         context_size_after: AFTER,
         context_window: 0,
         summary: String::new(),
+        duration_ms: 0,
     }));
+    app.checkpoint();
 
     assert_eq!(app.state.context_size, AFTER);
     assert_eq!(app.chats[0].context_size, AFTER);
+    assert_eq!(app.state.session.meta.context_size, AFTER);
+    assert_eq!(app.chats[0].message_count(), 2);
+    assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Notice));
+    assert_eq!(app.state.session.messages(), history.as_slice());
 }
 
 #[test]
@@ -5216,7 +5751,7 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     app.answer_tx = Some(tx);
 
     app.update(agent_msg(AgentEvent::AuthRequired));
@@ -5228,9 +5763,9 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     assert_eq!(rx.try_recv().unwrap(), "");
 }
 
-fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Receiver<String>) {
-    let (sub_tx, sub_rx) = flume::unbounded();
-    let (main_tx, main_rx) = flume::unbounded();
+fn app_with_subagent_tx(id: &str) -> (App, UnboundedReceiver<String>, UnboundedReceiver<String>) {
+    let (sub_tx, sub_rx) = unbounded_channel();
+    let (main_tx, main_rx) = unbounded_channel();
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -5252,8 +5787,8 @@ fn allow_once(ask_id: &str) -> String {
 /// or that tool call waits forever.
 #[test]
 fn concurrent_subagent_permission_requests_are_each_answered() {
-    let (first_tx, first_rx) = flume::unbounded();
-    let (second_tx, second_rx) = flume::unbounded();
+    let (first_tx, mut first_rx) = unbounded_channel();
+    let (second_tx, mut second_rx) = unbounded_channel();
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -5299,7 +5834,7 @@ fn auth_required_in_subagent_shows_in_both_chats() {
 
 #[test]
 fn auth_retry_in_subagent_routes_to_subagent_channel() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+    let (mut app, mut sub_rx, mut main_rx) = app_with_subagent_tx("sub1");
     app.update(subagent_msg(
         AgentEvent::AuthRequired,
         "sub1",
@@ -5315,7 +5850,7 @@ fn auth_retry_in_subagent_routes_to_subagent_channel() {
 
 #[test]
 fn cancel_clears_subagent_auth_retry() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx("sub1");
+    let (mut app, mut sub_rx, _main_rx) = app_with_subagent_tx("sub1");
     app.update(subagent_msg(
         AgentEvent::AuthRequired,
         "sub1",
@@ -5406,6 +5941,32 @@ fn search_reaches_output_that_lands_while_the_modal_is_open(status: Status) {
     );
 }
 
+const SEARCH_PASTE_TEXT: &str = "zzarrived";
+const PASTE_REFRESHES_THE_MATCHES: &str = "a pasted query has to find its match like a typed one";
+
+#[test]
+fn a_pasted_search_query_finds_its_match() {
+    let mut app = test_app();
+    app.active_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        SEARCH_PASTE_TEXT.into(),
+    ));
+    rendered(&mut app);
+    open_search(&mut app);
+
+    app.update(Msg::Paste(SEARCH_PASTE_TEXT.into()));
+
+    assert!(
+        app.search_modal.current_segment_index().is_some(),
+        "{PASTE_REFRESHES_THE_MATCHES}"
+    );
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "{PASTE_BELONGS_TO_THE_OVERLAY}"
+    );
+}
+
 #[test_case(ScrollPos { seg: 4, row: 2 }, false ; "restores_scroll_position")]
 #[test_case(ScrollPos::default(),          true  ; "restores_auto_scroll")]
 fn search_escape_restores_scroll(scroll: ScrollPos, auto_scroll: bool) {
@@ -5464,10 +6025,7 @@ fn mcp_toggle_dispatches_action() {
     ; "consumed_by_plan_form"
 )]
 #[test_case(
-    |app: &mut App| {
-        app.state.session_mut().push_message(Message::user("test".into()));
-        app.open_rewind_picker();
-    },
+    open_rewind,
     ""
     ; "routed_to_open_picker"
 )]
@@ -5527,10 +6085,7 @@ fn btw_empty_flashes_error() {
         0,
     );
     assert!(actions.is_empty());
-    assert_eq!(
-        app.status_bar.flash_text().unwrap(),
-        "Usage: /btw <question>"
-    );
+    assert_eq!(app.status_bar.flash_text().unwrap(), BTW_USAGE_MSG);
 }
 
 #[test]
@@ -5550,14 +6105,14 @@ fn btw_with_question_returns_action() {
 #[test]
 fn btw_modal_key_routing_and_animation() {
     let mut app = test_app();
-    let (tx, rx) = flume::bounded(1);
+    let (tx, rx) = channel(1);
     app.btw_modal.open("test", rx);
 
     // A pending stream is data, drained by `poll`. Only the typewriter
     // revealing the answer moves on its own.
     assert!(app.btw_modal.is_streaming());
     assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
-    tx.send(BtwEvent::TextDelta("hi".into())).unwrap();
+    tx.try_send(BtwEvent::TextDelta("hi".into())).unwrap();
     assert_eq!(app.btw_modal.poll(), Dirty::YES);
     assert_eq!(app.btw_modal.cadence(), Cadence::SMOOTH);
 
@@ -6088,6 +6643,69 @@ fn ctrl_t_noop_when_plan_not_ready() {
     assert!(!app.plan_form.is_visible());
 }
 
+const TAB_TOOK_THE_OWNER_BELOW: &str =
+    "Tab passes through the plan form to whatever answers it below the form";
+const TAB_LEFT_THE_MODE_ALONE: &str = "a Tab the focused window took does not toggle the plan mode";
+const PALETTE_QUERY: &str = "/n";
+const TAB_REACHED_THE_PALETTE: &str =
+    "Tab belongs to the owner below the plan form, not to the command palette under it";
+
+/// The plan form is non-modal and lets only Tab through, to the owner under
+/// it. When that is the chat, its palette for a `/` command hidden behind the
+/// form stays out of it.
+#[test]
+fn tab_passes_through_the_plan_form_to_the_chat() {
+    let mut app = test_app();
+    type_text(&mut app, PALETTE_QUERY);
+    assert!(palette_open(&mut app));
+    open_plan_form(&mut app);
+
+    press(&mut app, KeyCode::Tab);
+
+    assert_eq!(app.state.mode, Mode::Build, "{TAB_TOOK_THE_OWNER_BELOW}");
+    assert_eq!(
+        app.input_box.buffer.value(),
+        PALETTE_QUERY,
+        "{TAB_REACHED_THE_PALETTE}"
+    );
+}
+
+/// A Tab that skipped to the chat would complete `/n` in the input. The mode
+/// stays Plan either way, so the test asserts the input.
+#[test_case(open_help as fn(&mut App) ; "help_modal")]
+#[test_case(open_usage                ; "usage_modal")]
+#[test_case(open_btw                  ; "btw_modal")]
+#[test_case(open_search               ; "search_modal")]
+#[test_case(focus_queue               ; "queue_focus")]
+#[test_case(open_model_picker         ; "model_picker")]
+fn tab_through_the_plan_form_never_reaches_the_palette_behind_an_owner(below: fn(&mut App)) {
+    let mut app = test_app();
+    type_text(&mut app, PALETTE_QUERY);
+    assert!(palette_open(&mut app));
+    below(&mut app);
+    open_plan_form(&mut app);
+
+    press(&mut app, KeyCode::Tab);
+
+    assert_eq!(
+        app.input_box.buffer.value(),
+        PALETTE_QUERY,
+        "{TAB_REACHED_THE_PALETTE}"
+    );
+}
+
+#[test]
+fn tab_passes_through_the_plan_form_to_a_focused_window() {
+    let mut app = test_app();
+    let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    open_plan_form(&mut app);
+
+    press(&mut app, KeyCode::Tab);
+
+    assert!(took_a_key(&mut events), "{TAB_TOOK_THE_OWNER_BELOW}");
+    assert_eq!(app.state.mode, Mode::Plan, "{TAB_LEFT_THE_MODE_ALONE}");
+}
+
 fn probe_events(app: &mut App) -> RequestProbe {
     let (handle, probe) = probed_event_handle();
     app.lua_event_handle = handle;
@@ -6324,10 +6942,10 @@ fn assert_unsent(app: &App, actions: &[Action], left: &str) {
 }
 
 /// Streams a turn on {app}, and returns where its answers to the agent go.
-fn answer_channel(app: &mut App) -> flume::Receiver<String> {
+fn answer_channel(app: &mut App) -> UnboundedReceiver<String> {
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (answer_tx, answer_rx) = flume::unbounded();
+    let (answer_tx, answer_rx) = unbounded_channel();
     app.answer_tx = Some(answer_tx);
     answer_rx
 }
@@ -6339,6 +6957,23 @@ fn ask_permission(app: &mut App) {
         scopes: vec!["ls".into()],
         reason: None,
     }));
+}
+
+const ASK_REASON: &str = "plugin wants a human to look";
+
+#[test]
+fn permission_request_reason_reaches_the_prompt() {
+    let mut app = test_app();
+    let _answers = answer_channel(&mut app);
+    app.update(agent_msg(AgentEvent::PermissionRequest {
+        id: FIRST_ASK.into(),
+        tool: ToolKey::native("bash"),
+        scopes: vec!["ls".into()],
+        reason: Some(ASK_REASON.into()),
+    }));
+
+    assert!(app.permission_prompt.is_asking(FIRST_ASK));
+    assert!(rendered(&mut app).contains(ASK_REASON));
 }
 
 fn open_plan_form(app: &mut App) {
@@ -6417,8 +7052,8 @@ fn held_keys_follow_a_window_the_handler_opened_over_a_prompt() {
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, "x");
-    let (event_tx, events) = flume::unbounded();
-    let (_cmd_tx, cmd_rx) = flume::unbounded();
+    let (event_tx, mut events) = unbounded_channel();
+    let (_cmd_tx, cmd_rx) = unbounded_channel();
     app.float_mgr.open(
         Arc::new(SharedBuf::new()),
         FloatConfig::default(),
@@ -6428,7 +7063,7 @@ fn held_keys_follow_a_window_the_handler_opened_over_a_prompt() {
     );
     app.keybind_done(tab.id());
 
-    assert!(took_a_key(&events), "the held key reached the window");
+    assert!(took_a_key(&mut events), "the held key reached the window");
     assert_ne!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
 }
 
@@ -6590,15 +7225,15 @@ end)
 #[test]
 fn a_normal_mode_key_never_types_through_its_fallback() {
     let host = granted_host(MODE_FLIPPING_LOGGER, &["session_read"]);
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('n'),
         KeyModifiers::ALT,
     )));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
 
     app.update(Msg::Key(key(KeyCode::Char('a'))));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
 
     assert_eq!(app.input_box.buffer.value(), "");
 }
@@ -6652,9 +7287,9 @@ fn open_window(
     buf: &Arc<SharedBuf>,
     focus: bool,
     zindex: u16,
-) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
-    let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
-    let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+) -> (UnboundedReceiver<WinEvent>, UnboundedSender<WinCommand>) {
+    let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     let config = FloatConfig {
         zindex,
         ..FloatConfig::default()
@@ -6672,12 +7307,12 @@ fn open_window(
 fn windows_close_when_their_session_leaves_the_tab() {
     let mut app = test_app();
     let buf = Arc::new(SharedBuf::new());
-    let (events, _cmd_tx) = open_window(&mut app, &buf, false, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &buf, false, WINDOW_Z);
 
     app.reset_session();
 
     assert!(!app.float_mgr.is_open());
-    assert!(events.try_iter().any(|ev| matches!(ev, WinEvent::Close)));
+    assert!(iter::from_fn(|| events.try_recv().ok()).any(|ev| matches!(ev, WinEvent::Close)));
 }
 
 fn owner(probe: &RequestProbe) -> Option<String> {
@@ -6730,7 +7365,7 @@ fn a_key_goes_to_the_first_binding_in_resolution_order(bound: &[&str]) -> Option
 fn a_focused_windows_binding_beats_its_recv_and_falls_back_to_it() {
     let mut app = test_app();
     let buf = Arc::new(SharedBuf::new());
-    let (events, _cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
     let probe = bind_all(
         &mut app,
         plugin_key(KeyCode::Enter, KeyModifiers::NONE),
@@ -6744,12 +7379,12 @@ fn a_focused_windows_binding_beats_its_recv_and_falls_back_to_it() {
     let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
     assert_eq!(ticket.plugin().as_ref(), FOCUSED_PLUGIN);
     assert!(
-        !took_a_key(&events),
+        !took_a_key(&mut events),
         "the binding took it before the window"
     );
 
     app.keybind_fallback(ticket.id());
-    assert!(took_a_key(&events), "the window got the key back");
+    assert!(took_a_key(&mut events), "the window got the key back");
 }
 
 /// A picker's `<CR>` selects and closes. The close comes over the window's
@@ -6760,7 +7395,7 @@ fn keys_held_behind_a_window_that_closed_itself_reach_the_chat_input() {
     const TYPED: &str = "hi";
     let mut app = test_app();
     let buf = Arc::new(SharedBuf::new());
-    let (events, cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let (mut events, cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
     let probe = bind_all(
         &mut app,
         plugin_key(KeyCode::Enter, KeyModifiers::NONE),
@@ -6773,7 +7408,7 @@ fn keys_held_behind_a_window_that_closed_itself_reach_the_chat_input() {
     cmd_tx.send(WinCommand::Close).unwrap();
     app.keybind_done(ticket.id());
 
-    assert!(!took_a_key(&events));
+    assert!(!took_a_key(&mut events));
     assert_eq!(app.input_box.buffer.value(), TYPED);
 }
 
@@ -6934,11 +7569,11 @@ fn an_enter_behind_a_fallback_sends() {
 fn fallback_is_dropped_once_the_keyboard_moved() {
     let (mut app, probe) = app_binding(KeyCode::Char('a'));
     let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
-    let (events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
 
     app.keybind_fallback(pressed.id());
 
-    assert!(!took_a_key(&events));
+    assert!(!took_a_key(&mut events));
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
@@ -6986,12 +7621,12 @@ fn a_primary_paste_waits_behind_held_keys(paste_bound: bool) {
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, TYPED);
-    let (tx, rx) = flume::bounded(1);
-    app.primary_paste_rx.push(rx);
+    let (tx, rx) = oneshot::channel();
+    app.mouse_paste_rx.push(rx);
     tx.send(Some(PRIMARY_TEXT.into())).unwrap();
     // The poll alone, since a full tick lets a hold older than the slow
     // handler warning go, which a loaded machine can reach.
-    let _ = app.poll_primary_paste();
+    let _ = app.poll_mouse_paste();
     assert_eq!(app.input_box.buffer.value(), "");
     assert!(
         probe.try_recv_ticket().is_none(),
@@ -7018,7 +7653,7 @@ fn open_permission_prompt(app: &mut App) {
         ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
 }
@@ -7027,21 +7662,94 @@ fn open_alert(app: &mut App) {
     app.open_alert("alert".into());
 }
 
-/// A modal owns the keyboard, so a paste it has no field for goes nowhere:
-/// not into the chat input under it, nor to a global `<Paste>` binding.
-#[test_case(open_permission_prompt as fn(&mut App) ; "permission_prompt")]
+const FIELD_PASTE: &str = "zzfield";
+const PASTE_BELONGS_TO_THE_OVERLAY: &str =
+    "an overlay that owns the keyboard keeps its pastes out of the chat input";
+const PASTE_SHOWN_IN_THE_FIELD: &str = "the pasted text has to show in the field the keys reach";
+
+/// A `<Paste>` binding of every mode, which any paste that falls through an
+/// overlay would reach.
+fn app_with_a_paste_binding() -> (App, RequestProbe) {
+    let mut app = test_app();
+    let probe = install_binding(&mut app, EVERY_MODE, PASTE);
+    (app, probe)
+}
+
+/// The holder of the keyboard drops a paste it has no field for: it goes
+/// neither into the chat input under it nor to a global `<Paste>` binding.
+#[test_case(open_permission_prompt as fn(&mut App) ; "permission_prompt_without_the_deny_field")]
 #[test_case(open_alert                             ; "alert_modal")]
 #[test_case(open_help                              ; "help_modal")]
 #[test_case(focus_queue                            ; "queue_focus")]
-fn a_modal_drops_a_paste_it_has_no_field_for(open: fn(&mut App)) {
-    let mut app = test_app();
-    let probe = install_binding(&mut app, INSERT, PASTE);
+#[test_case(open_pack_review                       ; "pack_review")]
+#[test_case(open_plan_form                         ; "plan_form")]
+#[test_case(open_usage                             ; "usage_modal")]
+#[test_case(open_btw                               ; "btw_modal")]
+fn an_owner_without_a_field_drops_a_paste(open: fn(&mut App)) {
+    let (mut app, probe) = app_with_a_paste_binding();
     open(&mut app);
 
     app.update(Msg::Paste(PASTED.into()));
 
-    assert!(probe.try_recv_ticket().is_none());
-    assert_eq!(app.input_box.buffer.value(), "");
+    assert!(
+        probe.try_recv_ticket().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "{PASTE_BELONGS_TO_THE_OVERLAY}"
+    );
+}
+
+fn open_rewind(app: &mut App) {
+    app.state
+        .session_mut()
+        .push_message(Message::user("test".into()));
+    app.open_rewind_picker();
+}
+
+fn open_theme(app: &mut App) {
+    app.execute_command(cmd("/theme"), 0);
+}
+
+fn open_mcp(app: &mut App) {
+    app.execute_command(cmd("/mcp"), 0);
+}
+
+/// A paste lands in the field the keys reach, and in nothing under it.
+#[test_case(open_search as fn(&mut App)         ; "search")]
+#[test_case(open_painted_file_picker            ; "file_picker")]
+#[test_case(open_rewind                         ; "rewind_picker")]
+#[test_case(open_theme                          ; "theme_picker")]
+#[test_case(open_model_picker                   ; "model_picker")]
+#[test_case(open_mcp                            ; "mcp_picker")]
+#[test_case(open_login_provider_list            ; "login_list_step")]
+#[test_case(open_login_name_step                ; "login_text_step")]
+#[test_case(|app: &mut App| open_deny_prompt(app, IME_SCOPE) ; "permission_deny_field")]
+fn a_paste_lands_in_the_field_the_keys_reach(open: fn(&mut App)) {
+    let (mut app, probe) = app_with_a_paste_binding();
+    open(&mut app);
+
+    app.update(Msg::Paste(FIELD_PASTE.into()));
+
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "{PASTE_BELONGS_TO_THE_OVERLAY}"
+    );
+    assert!(
+        probe.try_recv_ticket().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    assert!(
+        rendered(&mut app).contains(FIELD_PASTE),
+        "{PASTE_SHOWN_IN_THE_FIELD}"
+    );
+}
+
+fn open_login_provider_list(app: &mut App) {
+    app.login_picker.open(app.storage.clone());
 }
 
 const TABBED_PASTE: &str = "a\tb\r\nc";
@@ -7057,7 +7765,7 @@ const TABBED_PASTE_LF: &str = "a\tb\nc";
 fn a_window_paste_is_cleaned_only_for_a_binding(focus: bool, bound: bool) {
     let mut app = test_app();
     let buf = Arc::new(SharedBuf::new());
-    let (events, _cmd_tx) = open_window(&mut app, &buf, focus, WINDOW_Z);
+    let (mut events, _cmd_tx) = open_window(&mut app, &buf, focus, WINDOW_Z);
     let binds = [(FOCUSED_PLUGIN, EVERY_MODE, Some(&buf))];
     let probe = bind_all(&mut app, PASTE, if bound { &binds } else { &[] });
 
@@ -7065,7 +7773,7 @@ fn a_window_paste_is_cleaned_only_for_a_binding(focus: bool, bound: bool) {
 
     let pasted = match probe.try_recv_ticket() {
         Some(ticket) => ticket.text().map(str::to_owned),
-        None => events.drain().find_map(|e| match e {
+        None => iter::from_fn(|| events.try_recv().ok()).find_map(|e| match e {
             WinEvent::Paste { text } => Some(text),
             _ => None,
         }),
@@ -7102,15 +7810,15 @@ fn new_host() -> PluginHost {
 }
 
 /// Wires {host} into a fresh app the way the event loop does.
-fn hosted_app(host: &PluginHost) -> (App, flume::Receiver<UiAction>) {
+fn hosted_app(host: &PluginHost) -> (App, UnboundedReceiver<UiAction>) {
     let mut app = test_app();
     app.keymap_reader = host.keymap_reader();
     app.lua_event_handle = host.event_handle();
-    (app, host.ui_action_rx())
+    (app, host.take_ui_action_rx().unwrap())
 }
 
 /// A host running {source} as {plugin}, and a fresh app wired to it.
-fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, flume::Receiver<UiAction>) {
+fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, UnboundedReceiver<UiAction>) {
     let host = new_host();
     host.load_source(plugin, source).unwrap();
     let (app, ui) = hosted_app(&host);
@@ -7120,10 +7828,13 @@ fn plugin_app(plugin: &str, source: &str) -> (PluginHost, App, flume::Receiver<U
 /// Plays the event loop for one key handler until it reports done. Returns
 /// what it asked for, in order, with the text of each flash, and the actions
 /// its fallback and built-in actions made.
-fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>, Vec<Action>) {
+fn serve_handler(
+    app: &mut App,
+    ui: &mut UnboundedReceiver<UiAction>,
+) -> (Vec<String>, Vec<Action>) {
     let (mut asked, mut actions) = (Vec::new(), Vec::new());
     loop {
-        match ui.recv_timeout(HANDLER_TIMEOUT).expect(HANDLER_NEVER_DONE) {
+        match wait_next(ui, HANDLER_TIMEOUT).expect(HANDLER_NEVER_DONE) {
             UiAction::Input {
                 req: InputRequest::Read,
                 reply_tx,
@@ -7172,16 +7883,16 @@ fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>,
 
 #[test]
 fn backslash_enter_works_as_a_plugin_built_on_fallback() {
-    let (_host, mut app, ui) = plugin_app("continuation", CONTINUATION_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app("continuation", CONTINUATION_PLUGIN);
 
     type_keys(&mut app, "a\\");
     app.update(Msg::Key(key(KeyCode::Enter)));
     type_keys(&mut app, "b");
-    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_EDIT]);
     assert_eq!(app.input_box.buffer.value(), "a\nb");
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    let (asked, actions) = serve_handler(&mut app, &ui);
+    let (asked, actions) = serve_handler(&mut app, &mut ui);
     assert_eq!(asked, [ASKED_FALLBACK]);
     assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "a\nb"));
 }
@@ -7229,11 +7940,11 @@ fn granted_host(source: &str, grants: &[&str]) -> PluginHost {
 #[test_case(EDITING_ENTER_PLUGIN, &["input", "agent", "session_read", "session_write"], "hi!", false ; "edited_sends_nothing")]
 fn a_fallback_enter_sends(source: &str, grants: &[&str], text: &str, sends: bool) {
     let host = granted_host(source, grants);
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
 
     type_keys(&mut app, "hi");
     app.update(Msg::Key(key(KeyCode::Enter)));
-    let (_, actions) = serve_handler(&mut app, &ui);
+    let (_, actions) = serve_handler(&mut app, &mut ui);
     if sends {
         assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == text));
     } else {
@@ -7269,11 +7980,11 @@ fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
     flash: Option<&str>,
 ) {
     let host = granted_host(source, grants);
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
 
     type_keys(&mut app, "hix");
     app.update(Msg::Key(key(KeyCode::Enter)));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
 
     assert_eq!(app.input_box.buffer.value(), left);
     assert_eq!(app.status_bar.flash_text(), flash);
@@ -7299,11 +8010,11 @@ end)
 /// queue.
 #[test]
 fn a_handler_edits_then_submits_like_a_typed_enter() {
-    let (_host, mut app, ui) = plugin_app("shout", SUBMIT_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app("shout", SUBMIT_PLUGIN);
 
     type_keys(&mut app, "hi");
     app.update(Msg::Key(key(KeyCode::Enter)));
-    let (asked, actions) = serve_handler(&mut app, &ui);
+    let (asked, actions) = serve_handler(&mut app, &mut ui);
     let [edit, refusal] = &asked[..] else {
         panic!("{asked:?}");
     };
@@ -7314,7 +8025,7 @@ fn a_handler_edits_then_submits_like_a_typed_enter() {
 
     type_keys(&mut app, "more");
     app.update(Msg::Key(key(KeyCode::Enter)));
-    let (_, actions) = serve_handler(&mut app, &ui);
+    let (_, actions) = serve_handler(&mut app, &mut ui);
     assert!(!actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
     assert_eq!(app.queue.text_messages(), ["more!"]);
 
@@ -7893,13 +8604,13 @@ fn an_edit_without_a_manifest_says_where_to_grant_input() {
     let host = new_host();
     host.load_source_with_permissions(USER_CONFIG, NO_GRANTS_EDIT, PluginPermissions::denied())
         .unwrap();
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
 
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('x'),
         KeyModifiers::CONTROL,
     )));
-    let asked = serve_handler(&mut app, &ui).0;
+    let asked = serve_handler(&mut app, &mut ui).0;
     let [refusal] = &asked[..] else {
         panic!("the edit never reached the UI, only the flash did: {asked:?}");
     };
@@ -7928,12 +8639,12 @@ const DECORATE_NEVER_CAME: &str = "the plugin never pushed its marks";
 const UNLOAD_NEVER_CAME: &str = "the UI never heard of the unload";
 
 /// Plays the event loop until the plugin pushes marks, and answers them.
-fn serve_decorate(app: &mut App, ui: &flume::Receiver<UiAction>) -> serde_json::Value {
+fn serve_decorate(app: &mut App, ui: &mut UnboundedReceiver<UiAction>) -> serde_json::Value {
     loop {
         if let UiAction::Input {
             req: InputRequest::Decorate(req),
             reply_tx,
-        } = ui.recv_timeout(HANDLER_TIMEOUT).expect(DECORATE_NEVER_CAME)
+        } = wait_next(ui, HANDLER_TIMEOUT).expect(DECORATE_NEVER_CAME)
         {
             let reply = app.decorate_input(req);
             let _ = reply_tx.send(reply.clone());
@@ -7954,25 +8665,25 @@ fn assert_one_ghost_after(app: &mut App, typed: &str) {
 /// drops a point mark.
 #[test]
 fn ghost_text_follows_typing_and_leaves_with_its_plugin() {
-    let (host, mut app, ui) = plugin_app(GHOST_PLUGIN_NAME, GHOST_PLUGIN);
+    let (host, mut app, mut ui) = plugin_app(GHOST_PLUGIN_NAME, GHOST_PLUGIN);
 
     type_keys(&mut app, "ab");
     let _ = app.tick();
     type_keys(&mut app, "c");
-    let reply = serve_decorate(&mut app, &ui);
+    let reply = serve_decorate(&mut app, &mut ui);
     assert_eq!(reply["version"], app.input_box.buffer.version());
     assert_one_ghost_after(&mut app, "abc");
 
     type_keys(&mut app, "d");
     assert_one_ghost_after(&mut app, "abcd");
     let _ = app.tick();
-    serve_decorate(&mut app, &ui);
+    serve_decorate(&mut app, &mut ui);
     assert_one_ghost_after(&mut app, "abcd");
 
     host.unload(GHOST_PLUGIN_NAME).unwrap();
     loop {
         if let UiAction::PluginUnloaded(plugin) =
-            ui.recv_timeout(HANDLER_TIMEOUT).expect(UNLOAD_NEVER_CAME)
+            wait_next(&mut ui, HANDLER_TIMEOUT).expect(UNLOAD_NEVER_CAME)
         {
             app.clear_plugin_marks(&plugin);
             break;
@@ -8002,11 +8713,11 @@ const PASTE_CHIP: &str = "see [3 lines]";
 /// show the raw lines shows the chip instead.
 #[test]
 fn a_collapsed_paste_shows_its_chip_in_the_first_frame() {
-    let (_host, mut app, ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
     type_keys(&mut app, "see ");
 
     app.update(Msg::Paste(PASTED_LINES.into()));
-    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_EDIT]);
     let screen = rendered(&mut app);
     assert!(screen.contains(PASTE_CHIP), "{screen}");
     assert!(!screen.contains(PASTED_WORD), "{screen}");
@@ -8017,12 +8728,12 @@ fn a_collapsed_paste_shows_its_chip_in_the_first_frame() {
 /// paste and never the user's text after it.
 #[test]
 fn a_paste_chip_counted_over_ev_text_covers_exactly_the_paste() {
-    let (_host, mut app, ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app(COLLAPSE_PLUGIN_NAME, COLLAPSED_PASTE_PLUGIN);
     let typed = "see ";
     type_keys(&mut app, typed);
 
     app.update(Msg::Paste(TABBED_PASTE.into()));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
     let landed = format!("a{TAB_SPACES}b\nc");
     let buffer = &app.input_box.buffer;
     assert_eq!(buffer.value(), format!("{typed}{landed}"));
@@ -8062,7 +8773,7 @@ const BURST_EDIT_THEN_RAISE: &str = r#"
 #[test_case("ev.fallback()", "x" ; "falls_back")]
 #[test_case("", "" ; "spends_the_key")]
 fn a_burst_through_slow_handlers_lands_in_order(body: &str, bound_lands_as: &str) {
-    let (_host, mut app, ui) = plugin_app(
+    let (_host, mut app, mut ui) = plugin_app(
         BURST_PLUGIN,
         &format!(r#"maki.keymap.set("i", "{BURST_BOUND}", function(ev) {body} end)"#),
     );
@@ -8070,7 +8781,7 @@ fn a_burst_through_slow_handlers_lands_in_order(body: &str, bound_lands_as: &str
 
     type_keys(&mut app, &typed);
     for _ in typed.matches(BURST_BOUND) {
-        serve_handler(&mut app, &ui);
+        serve_handler(&mut app, &mut ui);
     }
     type_keys(&mut app, "z");
 
@@ -8093,7 +8804,7 @@ fn a_handler_edits_and_falls_back_before_the_keys_behind_it(
     left: &str,
 ) {
     const TYPED_BEHIND: &str = "next";
-    let (_host, mut app, ui) = plugin_app(
+    let (_host, mut app, mut ui) = plugin_app(
         "shout",
         &format!(
             r#"
@@ -8114,7 +8825,7 @@ fn a_handler_edits_and_falls_back_before_the_keys_behind_it(
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     type_keys(&mut app, TYPED_BEHIND);
-    let (asked, actions) = serve_handler(&mut app, &ui);
+    let (asked, actions) = serve_handler(&mut app, &mut ui);
 
     assert_eq!(asked, [ASKED_EDIT, EDITED_FLASH, ASKED_FALLBACK]);
     let sends: Vec<_> = actions
@@ -8176,7 +8887,7 @@ const BOLD_WORD: &str = "bold";
 /// keystroke, and one undo takes the wrap back with the selection it had.
 #[test]
 fn ctrl_b_wraps_the_selection_in_one_step() {
-    let (_host, mut app, ui) = plugin_app("bold", BOLD_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app("bold", BOLD_PLUGIN);
     type_keys(&mut app, UNBOLDED);
     for _ in 0..BOLD_WORD.len() {
         app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)));
@@ -8187,7 +8898,7 @@ fn ctrl_b_wraps_the_selection_in_one_step() {
         KeyCode::Char('b'),
         KeyModifiers::CONTROL,
     )));
-    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_EDIT]);
     assert_eq!(app.input_box.buffer.value(), BOLDED);
     assert_eq!(app.input_box.buffer.version(), version + 1);
     assert_eq!(
@@ -8230,11 +8941,11 @@ end)
 #[test_case("2",   &["input", "session_read"], DRAFT     ; "a_selection_made_with_input")]
 fn a_fallback_lands_where_the_user_typed(anchor: &str, grants: &[&str], left: &str) {
     let host = granted_host(&steering_bang(anchor), grants);
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
     type_keys(&mut app, DRAFT);
 
     app.update(Msg::Key(key(KeyCode::Char('!'))));
-    serve_handler(&mut app, &ui);
+    serve_handler(&mut app, &mut ui);
 
     assert_eq!(app.input_box.buffer.value(), left);
 }
@@ -8266,7 +8977,7 @@ fn an_action_writes_the_input_with_its_price_alone() {
     let host = new_host();
     host.load_source(PRICED_OWNER, BANG_ACTION).unwrap();
     host.load_source(USER_CONFIG, BANG_CALLER).unwrap();
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
     type_keys(&mut app, DRAFT);
 
     app.update(Msg::Key(KeyEvent::new(
@@ -8274,7 +8985,7 @@ fn an_action_writes_the_input_with_its_price_alone() {
         KeyModifiers::CONTROL,
     )));
 
-    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT, "true"]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_EDIT, "true"]);
     assert_eq!(app.input_box.buffer.value(), format!("!{DRAFT}"));
     assert_eq!(
         press_enter(&mut app).err(),
@@ -8308,16 +9019,14 @@ const POPUP_NEVER_SHOWN: &str = "the completion popup never came up";
 
 /// Plays the event loop until the completion popup is on screen with its
 /// rows, which it shows only after painting them.
-fn serve_until_popup(ui: &flume::Receiver<UiAction>) -> flume::Receiver<WinCommand> {
+fn serve_until_popup(ui: &mut UnboundedReceiver<UiAction>) -> UnboundedReceiver<WinCommand> {
     loop {
-        match ui.recv_timeout(HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN) {
+        match wait_next(ui, HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN) {
             UiAction::Session { reply_tx, .. } => {
                 let _ = reply_tx.send(Ok(serde_json::json!({ "cwd": "/" })));
             }
-            UiAction::OpenWin { cmd_rx, .. } => loop {
-                let cmd = cmd_rx
-                    .recv_timeout(HANDLER_TIMEOUT)
-                    .expect(POPUP_NEVER_SHOWN);
+            UiAction::OpenWin { mut cmd_rx, .. } => loop {
+                let cmd = wait_next(&mut cmd_rx, HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN);
                 if matches!(cmd, WinCommand::SetVisible(true)) {
                     return cmd_rx;
                 }
@@ -8351,21 +9060,21 @@ fn tab_composed_in_init_lua_accepts_a_completion_or_falls_back(
         PluginPermissions::from_approved(grants.iter().copied()),
     )
     .unwrap();
-    let (mut app, ui) = hosted_app(&host);
+    let (mut app, mut ui) = hosted_app(&host);
 
     type_keys(&mut app, "$re");
     let _ = app.tick();
-    let _popup = serve_until_popup(&ui);
+    let _popup = serve_until_popup(&mut ui);
     let mode = app.state.mode;
     app.update(Msg::Key(key(KeyCode::Tab)));
-    let asked = serve_handler(&mut app, &ui).0;
+    let asked = serve_handler(&mut app, &mut ui).0;
 
     match missing {
         None => {
             assert_eq!(asked, [ASKED_EDIT]);
             assert_eq!(app.input_box.buffer.value(), "$review ");
             app.update(Msg::Key(key(KeyCode::Tab)));
-            assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_FALLBACK]);
+            assert_eq!(serve_handler(&mut app, &mut ui).0, [ASKED_FALLBACK]);
             press_enter(&mut app).unwrap();
         }
         Some(perm) => {
@@ -8387,16 +9096,16 @@ end)
 
 #[test]
 fn a_builtin_action_answers_the_handler_in_normal_mode() {
-    let (_host, mut app, ui) = plugin_app("vim", UNDO_PLUGIN);
+    let (_host, mut app, mut ui) = plugin_app("vim", UNDO_PLUGIN);
     type_keys(&mut app, "ab");
     set_mode(&app.keymap_reader, InputMode::Normal);
 
     app.update(Msg::Key(key(KeyCode::Char('u'))));
-    assert_eq!(serve_handler(&mut app, &ui).0, ["true"]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, ["true"]);
     assert_eq!(app.input_box.buffer.value(), "");
 
     app.update(Msg::Key(key(KeyCode::Char('u'))));
-    assert_eq!(serve_handler(&mut app, &ui).0, ["false"]);
+    assert_eq!(serve_handler(&mut app, &mut ui).0, ["false"]);
 }
 
 #[test]
@@ -8581,8 +9290,8 @@ fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: K
     app.input_box.set_input(HIDDEN_DRAFT);
     app.input_box.buffer.move_to_end();
     let mode = app.state.mode;
-    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    let (event_tx, mut event_rx) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     app.float_mgr.open(
         Arc::new(SharedBuf::new()),
         FloatConfig::default(),
@@ -8597,7 +9306,7 @@ fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: K
     assert_eq!(app.input_box.buffer.value(), HIDDEN_DRAFT);
     assert_eq!(app.state.mode, mode);
     assert!(
-        !event_rx.drain().any(|e| matches!(e, WinEvent::Key { .. })),
+        !iter::from_fn(|| event_rx.try_recv().ok()).any(|e| matches!(e, WinEvent::Key { .. })),
         "a key no notation names has no event to send"
     );
 }
@@ -8614,9 +9323,9 @@ const CLAIM_NOT_DELIVERED: &str = "the popup must not be handed a key it never c
 fn open_claiming_popup_keys(
     app: &mut App,
     keys: &[(KeyCode, KeyModifiers)],
-) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
-    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-    let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+) -> (UnboundedReceiver<WinEvent>, UnboundedSender<WinCommand>) {
+    let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     let config = FloatConfig {
         keys: keys.iter().map(|(c, m)| plugin_key(*c, *m)).collect(),
         ..FloatConfig::default()
@@ -8631,12 +9340,12 @@ fn open_claiming_popup(
     app: &mut App,
     key: KeyCode,
     modifiers: KeyModifiers,
-) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
+) -> (UnboundedReceiver<WinEvent>, UnboundedSender<WinCommand>) {
     open_claiming_popup_keys(app, &[(key, modifiers)])
 }
 
-fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
-    events.drain().any(|e| matches!(e, WinEvent::Key { .. }))
+fn took_a_key(events: &mut UnboundedReceiver<WinEvent>) -> bool {
+    iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e, WinEvent::Key { .. }))
 }
 
 /// The gap every layer, scope and priority rule existed to close: a popup the
@@ -8646,14 +9355,14 @@ fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
 fn a_key_an_unfocused_popup_claimed_never_reaches_the_chat_input() {
     const TYPED: char = '@';
     let mut app = test_app();
-    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let (mut events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
     app.update(Msg::Key(key(KeyCode::Char(TYPED))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
 
     assert!(actions.is_empty(), "no turn was sent");
     assert_eq!(app.input_box.buffer.value(), TYPED.to_string());
-    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert!(took_a_key(&mut events), "{CLAIM_DELIVERED}");
 }
 
 /// Everything the popup did not claim is still the chat input's, which is the
@@ -8662,12 +9371,12 @@ fn a_key_an_unfocused_popup_claimed_never_reaches_the_chat_input() {
 fn a_key_no_popup_claimed_still_reaches_the_chat_input() {
     const TYPED: char = 'a';
     let mut app = test_app();
-    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let (mut events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
     app.update(Msg::Key(key(KeyCode::Char(TYPED))));
 
     assert_eq!(app.input_box.buffer.value(), TYPED.to_string());
-    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    assert!(!took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
 }
 
 /// A claim is not a priority. The popup is up while the user works under it,
@@ -8682,7 +9391,7 @@ fn a_modal_opened_over_a_popup_outranks_the_keys_it_claimed() {
         (KeyCode::Enter, KeyModifiers::NONE),
         (KeyCode::Esc, KeyModifiers::NONE),
     ];
-    let (events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
+    let (mut events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
 
     app.update(Msg::Key(kb::FILE_PICKER.to_key_event()));
     assert!(
@@ -8691,11 +9400,11 @@ fn a_modal_opened_over_a_popup_outranks_the_keys_it_claimed() {
     );
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    assert!(!took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
 
     app.file_picker.close();
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert!(took_a_key(&mut events), "{CLAIM_DELIVERED}");
 }
 
 /// The command palette is one of those overlays, so it is answered with the
@@ -8710,7 +9419,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
         (KeyCode::Enter, KeyModifiers::NONE),
         (KeyCode::Tab, KeyModifiers::NONE),
     ];
-    let (events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
+    let (mut events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
 
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
@@ -8727,7 +9436,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
         matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()),
         "Enter ran the command the user was typing"
     );
-    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    assert!(!took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
 }
 
 /// What bounds a claim, and why there is nothing to release: the list lives on
@@ -8802,12 +9511,12 @@ fn a_popup_claiming_esc_closes_before_the_streaming_cancel_is_armed() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let (mut events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
     assert!(actions.is_empty(), "the popup took the Esc");
-    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert!(took_a_key(&mut events), "{CLAIM_DELIVERED}");
     assert_eq!(app.status, Status::Streaming);
     assert!(
         app.last_esc.is_none(),
@@ -8965,7 +9674,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
 
@@ -9822,7 +10531,7 @@ fn ctrl_c_denies_permission_prompt() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
     assert!(app.permission_prompt.is_open());
@@ -9850,8 +10559,8 @@ fn open_split_window(app: &mut App, dir: maki_lua::Split) {
         split: dir,
         ..maki_lua::FloatConfig::default()
     };
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = unbounded_channel::<maki_lua::WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<maki_lua::WinCommand>();
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
 }
 
@@ -9863,8 +10572,8 @@ fn attention_float_marks_app_as_awaiting_input_until_close() {
         needs_input: true,
         ..maki_lua::FloatConfig::default()
     };
-    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
-    let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let (event_tx, _event_rx) = unbounded_channel::<maki_lua::WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<maki_lua::WinCommand>();
 
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
     assert!(app.awaiting_input());
@@ -9907,8 +10616,8 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
         needs_input: true,
         ..FloatConfig::default()
     };
-    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    let (event_tx, mut event_rx) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
     app.float_mgr
         .open(Arc::new(SharedBuf::new()), config, true, event_tx, cmd_rx);
 
@@ -9957,8 +10666,7 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
 
     app.update(Msg::Key(key(KeyCode::Char('j'))));
     assert!(
-        event_rx
-            .try_iter()
+        iter::from_fn(|| event_rx.try_recv().ok())
             .any(|event| matches!(event, WinEvent::Key { key } if key == plugin_key(KeyCode::Char('j'), KeyModifiers::NONE)))
     );
     assert!(app.input_box.is_empty());
@@ -10042,7 +10750,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         maki_config::ToolKey::native("bash"),
         vec!["ls".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
 
@@ -10126,11 +10834,11 @@ fn stop_in_its_tab(app: &mut App) {
 fn an_ended_task_lets_go_of_its_answer_sender(setup: fn(&mut App), end: fn(&mut App)) {
     let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     setup(&mut app);
-    assert!(!sub_rx.is_disconnected());
+    assert!(!sub_rx.is_closed());
 
     end(&mut app);
 
-    assert!(sub_rx.is_disconnected());
+    assert!(sub_rx.is_closed());
 }
 
 #[test]
@@ -10179,12 +10887,12 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert!(!app.chats[0].is_finished());
 }
 
-/// A subagent whose session handed the UI its inbox, the way `sess:prompt`
+/// A subagent whose session handed the UI its control, the way `sess:prompt`
 /// does through `SubagentInfo`, with that chat in front.
-fn app_with_subagent_inbox() -> (App, Arc<SubagentInbox>) {
+fn app_with_subagent_inbox() -> (App, Arc<SessionControl>) {
     let app = app_with_active_subagent();
-    let inbox = Arc::clone(app.chats[1].inbox.as_ref().expect("a subagent's inbox"));
-    (app, inbox)
+    let control = Arc::clone(app.chats[1].control.as_ref().expect("a subagent's control"));
+    (app, control)
 }
 
 /// A message typed in a running subagent's chat is for that subagent: it
@@ -10281,13 +10989,30 @@ fn finished_subagent_reports_undelivered_messages() {
     let (mut app, inbox) = app_with_subagent_inbox();
     type_and_submit(&mut app, "a");
     finish_subagent_task(&mut app, false);
-    assert!(app.chats[1].inbox.is_none());
+    assert!(app.chats[1].control.is_none());
     assert_eq!(inbox.len(), 1);
     let notice = app.chats[1]
         .message_at(app.chats[1].message_count() - 2)
         .unwrap();
     assert_eq!(notice.text, format!("1{INBOX_DROPPED_SUFFIX}"));
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+/// A session that ended before its chat heard refuses what is typed there,
+/// and the reason flashes instead of the message vanishing.
+#[test]
+fn ended_subagent_refuses_typed_message_with_its_reason() {
+    let reason = EndReason::Stopped(Cutter::Parent);
+    let (mut app, control) = app_with_subagent_inbox();
+    control.end(reason);
+
+    type_and_submit(&mut app, "q");
+
+    assert!(control.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(format!("{}{reason}", queue::SUBAGENT_REFUSED_PREFIX).as_str())
+    );
 }
 
 /// A finished subagent's chat is a transcript: no box to type into, and
@@ -10391,6 +11116,7 @@ fn turn_response_normalizes_text_and_truncates_unicode() {
             ContentBlock::Thinking {
                 thinking: "ignored".into(),
                 signature: None,
+                reasoning_id: None,
             },
             ContentBlock::Text { text: long },
         ],
@@ -10454,7 +11180,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
     assert_eq!(
@@ -10470,7 +11196,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         maki_config::ToolKey::Wildcard,
         vec![],
         None,
-        true,
+        ProjectAnswers::Saved,
         None,
     );
     assert_eq!(
@@ -10618,7 +11344,7 @@ fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
         .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
         .unwrap();
     let probe = probe_events(&mut app);
-    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
+    app.restore_event_tx = Some(maki_agent::EventSender::new(unbounded_channel().0, 0));
 
     load_session(&mut app, stored.id, &test_model());
 
@@ -10638,7 +11364,7 @@ fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
     let mut app = test_app();
     let previous = app.state.session.id;
     let probe = probe_events(&mut app);
-    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
+    app.restore_event_tx = Some(maki_agent::EventSender::new(unbounded_channel().0, 0));
     let (_, items) = crate::chat::history_to_display(
         &[
             tool_use_msg(SUB_TOOL_ID),
@@ -11153,6 +11879,11 @@ fn turn_end_keeps_every_subagent_tab_in_the_meta() {
     assert_eq!(ids, [FINISHED_TASK_ID, UNFINISHED_TASK_ID, LATER_TASK_ID]);
 }
 
+/// The question a start in `project` would pose, with no stored answer.
+fn question_about_a_folder(project: &Path) -> TrustQuestion {
+    TrustQuestion::for_folder(&CanonicalFolder::resolve(project).unwrap())
+}
+
 /// A folder that ships exactly one gated file, plus the question a start in it
 /// would pose. Written into a tempdir so the grant is about a path nothing else
 /// on the machine owns.
@@ -11160,44 +11891,54 @@ fn question_about_a_gated_folder(project: &Path) -> TrustQuestion {
     let gated = project.join(GatedFile::InitLua.to_string());
     fs::create_dir_all(gated.parent().unwrap()).unwrap();
     fs::write(&gated, GATED_INIT_SOURCE).unwrap();
-    TrustQuestion::for_folder(&CanonicalFolder::resolve(project).unwrap())
+    question_about_a_folder(project)
 }
 
 /// `/trust` is `maki trust add --yes` from inside the TUI, so it has to leave
 /// the same record on disk. The reload is the other half: the project config it
-/// just granted only loads on a fresh start.
-#[test]
-fn trust_command_records_the_folder_and_reloads() {
+/// just granted only loads on a fresh start. A folder with nothing to load gets
+/// the same yes, which is what lets its project answers be saved.
+#[test_case(true ; "gated_folder")]
+#[test_case(false ; "vacant_folder")]
+fn trust_command_records_the_folder_and_reloads(gated: bool) {
     let (_state, storage, _writer, mut app) = tempdir_app();
     let project = TempDir::new().unwrap();
-    let question = question_about_a_gated_folder(project.path());
-    app.trust_question = Some(question.clone());
+    let (state, expected_flash) = if gated {
+        (
+            TrustState::Unanswered(question_about_a_gated_folder(project.path())),
+            format!("{TRUSTED_PREFIX}{}", GatedFile::InitLua),
+        )
+    } else {
+        (
+            TrustState::Vacant(question_about_a_folder(project.path())),
+            TRUSTED_VACANT_MSG.to_owned(),
+        )
+    };
+    let folder = state.grantable().unwrap().folder.clone();
+    app.trust = state;
 
     app.execute_command(cmd(TRUST), 0);
 
     assert!(
-        TrustedFolders::new(&storage)
-            .contains(&question.folder)
-            .unwrap(),
+        TrustedFolders::new(&storage).contains(&folder).unwrap(),
         "the grant must outlive the process"
     );
     assert_eq!(app.exit_request, ExitRequest::Reload);
-    assert_eq!(
-        app.status_bar.flash_text().unwrap(),
-        format!("{TRUSTED_PREFIX}{}", GatedFile::InitLua)
-    );
+    assert_eq!(app.status_bar.flash_text().unwrap(), expected_flash);
 }
 
 /// Nothing to grant is not a reason to tear the session down: the user would
 /// lose the chat to a no-op.
-#[test]
-fn trust_command_without_a_question_flashes_and_stays() {
+#[test_case(TrustState::Inert, NOTHING_TO_TRUST_MSG ; "nothing_to_trust")]
+#[test_case(TrustState::Trusted, ALREADY_TRUSTED_MSG ; "already_trusted")]
+fn trust_command_without_a_question_flashes_and_stays(state: TrustState, expected_flash: &str) {
     let (_state, _storage, _writer, mut app) = tempdir_app();
+    app.trust = state;
 
     let actions = app.execute_command(cmd(TRUST), 0);
 
     assert!(actions.is_empty());
-    assert_eq!(app.status_bar.flash_text(), Some(NOTHING_TO_TRUST_MSG));
+    assert_eq!(app.status_bar.flash_text(), Some(expected_flash));
     assert_eq!(app.exit_request, ExitRequest::None);
 }
 
@@ -11214,6 +11955,24 @@ fn run_builtin_model_picker_opens_and_refreshes() {
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());
     assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+/// A provider row that cannot serve models hands Enter to its login. Z.AI asks
+/// for a plan first, while a provider like Anthropic would open its key page
+/// in the developer's real browser and wait for the launcher to exit.
+#[test]
+fn enter_on_a_keyless_provider_row_opens_its_login() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(ModelList {
+        specs: Vec::new(),
+        providers: HashMap::from([("zai".into(), ProviderStatus::MissingKey)]),
+        loading: false,
+    })));
+    app.run_builtin(BuiltinAction::ModelPicker);
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.model_picker.is_open());
+    assert!(app.login_picker.is_open());
 }
 
 #[test]
@@ -11466,6 +12225,7 @@ fn a_moved_calls_tab_is_a_transcript_while_it_runs() {
     app.status = Status::Idle;
     app.focus_task(MOVED_ID).unwrap();
     assert!(!app.chat_accepts_input());
+    assert!(!app.input_focused());
     assert!(app.active_chat_working());
     assert!(rendered(&mut app).contains(NO_INPUT_TAB_HINT.trim()));
 
@@ -11489,14 +12249,20 @@ fn the_chat_in_front_decides_whether_the_borders_dim(status: Status, running: bo
     app.active_chat_working()
 }
 
-#[test]
-fn a_notice_keeps_its_detail_live_and_on_restore() {
+#[test_case(false ; "plain")]
+#[test_case(true ; "markdown")]
+fn a_notice_keeps_its_detail_live_and_on_restore(markdown: bool) {
+    let notice = Message {
+        markdown,
+        ..labelled_notice(NOTICE_LINE)
+    };
     let mut app = test_app();
-    app.start_mailbox_run(vec![labelled_notice(NOTICE_LINE)]);
+    app.start_mailbox_run(vec![notice.clone()]);
     app.update(agent_msg_with_run_id(
         AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: Some(NOTICE_BODY.into()),
+            markdown,
             end: None,
         },
         app.run_id,
@@ -11507,7 +12273,7 @@ fn a_notice_keeps_its_detail_live_and_on_restore() {
         .and_then(|row| row.detail.clone());
 
     let (restored, _) = crate::chat::history_to_display(
-        &[labelled_notice(NOTICE_LINE)],
+        &[notice],
         &HashMap::new(),
         &app.ui_config.tool_output_lines,
     );
@@ -11516,8 +12282,12 @@ fn a_notice_keeps_its_detail_live_and_on_restore() {
         .find(|row| row.role == DisplayRole::Notice)
         .and_then(|row| row.detail);
 
-    assert_eq!(live.as_deref(), Some(NOTICE_BODY));
-    assert_eq!(restored.as_deref(), Some(NOTICE_BODY));
+    let expected = NoticeDetail {
+        text: NOTICE_BODY.into(),
+        markdown,
+    };
+    assert_eq!(live.as_ref(), Some(&expected));
+    assert_eq!(restored, Some(expected));
 }
 
 const RECEIPT_TURN_ID: &str = "tool-1";
@@ -11616,7 +12386,7 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
         started_at: None,
         ended_at: None,
     }]);
-    session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![]);
+    session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![], |_: &Message| Vec::new());
 
     app.restore_resumed_session();
 
@@ -11659,10 +12429,10 @@ fn moved_call_history(receipt: bool, notice: Option<(bool, bool)>) -> Vec<Messag
         );
         let mut message = Message::observation(text);
         message.display_text = Some(display);
-        message.settles = Some(TaskSettled {
+        message.answers = Some(TaskAnswer::Settles(TaskSettled {
             task: MOVED_ID.into(),
             end,
-        });
+        }));
         messages.push(message);
     }
     messages.push(Message::user("second prompt".into()));
@@ -11722,6 +12492,7 @@ fn a_reloaded_moved_row_tells_the_ending_its_queued_result_gives(
             "output",
         );
         let notice = BackgroundNotice {
+            markdown: false,
             text,
             display: Some(&display),
             wake: false,
@@ -11902,7 +12673,7 @@ fn an_adopted_subagents_events_outlive_its_run() {
 /// after the turn ended still gets its answer, and the main agent none.
 #[test]
 fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx(TASK_ID);
+    let (mut app, mut sub_rx, main_rx) = app_with_subagent_tx(TASK_ID);
     receive_receipt(&mut app);
     end_turn(&mut app);
 
@@ -11928,7 +12699,7 @@ fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
 /// on one: the prompt takes the keys first, Esc included.
 #[test]
 fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
+    let (mut app, mut sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     receive_receipt(&mut app);
     moved_subagent_event(
         &mut app,
@@ -12047,12 +12818,12 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     let mut app = streaming_app();
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
-    let inbox = Arc::new(SubagentInbox::default());
-    let (answer_tx, _answer_rx) = flume::unbounded();
+    let control = Arc::new(SessionControl::default());
+    let (answer_tx, _answer_rx) = unbounded_channel();
     let mut info = subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx));
     info.model = Some(MOVED_MODEL.into());
     info.opts = Some(MOVED_OPTS);
-    info.inbox = Arc::clone(&inbox);
+    info.control = Arc::clone(&control);
     info.prompt = Some(SUBAGENT_PROMPT.into());
 
     name_session(&mut app, info.clone());
@@ -12061,9 +12832,9 @@ fn a_task_call_moved_before_its_subagent_spoke_gets_a_full_tab(
     assert_eq!(app.chats.len(), 2);
     let tab = &app.chats[1];
     assert!(
-        tab.inbox
+        tab.control
             .as_ref()
-            .is_some_and(|tab_inbox| Arc::ptr_eq(tab_inbox, &inbox))
+            .is_some_and(|tab_control| Arc::ptr_eq(tab_control, &control))
     );
     assert!(tab.answer_tx.is_some());
     assert_eq!(tab.model_id.as_deref(), Some(MOVED_MODEL));
@@ -12167,7 +12938,7 @@ fn a_reopened_tab_does_not_show_its_prompt_again() {
     speak_after_the_move(&mut app, info);
 
     let tab = &app.chats[app.chat_of_task(MOVED_ID).unwrap()];
-    assert!(tab.inbox.is_some());
+    assert!(tab.control.is_some());
     let prompts = (0..tab.message_count())
         .filter_map(|i| tab.message_at(i))
         .filter(|m| m.role == DisplayRole::User)
@@ -12281,14 +13052,13 @@ const BACKGROUND_WAIT: Duration = Duration::from_secs(600);
 fn exit_on_done_app(background_wait: Option<Duration>) -> (App, SessionMailbox) {
     let mut app = streaming_app();
     let mailbox = hold_mailbox(&mut app);
-    app.exit_on_done = true;
-    app.background_wait = background_wait;
+    app.exit_when_done(background_wait);
     mailbox.track(MOVED_ID);
     (app, mailbox)
 }
 
-/// A failed turn exits with its error: neither the wait nor a woken run may
-/// turn it into a success.
+/// A failed turn exits with its error. The background wait must not hold it
+/// until a woken run turns it into a success.
 #[test]
 fn exit_on_done_exits_a_failed_turn_without_waiting() {
     let (mut app, _mailbox) = exit_on_done_app(Some(BACKGROUND_WAIT));
@@ -12300,7 +13070,6 @@ fn exit_on_done_exits_a_failed_turn_without_waiting() {
 
     assert_eq!(app.exit_request, ExitRequest::Error);
     assert!(!app.awaits_background(Instant::now()));
-    assert!(!app.takes_mailbox_runs());
 }
 
 /// One deadline from the first held exit covers the whole wait, so a woken
@@ -12421,13 +13190,13 @@ fn clicking_a_moved_row_whose_tab_is_gone_takes_the_rows_own_click() {
 
 /// A `task` call moved off its turn, whose subagent asks the user through a
 /// channel of its own.
-fn app_with_moved_subagent() -> (App, flume::Receiver<String>, flume::Receiver<String>) {
+fn app_with_moved_subagent() -> (App, UnboundedReceiver<String>, UnboundedReceiver<String>) {
     let mut app = streaming_app();
-    let (main_tx, main_rx) = flume::unbounded();
+    let (main_tx, main_rx) = unbounded_channel();
     app.answer_tx = Some(main_tx);
     app.update(agent_msg(tool_start(MOVED_ID, SLOW_TOOL)));
     app.update(agent_msg(moved_done(MOVED_ID)));
-    let (answer_tx, answer_rx) = flume::unbounded();
+    let (answer_tx, answer_rx) = unbounded_channel();
     speak_after_the_move(
         &mut app,
         subagent_info_with_tx(MOVED_ID, RESEARCH_NAME, Some(answer_tx)),
@@ -12440,7 +13209,7 @@ fn app_with_moved_subagent() -> (App, flume::Receiver<String>, flume::Receiver<S
 #[test_case(false ; "enter")]
 #[test_case(true  ; "esc_then_enter")]
 fn one_enter_retries_every_run_parked_on_auth(esc_first: bool) {
-    let (mut app, sub_rx, main_rx) = app_with_moved_subagent();
+    let (mut app, mut sub_rx, mut main_rx) = app_with_moved_subagent();
     app.update(agent_msg(AgentEvent::AuthRequired));
     moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
     let tab = app.chat_of_task(MOVED_ID).unwrap();
@@ -12463,7 +13232,7 @@ fn one_enter_retries_every_run_parked_on_auth(esc_first: bool) {
 /// user's, sent as usual on top of the retry.
 #[test]
 fn a_task_awaiting_auth_lets_the_main_chat_go_on() {
-    let (mut app, sub_rx, _main_rx) = app_with_moved_subagent();
+    let (mut app, mut sub_rx, _main_rx) = app_with_moved_subagent();
     end_turn(&mut app);
     moved_subagent_event(&mut app, MOVED_ID, AgentEvent::AuthRequired);
 
@@ -12518,7 +13287,7 @@ fn a_finished_subagent_late_auth_ask_never_parks() {
 #[test]
 fn a_plugin_task_nobody_can_answer_gets_no_auth_retry() {
     let mut app = app_with_plugin_task();
-    let (main_tx, main_rx) = flume::unbounded();
+    let (main_tx, main_rx) = unbounded_channel();
     app.answer_tx = Some(main_tx);
 
     plugin_event(&mut app, AgentEvent::AuthRequired);
@@ -12562,4 +13331,173 @@ fn a_session_opened_under_a_moved_call_works_once_it_runs() {
     );
 
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
+}
+
+const OWNER_MISMATCH: &str = "the wrong state holds the keyboard";
+const OWNER_NOT_OPENED: &str = "the later owner has to be open for the earlier one to beat it";
+const OWNER_INPUT_MISMATCH: &str = "the chat input is focused only when the chat owns the keyboard";
+const OWNER_OVERLAY_MISMATCH: &str =
+    "an overlay is open exactly when a state with its own Overlay holds the keyboard";
+const OWNER_SUBAGENT_QUEUE: &str = "the session queue has no focus left to hold on a subagent tab";
+const OWNER_NOT_CLOSED: &str = "closing every overlay leaves the owner's overlay open";
+
+fn open_file_picker(app: &mut App) {
+    app.file_picker.open(env!("CARGO_MANIFEST_DIR"));
+}
+
+/// Exhaustive on purpose: a new owner does not build until it can be opened.
+fn open_owner(app: &mut App, owner: KeyboardOwner) {
+    match owner {
+        KeyboardOwner::Alert => open_alert(app),
+        KeyboardOwner::Permission => open_permission_prompt(app),
+        KeyboardOwner::PackReview => open_pack_review(app),
+        KeyboardOwner::PlanForm => open_plan_form(app),
+        KeyboardOwner::Help => open_help(app),
+        KeyboardOwner::Usage => open_usage(app),
+        KeyboardOwner::Btw => open_btw(app),
+        KeyboardOwner::FocusedWindow => open_cursor_float(app),
+        KeyboardOwner::Search => open_search(app),
+        KeyboardOwner::FilePicker => open_file_picker(app),
+        KeyboardOwner::Queue => focus_queue(app),
+        KeyboardOwner::RewindPicker => open_rewind(app),
+        KeyboardOwner::ThemePicker => open_theme(app),
+        KeyboardOwner::ModelPicker => open_model_picker(app),
+        KeyboardOwner::LoginPicker => open_login_provider_list(app),
+        KeyboardOwner::McpPicker => open_mcp(app),
+        KeyboardOwner::Chat => {}
+    }
+}
+
+#[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::Permission ; "permission")]
+#[test_case(KeyboardOwner::PackReview ; "pack_review")]
+#[test_case(KeyboardOwner::PlanForm ; "plan_form")]
+#[test_case(KeyboardOwner::Help ; "help")]
+#[test_case(KeyboardOwner::Usage ; "usage")]
+#[test_case(KeyboardOwner::Btw ; "btw")]
+#[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
+#[test_case(KeyboardOwner::Search ; "search")]
+#[test_case(KeyboardOwner::FilePicker ; "file_picker")]
+#[test_case(KeyboardOwner::Queue ; "queue")]
+#[test_case(KeyboardOwner::RewindPicker ; "rewind_picker")]
+#[test_case(KeyboardOwner::ThemePicker ; "theme_picker")]
+#[test_case(KeyboardOwner::ModelPicker ; "model_picker")]
+#[test_case(KeyboardOwner::LoginPicker ; "login_picker")]
+#[test_case(KeyboardOwner::McpPicker ; "mcp_picker")]
+#[test_case(KeyboardOwner::Chat ; "chat")]
+fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
+    let mut app = test_app();
+    open_owner(&mut app, owner);
+
+    assert_eq!(app.keyboard_owner(), owner, "{OWNER_MISMATCH}: {owner:?}");
+    assert_eq!(
+        app.input_focused(),
+        owner == KeyboardOwner::Chat,
+        "{OWNER_INPUT_MISMATCH}: {owner:?}"
+    );
+    assert_eq!(
+        app.any_overlay_open(),
+        !matches!(
+            owner,
+            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat
+        ),
+        "{OWNER_OVERLAY_MISMATCH}: {owner:?}"
+    );
+
+    app.close_all_overlays();
+
+    assert!(!app.any_overlay_open(), "{OWNER_NOT_CLOSED}: {owner:?}");
+}
+
+#[test_case(KeyboardOwner::Alert, KeyboardOwner::Permission ; "alert_over_permission")]
+#[test_case(KeyboardOwner::Permission, KeyboardOwner::PackReview ; "permission_over_pack_review")]
+#[test_case(KeyboardOwner::PackReview, KeyboardOwner::PlanForm ; "pack_review_over_plan_form")]
+#[test_case(KeyboardOwner::PlanForm, KeyboardOwner::Help ; "plan_form_over_help")]
+#[test_case(KeyboardOwner::Help, KeyboardOwner::Usage ; "help_over_usage")]
+#[test_case(KeyboardOwner::Usage, KeyboardOwner::Btw ; "usage_over_btw")]
+#[test_case(KeyboardOwner::Btw, KeyboardOwner::FocusedWindow ; "btw_over_focused_window")]
+#[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Search ; "focused_window_over_search")]
+#[test_case(KeyboardOwner::Search, KeyboardOwner::FilePicker ; "search_over_file_picker")]
+#[test_case(KeyboardOwner::FilePicker, KeyboardOwner::Queue ; "file_picker_over_queue")]
+#[test_case(KeyboardOwner::Queue, KeyboardOwner::RewindPicker ; "queue_over_rewind_picker")]
+#[test_case(KeyboardOwner::RewindPicker, KeyboardOwner::ThemePicker ; "rewind_picker_over_theme_picker")]
+#[test_case(KeyboardOwner::ThemePicker, KeyboardOwner::ModelPicker ; "theme_picker_over_model_picker")]
+#[test_case(KeyboardOwner::ModelPicker, KeyboardOwner::LoginPicker ; "model_picker_over_login_picker")]
+#[test_case(KeyboardOwner::LoginPicker, KeyboardOwner::McpPicker ; "login_picker_over_mcp_picker")]
+fn the_earlier_owner_holds_the_keyboard_over_the_next(
+    earlier: KeyboardOwner,
+    later: KeyboardOwner,
+) {
+    let mut app = test_app();
+    open_owner(&mut app, earlier);
+    open_owner(&mut app, later);
+
+    assert!(app.holds_keyboard(later), "{OWNER_NOT_OPENED}: {later:?}");
+    assert_eq!(
+        app.keyboard_owner(),
+        earlier,
+        "{OWNER_MISMATCH}: {earlier:?} over {later:?}"
+    );
+}
+
+#[test]
+fn a_focused_queue_on_a_subagent_tab_does_not_hold_the_keyboard() {
+    let mut app = app_with_subagent();
+    focus_queue(&mut app);
+    assert_eq!(
+        app.keyboard_owner(),
+        KeyboardOwner::Queue,
+        "{OWNER_MISMATCH}"
+    );
+
+    app.run_builtin(BuiltinAction::NextChat);
+
+    assert_eq!(
+        app.keyboard_owner(),
+        KeyboardOwner::Chat,
+        "{OWNER_SUBAGENT_QUEUE}"
+    );
+}
+
+const OWNER_LEAKED_A_KEY: &str = "a key the holder of the keyboard answers must not reach the chat";
+
+/// `<C-h>` opens the help from the chat, so a holder that does not answer it
+/// lets the help open. Left out is the help itself, which closes on `<C-h>`,
+/// so a leak would look the same.
+#[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::Permission ; "permission")]
+#[test_case(KeyboardOwner::PackReview ; "pack_review")]
+#[test_case(KeyboardOwner::PlanForm ; "plan_form")]
+#[test_case(KeyboardOwner::Usage ; "usage")]
+#[test_case(KeyboardOwner::Btw ; "btw")]
+#[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
+#[test_case(KeyboardOwner::Search ; "search")]
+#[test_case(KeyboardOwner::FilePicker ; "file_picker")]
+#[test_case(KeyboardOwner::Queue ; "queue")]
+#[test_case(KeyboardOwner::RewindPicker ; "rewind_picker")]
+#[test_case(KeyboardOwner::ThemePicker ; "theme_picker")]
+#[test_case(KeyboardOwner::ModelPicker ; "model_picker")]
+#[test_case(KeyboardOwner::LoginPicker ; "login_picker")]
+#[test_case(KeyboardOwner::McpPicker ; "mcp_picker")]
+fn the_holder_of_the_keyboard_keeps_a_shortcut_from_the_chat(owner: KeyboardOwner) {
+    let mut app = test_app();
+    open_owner(&mut app, owner);
+
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+
+    assert!(!app.help_modal.is_open(), "{OWNER_LEAKED_A_KEY}: {owner:?}");
+}
+
+const PALETTE_ESC_LEAKED: &str = "the Esc that closes the palette is the palette's, not the chat's";
+
+#[test]
+fn the_escape_that_closes_the_palette_stays_out_of_the_chat() {
+    let mut app = test_app();
+    type_slash(&mut app);
+    assert!(palette_open(&mut app));
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(!palette_open(&mut app));
+    assert_eq!(app.status_bar.flash_text(), None, "{PALETTE_ESC_LEAKED}");
 }

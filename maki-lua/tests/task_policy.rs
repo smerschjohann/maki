@@ -5,6 +5,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 
 use common::{
@@ -20,6 +21,7 @@ use maki_agent::{
 use maki_lua::test_support::runtime;
 use maki_lua::{MoveOutcome, PluginHost};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const TASK_RUNNER_SRC: &str = include_str!("../../plugins/task/runner.lua");
@@ -50,6 +52,9 @@ const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
 const SESSION_OPEN_ERR: &str = "session admission failed";
+const ASSIGNED_TIER: &str = "weak";
+/// Mirrors the task plugin's `ASSIGNED_MODEL_CONTEXT` for the stub's model.
+const ASSIGNED_MODEL_CONTEXT: &str = "model `test/model`, assigned to the weak tier: ";
 /// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
@@ -138,7 +143,7 @@ end
 
 maki.agent.resolve_model = function(ctx, opts)
   recorder.resolve_opts = opts
-  return { spec = "test/model" }
+  return { spec = "test/model", assigned_tier = opts.tier }
 end
 
 maki.agent.system_prompt = function(ctx, opts)
@@ -637,6 +642,18 @@ fn prompt_error_maps_to_sub_agent_error() {
     assert_eq!(snap["closed"], json!(1));
 }
 
+/// The stub reports every requested tier as assigned, so both the session
+/// open and the prompt failure must name the assignment that picked the model.
+#[test_case::test_case(SCENARIO_SESSION_ERROR, format!("{ASSIGNED_MODEL_CONTEXT}{SESSION_OPEN_ERR}") ; "session_open")]
+#[test_case::test_case(SCENARIO_PROMPT_ERROR, format!("{SUB_AGENT_ERROR_PREFIX}{ASSIGNED_MODEL_CONTEXT}{PROMPT_ERR_MSG}") ; "prompt")]
+fn assigned_tier_failure_names_the_assignment(scenario: &str, expected: String) {
+    let (reg, _host) = load_task_host();
+    let mut input = task_input(scenario, None);
+    input["model_tier"] = json!(ASSIGNED_TIER);
+    let err = exec_tool(&reg, TASK_TOOL, input).unwrap_err();
+    assert_eq!(err, expected);
+}
+
 /// Esc during a sub-agent run: the prompt hands back both an error and
 /// whatever the sub-agent managed to say, and half a transcript is worth
 /// more to the model than a bare "cancelled".
@@ -713,6 +730,19 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     assert_eq!(out, PLAIN_TEXT);
 }
 
+/// The session opens before the wait for a slot, so a refused open takes no
+/// slot and leaves nothing to close.
+#[test]
+fn a_session_that_fails_to_open_takes_no_slot() {
+    let (reg, _host) = load_task_host();
+    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_SESSION_ERROR, None)).unwrap_err();
+    assert!(err.contains(SESSION_OPEN_ERR), "got: {err}");
+
+    let snap = probe(&reg);
+    assert_eq!(snap["acquired"], json!(0));
+    assert_eq!(snap["closed"], json!(0));
+}
+
 #[test]
 fn background_input_is_on_by_default_and_can_be_turned_off() {
     let advertised = |reg: &ToolRegistry| {
@@ -740,8 +770,8 @@ fn background_without_a_chat_session_runs_blocking() {
 /// A blocking `task` call as dispatch makes it: one scope under the run
 /// token and its own event channel, executing on its own thread.
 struct ModelCall {
-    events: flume::Receiver<Envelope>,
-    result: flume::Receiver<ToolDoneEvent>,
+    events: UnboundedReceiver<Envelope>,
+    result: Receiver<ToolDoneEvent>,
 }
 
 impl ModelCall {
@@ -754,7 +784,7 @@ impl ModelCall {
     ) -> Self {
         let (ctx, events) = call_ctx(reg, chat.id, run, id);
         let reg = Arc::clone(reg);
-        let (result_tx, result) = flume::bounded(1);
+        let (result_tx, result) = sync_channel(1);
         thread::spawn(move || {
             let _ = result_tx.send(exec(&reg, TASK_TOOL, input, &ctx));
         });
@@ -783,12 +813,11 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
     let (reg, host) = load_task_host_with_opts(opts);
-    host.ui_attachment().attach();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     let chat = Chat::live();
     let (_run_trigger, run) = CancelToken::new();
 
-    let first = ModelCall::start(
+    let mut first = ModelCall::start(
         &reg,
         &chat,
         &run,
@@ -796,7 +825,7 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
         task_input(SCENARIO_PARKED, None),
     );
     let mut showed_waiting_row = false;
-    next_event(&first.events, |event| {
+    next_event(&mut first.events, |event| {
         showed_waiting_row |= matches!(event, AgentEvent::LiveToolBuf { .. });
         matches!(&event, AgentEvent::ToolMovable { movable: true, .. }).then_some(())
     });
@@ -810,39 +839,39 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let receipt = reply_text(receipt);
     assert!(receipt.starts_with(MOVED_RECEIPT), "{receipt}");
 
-    let second = ModelCall::start(
+    let mut second = ModelCall::start(
         &reg,
         &chat,
         &run,
         SECOND_CALL_ID,
         task_input(SCENARIO_PARKED_SECOND, None),
     );
-    let waiting = wait_live_buf(&second.events, SECOND_CALL_ID);
+    let waiting = wait_live_buf(&mut second.events, SECOND_CALL_ID);
     assert_eq!(buf_text(&waiting), WAITING_FOR_SLOT);
     wait(&reg, json!({ "acquires": 2 }));
     assert_eq!(
         request_move(&host.event_handle(), SECOND_CALL_ID),
         MoveOutcome::NoHook
     );
-    assert!(second.result.is_empty());
+    assert!(second.result.try_recv().is_err());
     assert_eq!(probe(&reg)["acquired"], json!(1));
 
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));
     release(&reg, SCENARIO_PARKED);
     assert_eq!(
-        done_text(&next_task_done(&ui)),
+        done_text(&next_task_done(&mut ui)),
         (PLAIN_TEXT.to_owned(), false)
     );
     assert_eq!(probe(&reg)["released"], json!(1));
 
     wait(&reg, json!({ "parked": SCENARIO_PARKED_SECOND }));
     assert_eq!(buf_text(&waiting), "");
-    wait_movable(&second.events, SECOND_CALL_ID);
+    wait_movable(&mut second.events, SECOND_CALL_ID);
     release(&reg, SCENARIO_PARKED_SECOND);
     let result = second.finish();
     assert!(!result.backgrounded);
     assert_eq!(reply_text(result), PLAIN_TEXT);
-    let final_body = next_event(&second.events, |event| match event {
+    let final_body = next_event(&mut second.events, |event| match event {
         AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot.text()),
         _ => None,
     });

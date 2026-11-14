@@ -4,20 +4,23 @@
 pub(crate) mod bedrock;
 pub(crate) mod shared;
 
+use std::str::from_utf8;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use flume::Sender;
+use futures::TryStreamExt;
 use maki_storage::id::SessionRef;
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::header::HeaderValue;
+use reqwest::{Client, Method, Request, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use url::Url;
 
 use maki_config::providers::Protocol;
 
+use crate::headers::header_value;
 use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
@@ -29,9 +32,10 @@ use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::codec::SessionCarrier;
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, SseBody, Timeouts};
 
-const API_VERSION: &str = "2023-06-01";
+pub(crate) const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
 const API_HOST: &str = "api.anthropic.com";
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -40,6 +44,8 @@ const USAGE_PATH: &str = "/api/oauth/usage";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+const BETA_HEADER: &str = "anthropic-beta";
+const BETA_SEPARATOR: &str = ",";
 const MONEY_EXPONENT: u32 = 2;
 const LABEL_SESSION: &str = "Current session";
 const LABEL_WEEK_ALL: &str = "Current week (all models)";
@@ -61,14 +67,15 @@ const BEDROCK_NOTE: &str = r#"#### Amazon Bedrock
 
 If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
 
-You will need `AWS_REGION` and one of the following for auth:
+The region comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`, then your AWS profile, and falls back to `us-east-1`. Auth uses the first of these that is set:
 
 | Method | Env vars |
 |--------|----------|
-| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
-| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
 | Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
 | Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
+| AWS credentials | The AWS SDK's default chain: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE` (static keys, SSO, `credential_process`, assumed roles, `aws login`), web identity, container and instance credentials |
+
+Temporary AWS credentials are refreshed 5 minutes before they expire. After `aws sso login`, the next request picks up the new session.
 
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
 
@@ -82,6 +89,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
@@ -114,7 +122,7 @@ inventory::submit!(SPEC.config_row());
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     if bedrock::is_enabled() {
-        Ok(Box::new(bedrock::Bedrock::new(timeouts)?))
+        Ok(Box::new(bedrock::Bedrock::new(timeouts)))
     } else {
         Ok(Box::new(Anthropic::new(timeouts)?))
     }
@@ -324,14 +332,46 @@ fn is_anthropic_api(base_url: &str) -> bool {
 
 /// Subscription quota only exists for OAuth tokens against the real Anthropic
 /// API; API keys and anthropic-protocol third-party endpoints have none.
+/// [`ResolvedAuth::finish`], except that `anthropic-beta` is a list: the betas
+/// the credentials or `[<slug>.headers]` name join the ones this request needs
+/// (fast mode, 1M context, deferred tools...) instead of replacing them.
+fn finish(
+    auth: &ResolvedAuth,
+    builder: RequestBuilder,
+    betas: &[&str],
+) -> Result<Request, AgentError> {
+    let mut request = auth.finish(builder)?;
+    let merged = merge_betas(betas, request.headers().get(BETA_HEADER));
+    if !merged.is_empty() {
+        let value = header_value(BETA_HEADER, &merged)?;
+        request.headers_mut().insert(BETA_HEADER, value);
+    }
+    Ok(request)
+}
+
+fn merge_betas(betas: &[&str], configured: Option<&HeaderValue>) -> String {
+    let configured = configured
+        .and_then(|value| from_utf8(value.as_bytes()).ok())
+        .unwrap_or_default();
+    let mut merged: Vec<&str> = Vec::new();
+    for beta in betas
+        .iter()
+        .copied()
+        .chain(configured.split(BETA_SEPARATOR).map(str::trim))
+    {
+        if !beta.is_empty() && !merged.contains(&beta) {
+            merged.push(beta);
+        }
+    }
+    merged.join(BETA_SEPARATOR)
+}
+
 fn usage_eligible(
     auth: &super::ResolvedAuth,
     fallback_base_url: Option<&str>,
     configured_override: Option<&str>,
 ) -> bool {
-    auth.headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+    auth.header(super::AUTHORIZATION_HEADER).is_some()
         && auth
             .base_url
             .as_deref()
@@ -359,6 +399,7 @@ pub struct Anthropic {
     auth: Arc<Mutex<super::ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
+    session_id: SessionCarrier,
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     /// Reused by key rotation / reload so they do not re-parse providers.toml.
@@ -379,6 +420,7 @@ impl Anthropic {
             auth: Arc::new(Mutex::new(resolved)),
             key_pool: Some(pool),
             system_prefix: None,
+            session_id: SessionCarrier::default(),
             stream_timeout: timeouts.stream,
             resolved_base_url,
             fallback_base_url: None,
@@ -394,6 +436,7 @@ impl Anthropic {
             auth,
             key_pool: None,
             system_prefix: None,
+            session_id: SessionCarrier::default(),
             stream_timeout: timeouts.stream,
             // Custom / dynamic callers own their base URL; treating it as the
             // anthropic override would make every third-party endpoint look
@@ -405,6 +448,11 @@ impl Anthropic {
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
+        self
+    }
+
+    pub(crate) fn with_session_id(mut self, session_id: SessionCarrier) -> Self {
+        self.session_id = session_id;
         self
     }
 
@@ -422,37 +470,41 @@ impl Anthropic {
             .unwrap_or(API_ORIGIN)
     }
 
-    fn build_request(&self, method: Method, path: &str) -> RequestBuilder {
+    fn build_request(
+        &self,
+        method: Method,
+        path: &str,
+        betas: &[&str],
+    ) -> Result<Request, AgentError> {
         let auth = self.auth.lock().unwrap();
-        let url = format!("{}{path}", origin(self.base_url(&auth)));
-        auth.configure_request(
-            self.client
-                .request(method, url)
-                .header("anthropic-version", API_VERSION)
-                .header("user-agent", super::user_agent()),
-        )
+        finish(&auth, self.request_with(&auth, method, path), betas)
+    }
+
+    /// What maki sends on its own, for [`finish`] to go over.
+    fn request_with(&self, auth: &ResolvedAuth, method: Method, path: &str) -> RequestBuilder {
+        let url = format!("{}{path}", origin(self.base_url(auth)));
+        self.client
+            .request(method, url)
+            .header("anthropic-version", API_VERSION)
     }
 
     async fn do_stream_request(
         &self,
+        auth: &ResolvedAuth,
         body: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         betas: &[&str],
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
-        let mut builder = self
-            .build_request(Method::POST, MESSAGES_PATH)
-            .header("content-type", "application/json");
-        if !betas.is_empty() {
-            builder = builder.header("anthropic-beta", betas.join(","));
-        }
-        let request = builder.body(json_body).build()?;
-        super::send_request(&self.client, request, |response| async move {
-            if response.status().as_u16() == 200 {
-                parse_sse(super::body_reader(response), event_tx, self.stream_timeout).await
-            } else {
-                Err(AgentError::from_response(response).await)
-            }
+        let request = finish(
+            auth,
+            self.request_with(auth, Method::POST, MESSAGES_PATH)
+                .header("content-type", "application/json")
+                .body(json_body),
+            betas,
+        )?;
+        super::ok_sse(&self.client, request, self.stream_timeout, |body| {
+            parse_sse(body, event_tx)
         })
         .await
     }
@@ -467,7 +519,7 @@ impl Anthropic {
                 path.push_str(&format!("&after_id={cursor}"));
             }
 
-            let request = self.build_request(Method::GET, &path).build()?;
+            let request = self.build_request(Method::GET, &path, &[])?;
             let body_text = super::ok_text(&self.client, request).await?;
             let page: ModelsPage = serde_json::from_str(&body_text)?;
             for m in page.data {
@@ -495,9 +547,9 @@ impl Provider for Anthropic {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let system_blocks = if let Some(prefix) = &self.system_prefix {
@@ -521,17 +573,15 @@ impl Provider for Anthropic {
                 }]
             };
 
-            let (top_p, anthropic_api) = {
-                let auth = self.auth.lock().unwrap();
-                (auth.top_p, is_anthropic_api(self.base_url(&auth)))
-            };
+            let mut auth = self.auth.lock().unwrap().clone();
+            let anthropic_api = is_anthropic_api(self.base_url(&auth));
             let mut body = shared::build_request_body_with_system(
                 model,
                 messages,
                 &system_blocks,
                 tools,
                 opts.thinking,
-                top_p,
+                auth.top_p,
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
@@ -548,9 +598,12 @@ impl Provider for Anthropic {
             if reports_block_binding(&body, anthropic_api) {
                 betas.push(BLOCK_BINDING_BETA);
             }
+            if let Some(session) = session_id {
+                self.session_id.apply(session, &mut body, &mut auth)?;
+            }
 
             debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, ?betas, "sending API request");
-            self.do_stream_request(&body, event_tx, &betas).await
+            self.do_stream_request(&auth, &body, event_tx, &betas).await
         })
     }
 
@@ -574,11 +627,7 @@ impl Provider for Anthropic {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Raw(API_KEY_HEADER))
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -590,10 +639,7 @@ impl Provider for Anthropic {
             ) {
                 return Ok(None);
             }
-            let request = self
-                .build_request(Method::GET, USAGE_PATH)
-                .header("anthropic-beta", OAUTH_BETA)
-                .build()?;
+            let request = self.build_request(Method::GET, USAGE_PATH, &[OAUTH_BETA])?;
             let body_text = super::ok_text(&self.client, request).await?;
             let parsed: OauthUsage = serde_json::from_str(&body_text)?;
             Ok(Some(parsed.into()))
@@ -654,29 +700,18 @@ struct ModelsPage {
 }
 
 pub(crate) async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
-    event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
+    mut events: SseBody,
+    event_tx: &UnboundedSender<ProviderEvent>,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
     let mut parser = shared::EventParser::new();
-    let mut current_event = String::new();
-    let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        if let Some(rest) = line.strip_prefix("event:") {
-            current_event = rest.strip_prefix(' ').unwrap_or(rest).to_string();
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data else {
             continue;
-        }
-
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.strip_prefix(' ').unwrap_or(d),
-            None => continue,
         };
 
         if parser
-            .process(&current_event, data, event_tx)
-            .await?
+            .process(event.event.as_deref().unwrap_or_default(), &data, event_tx)?
             .is_break()
         {
             break;
@@ -689,18 +724,17 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Canned, serve, sse_event};
+    use crate::test_support::{Canned, serve, sse_body, sse_event};
     use crate::{
         ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
         TokenUsage,
     };
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
-    use std::io::Cursor;
-    use std::time::Duration;
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
-    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
     const THINKING_SIGNATURE: &str = "sig";
     const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
@@ -784,6 +818,33 @@ mod tests {
         assert_eq!(usage.limits[0].reset_at, None);
     }
 
+    const EXTRA_BETA: &str = "files-api-2025-04-14";
+    const SPACED_BETAS: &str = " files-api-2025-04-14 ,oauth-2025-04-20,";
+
+    #[test_case(&[FAST_MODE_BETA], Some(OAUTH_BETA), &[FAST_MODE_BETA, OAUTH_BETA] ; "credential_beta_joins_makis")]
+    #[test_case(&[OAUTH_BETA, FAST_MODE_BETA], Some(SPACED_BETAS), &[OAUTH_BETA, FAST_MODE_BETA, EXTRA_BETA] ; "shared_beta_sent_once")]
+    #[test_case(&[], Some(OAUTH_BETA), &[OAUTH_BETA] ; "credential_beta_alone")]
+    #[test_case(&[FAST_MODE_BETA], None, &[FAST_MODE_BETA] ; "makis_beta_alone")]
+    #[test_case(&[], None, &[] ; "no_beta_no_header")]
+    fn betas_go_out_in_one_header(betas: &[&str], credential: Option<&str>, expected: &[&str]) {
+        let headers = credential
+            .map(|beta| (BETA_HEADER.to_owned(), beta.to_owned()))
+            .into_iter()
+            .collect();
+        let auth = ResolvedAuth::for_test(None, headers);
+
+        let request = finish(&auth, Client::new().post(API_ORIGIN), betas).unwrap();
+
+        let sent: Vec<_> = request.headers().get_all(BETA_HEADER).iter().collect();
+        let line = expected.join(BETA_SEPARATOR);
+        let expected: Vec<&str> = if expected.is_empty() {
+            Vec::new()
+        } else {
+            vec![&line]
+        };
+        assert_eq!(sent, expected);
+    }
+
     #[test_case("Authorization", None, true ; "bearer_default_url_eligible")]
     #[test_case("authorization", Some("https://api.anthropic.com/v1/messages"), true ; "bearer_anthropic_url_eligible")]
     #[test_case("authorization", Some("https://api.anthropic.com"), true ; "bearer_anthropic_origin_eligible")]
@@ -825,7 +886,7 @@ mod tests {
         )
         .with_fallback_base_url(Some(THIRD_PARTY_BASE_URL.into()));
         provider.reload_auth().await.unwrap();
-        assert_eq!(provider.auth.lock().unwrap().headers, headers);
+        assert_eq!(provider.auth.lock().unwrap().header_list(), headers);
     }
 
     #[test_case(None, true ; "no_fallback_is_anthropic")]
@@ -886,12 +947,10 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\
 \n\
 event: message_stop\n\
-data: {\"type\":\"message_stop\"}\n";
+data: {\"type\":\"message_stop\"}\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
             resp.usage,
@@ -938,10 +997,8 @@ event: message_stop\n\
 data: {{\"type\":\"message_stop\"}}\n"
         );
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
             resp.usage,
@@ -983,10 +1040,8 @@ data: {{\"type\":\"message_stop\"}}\n"
         ]
         .concat();
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert_eq!(
             resp.usage,
@@ -1038,10 +1093,8 @@ data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"
 event: message_stop\n\
 data: {{\"type\":\"message_stop\"}}\n"
         );
-        let (tx, _rx) = flume::unbounded();
-        parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap()
+        let (tx, _rx) = unbounded_channel();
+        parse_sse(sse_body(sse_data), &tx).await.unwrap()
     }
 
     #[test_case(None, true ; "from_message_start")]
@@ -1066,7 +1119,10 @@ data: {{\"type\":\"message_stop\"}}\n"
 
         assert_eq!(
             (resp.usage.input, resp.usage.output),
-            (STARTED_INPUT_TOKENS, DELTA_OUTPUT_TOKENS)
+            (
+                u64::from(STARTED_INPUT_TOKENS),
+                u64::from(DELTA_OUTPUT_TOKENS)
+            )
         );
         assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
         assert_eq!(resp.input_transformations, vec![dropped_thinking()]);
@@ -1088,12 +1144,10 @@ event:message_delta\n\
 data:{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\
 \n\
 event:message_stop\n\
-data:{\"type\":\"message_stop\"}\n";
+data:{\"type\":\"message_stop\"}\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "OK"));
         assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
@@ -1120,20 +1174,17 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse_data.as_bytes()), &tx).await.unwrap();
 
         let tools: Vec<_> = resp.message.tool_uses().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].0, "tu_1");
         assert_eq!(tools[0].1, "bash");
 
-        let starts: Vec<_> = rx
-            .drain()
+        let starts: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|e| match e {
                 ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
                 _ => None,
@@ -1150,6 +1201,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         ContentBlock::Thinking {
             thinking: thinking.into(),
             signature: Some(THINKING_SIGNATURE.into()),
+            reasoning_id: None,
         }
     }
 
@@ -1157,6 +1209,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         ContentBlock::Thinking {
             thinking: thinking.into(),
             signature: None,
+            reasoning_id: None,
         }
     }
 
@@ -1648,11 +1701,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
     #[tokio::test]
     async fn parse_sse_overloaded_error() {
-        let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
-        let (tx, _rx) = flume::unbounded();
-        let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap_err();
+        let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let (tx, _rx) = unbounded_channel();
+        let err = parse_sse(sse_body(input), &tx).await.unwrap_err();
         match err {
             AgentError::Api {
                 status, message, ..
@@ -1666,11 +1717,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
     #[tokio::test]
     async fn parse_sse_unparseable_error() {
-        let input = b"event: error\ndata: not-json\n";
-        let (tx, _rx) = flume::unbounded();
-        let err = parse_sse(Cursor::new(input), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap_err();
+        let input = b"event: error\ndata: not-json\n\n";
+        let (tx, _rx) = unbounded_channel();
+        let err = parse_sse(sse_body(input), &tx).await.unwrap_err();
         match err {
             AgentError::Api {
                 status, message, ..
@@ -1698,12 +1747,10 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n";
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse_data.as_bytes()), &tx).await.unwrap();
 
         let tools: Vec<_> = resp.message.tool_uses().collect();
         assert_eq!(tools.len(), 1);
@@ -1742,21 +1789,18 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n";
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(
-            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature, .. }
                 if thinking == "Let me think" && *signature == Some("sig123".to_string()))
         );
         assert!(matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello"));
 
-        let thinking_deltas: Vec<_> = rx
-            .drain()
+        let thinking_deltas: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|e| match e {
                 ProviderEvent::ThinkingDelta { text } => Some(text),
                 _ => None,
@@ -1787,12 +1831,10 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n";
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
-            .await
-            .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(
             matches!(&resp.message.content[0], ContentBlock::RedactedThinking { data } if data == "opaque_data")

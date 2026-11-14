@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use flume::{Receiver, Sender};
+use futures::FutureExt;
 use maki_config::ToolKey;
 use maki_providers::{
     AgentError, ContentBlock, ImageSource, Message, RequestOptions, Role, StopReason, TaskEnd,
@@ -15,7 +15,10 @@ use maki_providers::{
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use crate::SessionControl;
 pub const NO_FILES_FOUND: &str = "No files found";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,18 +528,27 @@ pub struct CallRecord {
 const UNKNOWN_TOOL: &str = "unknown";
 
 impl ToolDoneEvent {
-    pub fn error(id: String, message: impl Into<String>) -> Self {
-        let message: String = message.into();
+    pub fn new(id: String, tool: Arc<str>, output: ToolOutput, is_error: bool) -> Self {
         Self {
             id,
-            tool: Arc::from(UNKNOWN_TOOL),
-            output: Arc::new(ToolOutput::Plain(message.into())),
-            is_error: true,
+            tool,
+            output: Arc::new(output),
+            is_error,
             annotation: None,
             written_path: None,
             call: None,
             backgrounded: false,
         }
+    }
+
+    pub fn error(id: String, message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::new(
+            id,
+            Arc::from(UNKNOWN_TOOL),
+            ToolOutput::Plain(message.into()),
+            true,
+        )
     }
 
     /// How long the call ran before this result, a receipt's until the move.
@@ -606,8 +618,8 @@ pub enum DoneReason {
     /// A manual `/compact` ended the run, but no user turn ended with it, so
     /// a goal loop should not treat this as a turn boundary.
     Compact,
-    /// An `agent.user_message` layer dropped the message before the model saw
-    /// it.
+    /// Nothing new reached the model: an `agent.user_message` layer dropped
+    /// the message, or [`crate::Agent::resume`] found nothing to answer.
     Dropped,
 }
 
@@ -741,12 +753,14 @@ pub enum AgentEvent {
         context_size: u32,
         context_window: u32,
     },
+    CompactionStarted,
     CompactionDone {
         context_size_before: u32,
         context_size_after: u32,
         context_window: u32,
         /// So a plugin can check the summary kept what matters.
         summary: String,
+        duration_ms: u64,
     },
     Retry {
         attempt: u32,
@@ -793,6 +807,9 @@ pub enum AgentEvent {
         text: String,
         /// What the line unfolds to, see `observation_detail`.
         detail: Option<String>,
+        /// `detail` is markdown, see [`Message::markdown`].
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        markdown: bool,
         /// Set when the line answers a background task, for its colored dot.
         #[serde(skip_serializing_if = "Option::is_none")]
         end: Option<TaskEnd>,
@@ -849,17 +866,22 @@ impl AgentEvent {
 /// Wakes the UI loop so a change made on another thread is painted now, not on
 /// the loop's next timed poll. Wakes pile up into one until the loop looks, so
 /// a plugin writing in a tight loop costs one frame, not one per write.
-#[derive(Clone)]
-pub struct UiWaker(Sender<()>);
+#[derive(Clone, Default)]
+pub struct UiWaker(Arc<Notify>);
 
 impl UiWaker {
-    pub fn new() -> (Self, Receiver<()>) {
-        let (tx, rx) = flume::bounded(1);
-        (Self(tx), rx)
+    pub fn wake(&self) {
+        self.0.notify_one();
     }
 
-    pub fn wake(&self) {
-        let _ = self.0.try_send(());
+    /// Resolves once a wake came in that the loop has not taken yet.
+    pub async fn woken(&self) {
+        self.0.notified().await;
+    }
+
+    /// Takes a pending wake without waiting for one.
+    pub fn take_wake(&self) -> bool {
+        self.woken().now_or_never().is_some()
     }
 }
 
@@ -1329,13 +1351,12 @@ pub struct SubagentInfo {
     #[serde(skip)]
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
-    pub answer_tx: Option<flume::Sender<String>>,
-    /// Where a host queues messages for this subagent. Its loop drains the
-    /// queue between turns, so a message lands as an interrupt. Every
+    pub answer_tx: Option<UnboundedSender<String>>,
+    /// How a host reaches this subagent: its inbox, status and stop. Every
     /// subagent has one, so a chat without one has not heard from its
     /// subagent yet.
     #[serde(skip)]
-    pub inbox: Arc<crate::SubagentInbox>,
+    pub control: Arc<SessionControl>,
     /// The model's call this session runs under when that is not its own
     /// `task` call, like the `batch` it is a child of. Once that call moves,
     /// `/tasks` lists the session under it.
@@ -1345,18 +1366,18 @@ pub struct SubagentInfo {
 
 #[derive(Debug, Clone)]
 pub struct EventSender {
-    tx: Sender<Envelope>,
+    tx: UnboundedSender<Envelope>,
     run_id: u64,
 }
 
 impl EventSender {
-    pub fn new(tx: Sender<Envelope>, run_id: u64) -> Self {
+    pub fn new(tx: UnboundedSender<Envelope>, run_id: u64) -> Self {
         Self { tx, run_id }
     }
 
     pub fn send(&self, event: impl Into<AgentEvent>) -> Result<(), AgentError> {
         self.tx
-            .try_send(Envelope {
+            .send(Envelope {
                 event: event.into(),
                 subagent: None,
                 run_id: self.run_id,
@@ -1365,11 +1386,11 @@ impl EventSender {
     }
 
     pub fn send_envelope(&self, envelope: Envelope) -> Result<(), AgentError> {
-        self.tx.try_send(envelope).map_err(|_| AgentError::Channel)
+        self.tx.send(envelope).map_err(|_| AgentError::Channel)
     }
 
     pub fn try_send(&self, event: impl Into<AgentEvent>) {
-        let _ = self.tx.try_send(Envelope {
+        let _ = self.tx.send(Envelope {
             event: event.into(),
             subagent: None,
             run_id: self.run_id,
@@ -1405,7 +1426,7 @@ pub struct Envelope {
 /// [`EventSender`] clones until the VM garbage-collects them, which never
 /// happens on an idle VM.
 pub fn event_stream() -> (EventStreamGuard, SessionEvents) {
-    let (tx, rx) = flume::unbounded();
+    let (tx, rx) = unbounded_channel();
     (EventStreamGuard { tx }, SessionEvents { rx, closed: false })
 }
 
@@ -1418,7 +1439,7 @@ pub fn event_stream() -> (EventStreamGuard, SessionEvents) {
 /// collector's schedule.
 #[derive(Debug)]
 pub struct EventStreamGuard {
-    tx: Sender<Envelope>,
+    tx: UnboundedSender<Envelope>,
 }
 
 impl EventStreamGuard {
@@ -1429,7 +1450,7 @@ impl EventStreamGuard {
 
 impl Drop for EventStreamGuard {
     fn drop(&mut self) {
-        let _ = self.tx.try_send(Envelope {
+        let _ = self.tx.send(Envelope {
             event: AgentEvent::StreamClosed,
             subagent: None,
             run_id: 0,
@@ -1441,7 +1462,7 @@ impl Drop for EventStreamGuard {
 /// split the terminal item and one of them would wait forever.
 #[derive(Debug)]
 pub struct SessionEvents {
-    rx: Receiver<Envelope>,
+    rx: UnboundedReceiver<Envelope>,
     /// Kept instead of dropping `rx`, so a retained [`EventSender`] still
     /// reports success: the stream ends because the marker said so, never
     /// because a sender happened to notice a dead channel.
@@ -1454,14 +1475,14 @@ impl SessionEvents {
     /// delivered first and everything sent after it is lost. That is why a
     /// session drops its guard only once the run returned and history landed.
     ///
-    /// Cancel-safe: the only suspension point is flume's `recv_async`, which
+    /// Cancel-safe: the only suspension point is tokio's `recv`, which
     /// leaves a queued envelope in the queue when dropped.
     pub async fn next(&mut self) -> Option<Envelope> {
         if self.closed {
             return None;
         }
-        match self.rx.recv_async().await {
-            Ok(envelope) if !matches!(envelope.event, AgentEvent::StreamClosed) => Some(envelope),
+        match self.rx.recv().await {
+            Some(envelope) if !matches!(envelope.event, AgentEvent::StreamClosed) => Some(envelope),
             _ => {
                 self.closed = true;
                 None
@@ -2031,15 +2052,15 @@ mod tests {
 
     const FIRST_COST: f64 = 0.5;
     const SECOND_COST: f64 = 0.25;
-    const FIRST_INPUT: u32 = 10;
-    const SECOND_INPUT: u32 = 5;
+    const FIRST_INPUT: u64 = 10;
+    const SECOND_INPUT: u64 = 5;
     const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
     const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
     const CARRIED_ONCE_MSG: &str =
         "a carried balance shows on the child and stays counted once on the parent";
     const FLOAT_RESIDUE: f64 = 1e-12;
 
-    fn usage(input: u32) -> TokenUsage {
+    fn usage(input: u64) -> TokenUsage {
         TokenUsage {
             input,
             ..Default::default()
@@ -2122,7 +2143,7 @@ mod tests {
 
     #[test_case(SECOND_INPUT, Some(SECOND_COST) ; "spent_rounds_are_the_difference")]
     #[test_case(0, None ; "no_tokens_means_no_spend_despite_cost_residue")]
-    fn totals_since_an_earlier_reading(input: u32, expected_cost: Option<f64>) {
+    fn totals_since_an_earlier_reading(input: u64, expected_cost: Option<f64>) {
         let earlier = RunTotals {
             usage: usage(FIRST_INPUT),
             cost: Some(FIRST_COST),

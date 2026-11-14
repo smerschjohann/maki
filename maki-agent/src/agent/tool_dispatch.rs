@@ -158,16 +158,7 @@ pub async fn run(
         }
         Verdict::Denied(reason) => {
             warn!(tool = %name, reason = %reason, "input hook stopped the call");
-            return ToolDoneEvent {
-                call: None,
-                id,
-                tool: Arc::from(name),
-                output: Arc::new(ToolOutput::Plain(reason.into())),
-                is_error: true,
-                annotation: None,
-                written_path: None,
-                backgrounded: false,
-            };
+            return ToolDoneEvent::new(id, Arc::from(name), ToolOutput::Plain(reason.into()), true);
         }
     };
 
@@ -229,14 +220,10 @@ fn ran(id: String, tool: Arc<str>, result: ToolExecResult) -> Ran {
     let backgrounded = moved.is_some();
     let done = match output {
         Ok(output) => ToolDoneEvent {
-            call: None,
-            id,
-            tool,
-            output: Arc::new(output),
-            is_error: false,
             annotation,
             written_path,
             backgrounded,
+            ..ToolDoneEvent::new(id, tool, output, false)
         },
         Err(message) => ToolDoneEvent {
             tool,
@@ -655,7 +642,8 @@ impl Route<'_> {
 
     /// What hooking this call would lend. Every route answers here, so a new
     /// one cannot reach a hook without naming its price. Only a declared
-    /// capability narrows it: reading undeclared as free is what would let an
+    /// capability, or an explicit declaration that the tool reaches nothing,
+    /// narrows it: reading undeclared as free is what would let an
     /// unprivileged plugin steer `batch` or `code_execution` into any tool it
     /// likes.
     fn authority(&self) -> Option<Authority> {
@@ -871,16 +859,12 @@ async fn run_inner(
             if ctx.mcp.is_some() && is_wire_name(name) {
                 text = format!("{text}. {MCP_SERVER_GONE}");
             }
-            ToolDoneEvent {
-                call: None,
+            ToolDoneEvent::new(
                 id,
-                tool: Arc::from(UNKNOWN_MCP),
-                output: Arc::new(ToolOutput::Plain(text.into())),
-                is_error: true,
-                annotation: None,
-                written_path: None,
-                backgrounded: false,
-            }
+                Arc::from(UNKNOWN_MCP),
+                ToolOutput::Plain(text.into()),
+                true,
+            )
             .into()
         }
     }
@@ -1101,16 +1085,7 @@ fn run_tool_search(
         Ok(found) => (found, false),
         Err(e) => (e.into(), true),
     };
-    ToolDoneEvent {
-        call: None,
-        id,
-        tool: tool_id,
-        output: Arc::new(view.output(output)),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    }
+    ToolDoneEvent::new(id, tool_id, view.output(output), is_error)
 }
 
 /// Why a file-mutating tool is stopped before its permission check, if it is.
@@ -1190,16 +1165,7 @@ async fn run_local_tool(
             (e, true)
         }
     };
-    ToolDoneEvent {
-        call: None,
-        id,
-        tool: tool_id,
-        output: Arc::new(ToolOutput::Plain(output.into())),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    }
+    ToolDoneEvent::new(id, tool_id, ToolOutput::Plain(output.into()), is_error)
 }
 
 /// Enforce permission for a native tool. MCP tools bypass this — they go
@@ -1340,15 +1306,13 @@ async fn execute_mcp_tool(
 ) -> ToolDoneEvent {
     let view = RoutedView::mcp(&tool);
     emit_raw_start(ctx, origin, id, &tool, view.summary.clone(), input);
-    let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
-        call: None,
-        id: id.to_owned(),
-        tool: Arc::clone(&tool),
-        output: Arc::new(view.output(output)),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
+    let done = |output: TextOutput, is_error: bool| {
+        ToolDoneEvent::new(
+            id.to_owned(),
+            Arc::clone(&tool),
+            view.output(output),
+            is_error,
+        )
     };
 
     let perm_tool = match ToolKey::parse(&tool) {
@@ -1537,27 +1501,27 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::path::{Path, PathBuf};
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use flume::Receiver;
     use futures::FutureExt;
-    use maki_config::{
-        Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
-    };
+    use maki_config::project::{self, TrustMode};
+    use maki_config::{Effect, Permission, PermissionRule, PermissionsConfig, ToolKey};
     use maki_providers::{ContentBlock, Message, Role, StreamResponse};
     use maki_storage::id::MakiId;
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
     use tokio::time::sleep;
 
     use super::*;
     use crate::agent::history::History;
-    use crate::call_scope::TaskHome;
-    use crate::cancel::{CancelToken, CancelTrigger};
+    use crate::call_scope::{MovedTrigger, TaskHome};
+    use crate::cancel::CancelToken;
     use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
@@ -1601,6 +1565,10 @@ mod tests {
     const HOOK_DENY_REASON: &str = "not on my watch";
     const HOOK_OUTPUT_TEXT: &str = "trimmed";
     const HOOK_PERMISSION: Permission = Permission::Run;
+    const HOOK_REACH: ToolReach = ToolReach::Capability {
+        permission: HOOK_PERMISSION,
+        prompted: true,
+    };
     const HOOK_FIELD_TYPE: &str = "string";
     const HOOK_DIFF_COMMAND: &str = "apply";
     const HOOK_DIFF_PATH: &str = "/tmp/diffed.txt";
@@ -1713,7 +1681,7 @@ mod tests {
         registry
             .register(
                 tool,
-                ToolSource::Lua {
+                ToolSource {
                     plugin: TEST_PLUGIN.into(),
                 },
             )
@@ -1747,7 +1715,8 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             config,
             PathBuf::from(TEST_ROOT),
-            ProjectConfig::for_project(Path::new(TEST_ROOT)),
+            project::resolve_noninteractive(Path::new(TEST_ROOT), TrustMode::Session)
+                .project_config,
             Arc::default(),
         ));
         stub_ctx_with_permissions(mode, permissions)
@@ -1763,7 +1732,7 @@ mod tests {
 
     /// Its permission scope, its write target and its output are all its
     /// input, which is how a test sees the input each stage of dispatch got.
-    struct HookMock(Option<Permission>);
+    struct HookMock(Option<ToolReach>);
 
     struct HookMockInvocation(String);
 
@@ -1829,10 +1798,7 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
         }
         fn reach(&self) -> Option<ToolReach> {
-            self.0.map(|permission| ToolReach {
-                permission,
-                prompted: true,
-            })
+            self.0
         }
         fn tool_kind(&self) -> Option<&str> {
             Some(HOOK_TOOL_KIND)
@@ -2005,10 +1971,10 @@ mod tests {
 
     fn hooked_with(
         mut ctx: ToolContext,
-        permission: Option<Permission>,
+        reach: Option<ToolReach>,
         hook: RecordingHook,
     ) -> (ToolContext, RecordingHook) {
-        ctx.registry = registered(Arc::new(HookMock(permission)));
+        ctx.registry = registered(Arc::new(HookMock(reach)));
         ctx.registry.set_hook(hook.clone());
         (ctx, hook)
     }
@@ -2097,22 +2063,24 @@ mod tests {
 
     /// Hooking in dispatch is what reaches a route maki did not write the code
     /// behind, and each one has to answer for what that lends. Only a declared
-    /// capability narrows the price; everything else prices at the maximum.
+    /// capability, or a declaration that the tool reaches nothing, narrows the
+    /// price. Everything else prices at the maximum.
     /// The name stays the one the model called, not whatever dispatch routes
     /// it to.
-    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(HOOK_PERMISSION), Authority::Capability(HOOK_PERMISSION) ; "a_checked_tool_lends_its_capability")]
-    #[test_case(build_ctx,      HOOK_TOOL_NAME,        None,                  Authority::Unbounded                   ; "a_tool_declaring_nothing_declares_no_limit")]
-    #[test_case(mcp_route_ctx,  TOOL_SEARCH_TOOL_NAME, None,                  Authority::Unbounded                   ; "search_declares_nothing_either")]
-    #[test_case(mcp_route_ctx,  PROBE_WIRE,            None,                  Authority::Unbounded                   ; "an_mcp_tool_is_code_maki_does_not_own")]
-    #[test_case(host_route_ctx, CLIENT_NAME,           None,                  Authority::Unbounded                   ; "a_host_tool_is_code_maki_does_not_own")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(HOOK_REACH),       Authority::Capability(HOOK_PERMISSION) ; "a_checked_tool_lends_its_capability")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(ToolReach::Inert), Authority::Inert                       ; "an_inert_tool_lends_nothing")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        None,                   Authority::Unbounded                   ; "a_tool_declaring_nothing_declares_no_limit")]
+    #[test_case(mcp_route_ctx,  TOOL_SEARCH_TOOL_NAME, None,                   Authority::Unbounded                   ; "search_declares_nothing_either")]
+    #[test_case(mcp_route_ctx,  PROBE_WIRE,            None,                   Authority::Unbounded                   ; "an_mcp_tool_is_code_maki_does_not_own")]
+    #[test_case(host_route_ctx, CLIENT_NAME,           None,                   Authority::Unbounded                   ; "a_host_tool_is_code_maki_does_not_own")]
     #[tokio::test]
     async fn a_route_lends_the_authority_it_declares(
         build: fn() -> ToolContext,
         name: &str,
-        permission: Option<Permission>,
+        reach: Option<ToolReach>,
         expected: Authority,
     ) {
-        let (ctx, hook) = hooked_with(build(), permission, RecordingHook::default());
+        let (ctx, hook) = hooked_with(build(), reach, RecordingHook::default());
         dispatch(&ctx, name, &call_input(HOOK_PLAIN)).await;
 
         let firing = hook.at(HookStage::Input).expect("the input stage fired");
@@ -2346,7 +2314,7 @@ mod tests {
     /// and ends as `ending` says. It lands where the test reads it.
     #[derive(Clone)]
     struct MovedMock {
-        landed: flume::Sender<Option<ToolDoneEvent>>,
+        landed: UnboundedSender<Option<ToolDoneEvent>>,
         ending: MovedEnding,
     }
 
@@ -2406,11 +2374,11 @@ mod tests {
         answer: fn(HookStage, &Value) -> Verdict,
     ) -> (
         ToolDoneEvent,
-        flume::Receiver<Option<ToolDoneEvent>>,
+        UnboundedReceiver<Option<ToolDoneEvent>>,
         Arc<CallScope>,
         RecordingHook,
     ) {
-        let (landed, landed_rx) = flume::bounded(1);
+        let (landed, landed_rx) = unbounded_channel();
         let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
         let mut ctx = build_ctx();
         ctx.cancel = scope.cancel().clone();
@@ -2445,10 +2413,10 @@ mod tests {
     /// output carries the instructions found before it.
     #[tokio::test]
     async fn a_moved_calls_receipt_and_final_result_both_take_the_output_pipeline() {
-        let (receipt, landed, scope, hook) =
+        let (receipt, mut landed, scope, hook) =
             dispatch_moved(MovedEnding::Replies, redact_the_output).await;
         let landed = landed
-            .recv_async()
+            .recv()
             .await
             .expect("the tail landed")
             .expect("the call replied");
@@ -2481,16 +2449,10 @@ mod tests {
     #[test_case(MovedEnding::Panics ; "the_pipeline_dies")]
     #[tokio::test]
     async fn a_published_move_always_lands(ending: MovedEnding) {
-        let (receipt, landed, _scope, hook) = dispatch_moved(ending, redact_the_output).await;
+        let (receipt, mut landed, _scope, hook) = dispatch_moved(ending, redact_the_output).await;
 
         assert!(receipt.backgrounded);
-        assert!(
-            landed
-                .recv_async()
-                .await
-                .expect("the tail landed")
-                .is_none()
-        );
+        assert!(landed.recv().await.expect("the tail landed").is_none());
         assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
     }
 
@@ -2503,12 +2465,13 @@ mod tests {
     async fn a_receipt_failed_by_a_layer_unpublishes_the_move(
         answer: fn(HookStage, &Value) -> Verdict,
     ) {
-        let (receipt, landed, _scope, hook) = dispatch_moved(MovedEnding::Replies, answer).await;
+        let (receipt, mut landed, _scope, hook) =
+            dispatch_moved(MovedEnding::Replies, answer).await;
 
         assert!(receipt.is_error);
         assert!(!receipt.backgrounded);
         assert!(
-            landed.recv_async().await.is_err(),
+            landed.recv().await.is_none(),
             "dropped unlanded, which abandons the move"
         );
         let receipts: Vec<_> = output_firings(&hook)
@@ -2669,9 +2632,9 @@ mod tests {
     fn answered(
         mut ctx: ToolContext,
         answer: PermissionAnswer,
-    ) -> (ToolContext, Receiver<Envelope>) {
-        let (event_tx, events) = flume::unbounded();
-        let (answer_tx, answer_rx) = flume::unbounded();
+    ) -> (ToolContext, UnboundedReceiver<Envelope>) {
+        let (event_tx, events) = unbounded_channel();
+        let (answer_tx, answer_rx) = unbounded_channel();
         answer_tx
             .send(TaggedAnswer::new(TEST_ID, answer).encode())
             .unwrap();
@@ -2680,9 +2643,8 @@ mod tests {
         (ctx, events)
     }
 
-    fn prompts(events: &Receiver<Envelope>) -> Vec<Prompt> {
-        events
-            .try_iter()
+    fn prompts(events: &mut UnboundedReceiver<Envelope>) -> Vec<Prompt> {
+        iter::from_fn(|| events.try_recv().ok())
             .filter_map(|envelope| match envelope.event {
                 AgentEvent::PermissionRequest {
                     tool,
@@ -2745,12 +2707,12 @@ mod tests {
         answer: PermissionAnswer,
         expected_start: String,
     ) {
-        let (ctx, events) = answered(build(), answer);
+        let (ctx, mut events) = answered(build(), answer);
         let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_as_is));
         let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
         assert_eq!(
-            prompts(&events),
+            prompts(&mut events),
             vec![asked(
                 ToolKey::native(HOOK_TOOL_NAME),
                 HOOK_PLAIN.to_owned()
@@ -2764,12 +2726,12 @@ mod tests {
     /// runs, or approving one command would run another.
     #[tokio::test]
     async fn an_ask_with_a_rewrite_prompts_for_and_runs_the_rewrite() {
-        let (ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+        let (ctx, mut events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
         let (ctx, _hook) = hooked_with(ctx, None, RecordingHook::answering(ask_with_a_rewrite));
         let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
         assert_eq!(
-            prompts(&events),
+            prompts(&mut events),
             vec![asked(
                 ToolKey::native(HOOK_TOOL_NAME),
                 HOOK_REWRITTEN_TO.to_owned()
@@ -2785,7 +2747,7 @@ mod tests {
     /// The queued allow is the control: were the user asked, the call would run.
     #[tokio::test]
     async fn a_deny_rule_refuses_an_ask_without_prompting() {
-        let (ctx, events) = answered(
+        let (ctx, mut events) = answered(
             denying_ctx(ToolKey::native(HOOK_TOOL_NAME)),
             PermissionAnswer::AllowOnce,
         );
@@ -2795,10 +2757,10 @@ mod tests {
         assert!(done.is_error);
         let text = done.output.as_text();
         assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
-        assert!(prompts(&events).is_empty());
+        assert!(prompts(&mut events).is_empty());
     }
 
-    fn moved_away(scope: &CallScope) -> CancelTrigger {
+    fn moved_away(scope: &CallScope) -> MovedTrigger {
         scope
             .move_to(TaskHome {
                 chat: MakiId::generate(),
@@ -2811,7 +2773,7 @@ mod tests {
     /// The queued allow is the control: were the user asked, the call would run.
     #[tokio::test]
     async fn a_moved_call_asks_nobody() {
-        let (mut ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+        let (mut ctx, mut events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
         let scope = Arc::new(CallScope::new(TEST_ID.to_owned(), &CancelToken::none()));
         let _task = moved_away(&scope);
         ctx.call = Some(scope);
@@ -2819,13 +2781,13 @@ mod tests {
         let done = dispatch_nested(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
         assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
-        assert!(prompts(&events).is_empty());
+        assert!(prompts(&mut events).is_empty());
     }
 
     #[tokio::test]
     async fn a_move_withdraws_the_ask_and_frees_the_prompt_channel() {
-        let (event_tx, events) = flume::unbounded();
-        let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+        let (event_tx, mut events) = unbounded_channel();
+        let (_answer_tx, answer_rx) = unbounded_channel::<String>();
         let mut ctx = build_ctx();
         ctx.event_tx = EventSender::new(event_tx, 0);
         let channel = Arc::new(AsyncMutex::new(answer_rx));
@@ -2837,7 +2799,7 @@ mod tests {
         let input = call_input(HOOK_PLAIN);
         let mut done = pin!(dispatch_nested(&ctx, HOOK_TOOL_NAME, &input));
         assert!(done.as_mut().now_or_never().is_none());
-        assert_eq!(prompts(&events).len(), 1);
+        assert_eq!(prompts(&mut events).len(), 1);
 
         let _task = moved_away(&scope);
         let done = done.await;
@@ -2872,11 +2834,11 @@ mod tests {
         tool: ToolKey,
         input: Value,
     ) {
-        let (ctx, events) = answered(build(), PermissionAnswer::AllowOnce);
+        let (ctx, mut events) = answered(build(), PermissionAnswer::AllowOnce);
         ctx.registry.set_hook(RecordingHook::answering(ask_as_is));
         dispatch(&ctx, name, &input).await;
 
-        assert_eq!(prompts(&events), vec![asked(tool, input.to_string())]);
+        assert_eq!(prompts(&mut events), vec![asked(tool, input.to_string())]);
     }
 
     #[tokio::test]
@@ -2979,7 +2941,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_tool_notify_emits_tool_start_with_raw_input() {
-        let (tx, rx) = flume::unbounded::<crate::Envelope>();
+        let (tx, mut rx) = unbounded_channel::<Envelope>();
         let event_tx = crate::EventSender::new(tx, 0);
         let mut ctx =
             crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
@@ -3056,14 +3018,13 @@ mod tests {
         assert_eq!(view.summary, summary);
         assert_eq!(view.markdown, markdown);
 
-        let (tx, events) = flume::unbounded();
+        let (tx, mut events) = unbounded_channel();
         let ctx = with_mcp(
             stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(tx, 0)), None),
             &stub_mcp(&[PROBE_QUALIFIED]),
         );
         let done = dispatch(&ctx, name, &input).await;
-        let start = events
-            .try_iter()
+        let start = iter::from_fn(|| events.try_recv().ok())
             .find_map(|envelope| match envelope.event {
                 AgentEvent::ToolStart(start) => Some(start),
                 _ => None,
@@ -3471,8 +3432,8 @@ mod tests {
     async fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
         let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
         ctx.registry = registered(Arc::new(GuardedMock));
-        let (event_tx, events) = flume::unbounded();
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
+        let (answer_tx, answer_rx) = unbounded_channel();
         ctx.event_tx = EventSender::new(event_tx, 0);
         ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
         ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
@@ -3480,7 +3441,7 @@ mod tests {
 
         let user = async {
             while !matches!(
-                events.recv_async().await.unwrap().event,
+                events.recv().await.unwrap().event,
                 AgentEvent::PermissionRequest { .. }
             ) {}
             sleep(PROMPT_THINK_TIME).await;
@@ -3601,7 +3562,7 @@ mod tests {
         run: CancelToken,
         on_call: impl Fn(&ToolContext) + Send + Sync + 'static,
     ) -> Vec<CallView> {
-        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let (tx, _rx) = unbounded_channel::<Envelope>();
         let event_tx = EventSender::new(tx, 0);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
         ctx.cancel = run;
@@ -3659,7 +3620,7 @@ mod tests {
         const SLOW_DELAY: Duration = Duration::from_millis(50);
         const PANIC_MESSAGE: &str = "probe exploded";
 
-        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let (tx, _rx) = unbounded_channel::<Envelope>();
         let event_tx = EventSender::new(tx, 0);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
         ctx.local_tools = Arc::new(HashMap::from([(
@@ -3756,7 +3717,9 @@ mod telemetry_tests {
 
 #[cfg(test)]
 mod layer_mark_tests {
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::tools::test_support::stub_ctx_with;
@@ -3774,22 +3737,20 @@ mod layer_mark_tests {
         marked_rows: &[&str],
         streamed: &[&str],
     ) {
-        let (event_tx, events) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(event_tx, 0)), row);
-        let (sink, live) = flume::unbounded();
+        let (sink, mut live) = unbounded_channel();
         ctx.live_sink = Some(sink);
 
         mark_allowed_by(&ctx, Arc::from(PLUGIN));
 
-        let rows: Vec<String> = events
-            .try_iter()
+        let rows: Vec<String> = iter::from_fn(|| events.try_recv().ok())
             .filter_map(|envelope| match envelope.event {
                 AgentEvent::AllowedByPlugin { id, plugin } if plugin == PLUGIN => Some(id),
                 _ => None,
             })
             .collect();
-        let sent: Vec<String> = live
-            .try_iter()
+        let sent: Vec<String> = iter::from_fn(|| live.try_recv().ok())
             .filter_map(|ev| match ev {
                 ToolLive::AllowedBy(plugin) => Some(plugin.to_string()),
                 _ => None,

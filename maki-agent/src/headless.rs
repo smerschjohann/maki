@@ -1,11 +1,11 @@
 use std::future::Future;
+use std::iter;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use flume::{Receiver, Sender};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
@@ -15,11 +15,13 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 use tokio::time::{sleep_until, timeout};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
-use crate::agent::{self, RunContext, RunContextBuilder};
+use crate::agent::{self, HostPrompt, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
@@ -226,8 +228,8 @@ impl Next {
 
 /// Where an interactive session's turns come from.
 struct Inputs {
-    prompts: Receiver<AgentInput>,
-    modes: Receiver<AgentMode>,
+    prompts: UnboundedReceiver<AgentInput>,
+    modes: UnboundedReceiver<AgentMode>,
     keep_alive: KeepAlive,
     /// Ends the session at once, whatever is still out.
     stop: CancelToken,
@@ -244,10 +246,10 @@ impl Inputs {
     async fn next(&mut self) -> Option<Next> {
         let stop = self.stop.clone();
         let next = async {
-            if let Ok(input) = self.prompts.recv_async().await {
+            if let Some(input) = self.prompts.recv().await {
                 return Some(Next::Prompt(input));
             }
-            if let Some(mode) = self.modes.try_iter().last() {
+            if let Some(mode) = iter::from_fn(|| self.modes.try_recv().ok()).last() {
                 self.keep_alive.switch_mode(mode);
             }
             self.keep_alive.next_input().await.map(Next::Woken)
@@ -302,6 +304,29 @@ async fn connect(
     }
 }
 
+/// Whether the current model has heard back from its provider's listing.
+enum Listing {
+    Due,
+    Answered,
+}
+
+/// Runs under a turn's cancel, so a host's cancel ends this wait and that turn
+/// instead of being dropped as meant for the turn before. A cancelled wait stays
+/// due, so the next turn lists it.
+async fn await_listing(model: &Model, provider: &dyn Provider, cancel: &CancelToken) -> Listing {
+    let Ok(answer) = cancel
+        .race(provider::discover_provider(model, provider))
+        .await
+    else {
+        return Listing::Due;
+    };
+    if let Err(e) = answer {
+        warn!(provider = %model.provider, error = %e, "failed to list models, using static fallback");
+        eprintln!("warning: {}: {e} (using static fallback)", model.provider);
+    }
+    Listing::Answered
+}
+
 /// What a session task ends with, before its MCP is torn down: the track
 /// is out of the task whatever that teardown does, so it never drops on an
 /// executor thread after the caller stopped looking.
@@ -326,8 +351,7 @@ struct ContextSpec {
     excluded_tools: Vec<&'static str>,
     mcp: bool,
     background: bool,
-    system_override: Option<String>,
-    append_system: Option<String>,
+    host_prompt: HostPrompt,
 }
 
 impl ContextSpec {
@@ -349,8 +373,7 @@ impl ContextSpec {
             excluded_tools,
             mcp: mcp.is_some(),
             background: true,
-            system_override: None,
-            append_system: None,
+            host_prompt: HostPrompt::default(),
         }
     }
 
@@ -365,19 +388,8 @@ impl ContextSpec {
             self.mcp,
             self.background,
         );
-        let mut context = match &self.system_override {
-            Some(system) => {
-                RunContext::fixed(system.clone(), tools).with_prompt_policy(&self.slots)
-            }
-            None => RunContext::render(&self.vars, &self.instructions, &self.slots, model, tools),
-        };
-        if let Some(append) = &self.append_system {
-            for text in [&mut context.system, &mut context.authored] {
-                text.push('\n');
-                text.push_str(append);
-            }
-        }
-        context
+        self.host_prompt
+            .context(&self.vars, &self.instructions, &self.slots, model, tools)
     }
 
     fn builder(self) -> RunContextBuilder {
@@ -417,8 +429,7 @@ pub struct InteractiveParams {
     /// Nobody answers permission prompts, so they are denied at once instead
     /// of waiting forever.
     pub unattended: bool,
-    pub system_prompt_override: Option<String>,
-    pub append_system_prompt: Option<String>,
+    pub host_prompt: HostPrompt,
     /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
     /// are what a host without toggles puts on every [`AgentInput`] it sends.
     pub defaults: SessionDefaults,
@@ -439,12 +450,12 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
-    pub input_tx: Sender<AgentInput>,
-    pub answer_tx: Sender<String>,
-    pub cancel_tx: Sender<()>,
-    pub model_tx: Sender<Model>,
+    pub input_tx: UnboundedSender<AgentInput>,
+    pub answer_tx: UnboundedSender<String>,
+    pub cancel_tx: watch::Sender<()>,
+    pub model_tx: UnboundedSender<Model>,
     /// Send through [`Self::switch_mode`], which also tells background work.
-    pub mode_tx: Sender<AgentMode>,
+    pub mode_tx: UnboundedSender<AgentMode>,
     pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
     pub task: SessionTask,
@@ -469,8 +480,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"), &params.config.instructions);
     let spec = ContextSpec {
-        system_override: params.system_prompt_override,
-        append_system: params.append_system_prompt,
+        host_prompt: params.host_prompt,
         background: params.background.seeded(),
         ..ContextSpec::new(
             vars,
@@ -492,11 +502,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
-    let (model_tx, model_rx) = flume::unbounded::<Model>();
-    let (mode_tx, mode_rx) = flume::unbounded::<AgentMode>();
+    let (input_tx, input_rx) = unbounded_channel::<AgentInput>();
+    let (answer_tx, answer_rx) = unbounded_channel::<String>();
+    let (cancel_tx, cancel_rx) = watch::channel(());
+    let (model_tx, mut model_rx) = unbounded_channel::<Model>();
+    let (mode_tx, mode_rx) = unbounded_channel::<AgentMode>();
 
     let session_ref = params.resumed.id.clone();
     let mailbox = open_mailbox(&params.resumed);
@@ -553,6 +563,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             stop: params.stop.clone(),
         };
         let mut run_id: u64 = 0;
+        let mut listing = Listing::Due;
 
         while let Some(next) = inputs.next().await {
             let (trigger, cancel) = params.stop.child();
@@ -568,8 +579,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             let event_tx = base_tx.with_run_id(run_id);
             let error_tx = event_tx.clone();
 
-            if let Some(mut new_model) = model_rx
-                .try_iter()
+            if let Some(mut new_model) = iter::from_fn(|| model_rx.try_recv().ok())
                 .last()
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                 && new_model.spec() != model.spec()
@@ -578,12 +588,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     Some(switched) => {
                         provider = switched;
                         model = new_model;
-                        if let Some(seed) = &seed {
-                            seed.model_slot.store(Arc::new(ModelSlot {
-                                model: model.clone(),
-                                provider: Arc::clone(&provider),
-                            }));
-                        }
+                        listing = Listing::Due;
                     }
                     None if !next.survives_failed_switch() => {
                         run_id += 1;
@@ -592,6 +597,19 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     None => {}
                 }
             }
+            if matches!(listing, Listing::Due) {
+                listing = await_listing(&model, provider.as_ref(), &cancel).await;
+            }
+            // The host or another session can discover the provider long after
+            // our own listing gave up, so every turn reads the registry again.
+            provider::refresh_model(&mut model, provider.as_ref());
+            // Plugin work started off the seed must run on this turn's model.
+            if let Some(seed) = &seed {
+                seed.model_slot.store(Arc::new(ModelSlot {
+                    model: model.clone(),
+                    provider: Arc::clone(&provider),
+                }));
+            }
             let input = next.into_input();
 
             // An ask holds this lock from before its request goes out until
@@ -599,7 +617,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             // taker. A call moved to the background can still be parked on
             // it after its run ended: then whatever is queued may be its
             // answer, and the new run must not wait for it to arrive.
-            if let Ok(answers) = answer_rx.try_lock() {
+            if let Ok(mut answers) = answer_rx.try_lock() {
                 while answers.try_recv().is_ok() {}
             }
 
@@ -625,7 +643,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     prompt_slots: Arc::clone(&params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     ledger: turn.ledger(),
-                    registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
                 },
@@ -678,11 +695,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 /// meant for the turn before. Prompt and cancel ride separate channels, so a
 /// cancel sent right after a prompt, before the loop picked that prompt up,
 /// is dropped with it.
-fn relay_cancel(cancel_rx: &Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
-    while cancel_rx.try_recv().is_ok() {}
-    let cancel_rx = cancel_rx.clone();
+fn relay_cancel(cancel_rx: &watch::Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
+    let mut cancel_rx = cancel_rx.clone();
+    cancel_rx.mark_unchanged();
     AbortOnDropHandle::new(tokio::spawn(async move {
-        if cancel_rx.recv_async().await.is_ok() {
+        if cancel_rx.changed().await.is_ok() {
             trigger.cancel();
         }
     }))
@@ -730,13 +747,27 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{pending, ready};
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures::FutureExt;
+    use maki_config::project::{self, TrustMode};
+    use maki_config::providers::Protocol;
+    use maki_providers::model::ModelTier;
+    use maki_providers::model_registry;
+    use maki_providers::plugin::{
+        self, DeclAuthority, Hook, ProviderDecl, ProviderHooks, Registration,
+    };
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::{AgentError, ModelInfo, ProviderEvent, StreamResponse};
     use maki_storage::id::MakiId;
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::oneshot;
+    use tokio::task::yield_now;
 
     use super::*;
     use crate::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -778,6 +809,248 @@ mod tests {
     const DROPPED_RELAY_FREES_CHANNEL: &str =
         "a dropped relay must not take the next turn's cancel";
     const RELAY_WAIT: Duration = Duration::from_secs(5);
+    const LISTED_PROVIDER: &str = "copilot";
+    const LISTED_MODEL: &str = "listed-model";
+    const UNLISTED_MODEL: &str = "unlisted-model";
+    const NEVER_LISTED_PROVIDER: &str = "ollama";
+    const LISTED_WINDOW: u32 = 123_456;
+    const LISTING_FAILED: &str = "no listing";
+    const ONLY_LISTS_MODELS: &str = "only asked for its models";
+    const LISTING_WAITS: &str = "a hung listing holds the turn until it is cancelled";
+    const ANSWERING_SLUG: &str = "answering";
+    const HANGING_SLUG: &str = "hanging";
+    const FAILING_SLUG: &str = "failing";
+    const PLUGIN_ORIGIN: &str = "https://example.com";
+    const PLUGIN_HOST: &str = "example.com";
+    const LISTED_ONCE: &str = "an answered listing must not be asked again for the same model";
+    const LISTING_DUE: &str = "a switch and a cancelled wait must each list before the turn";
+    const TURN_ENDS: &str = "a turn must end by itself or on a cancel";
+    const SEED_PUBLISHED: &str = "a detached session publishes its seed";
+    const DISCOVERY_HEALS: &str =
+        "discovery that lands after a failed listing reaches the next turn";
+
+    type Listed = BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>;
+
+    struct ListingProvider(fn() -> Listed);
+
+    impl Provider for ListingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            unreachable!("{ONLY_LISTS_MODELS}")
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            (self.0)()
+        }
+    }
+
+    fn lists_window() -> Listed {
+        Box::pin(ready(Ok(vec![ModelInfo {
+            context_window: Some(LISTED_WINDOW),
+            ..ModelInfo::id_only(LISTED_MODEL.into())
+        }])))
+    }
+
+    fn fails() -> Listed {
+        Box::pin(ready(Err(AgentError::Config {
+            message: LISTING_FAILED.into(),
+        })))
+    }
+
+    fn hangs() -> Listed {
+        Box::pin(pending())
+    }
+
+    #[test_case(lists_window ; "a_listing_answers")]
+    #[test_case(fails ; "a_failed_listing_is_an_answer_too")]
+    #[tokio::test]
+    async fn an_answered_listing_is_no_longer_due(listing: fn() -> Listed) {
+        let model = Model::from_spec(&format!("{LISTED_PROVIDER}/{LISTED_MODEL}")).unwrap();
+        let answer = await_listing(&model, &ListingProvider(listing), &CancelToken::none()).await;
+        assert!(matches!(answer, Listing::Answered));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_leaves_a_hung_listing_due() {
+        let (trigger, cancel) = CancelToken::new();
+        let model = Model::from_spec(&format!("{NEVER_LISTED_PROVIDER}/{UNLISTED_MODEL}")).unwrap();
+        let provider = ListingProvider(hangs);
+        let mut waiting = pin!(await_listing(&model, &provider, &cancel));
+        assert!(waiting.as_mut().now_or_never().is_none(), "{LISTING_WAITS}");
+        trigger.cancel();
+        assert!(matches!(waiting.await, Listing::Due));
+    }
+
+    struct CalledListing {
+        called: UnboundedSender<()>,
+        listing: fn() -> Listed,
+    }
+
+    impl Hook<(), Vec<ModelInfo>> for CalledListing {
+        fn call(&self, (): ()) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            self.called.send(()).unwrap();
+            (self.listing)()
+        }
+    }
+
+    fn register_listed(slug: &str, listing: fn() -> Listed) -> UnboundedReceiver<()> {
+        let (called, calls) = unbounded_channel();
+        plugin::register(
+            Registration {
+                decl: ProviderDecl {
+                    slug: slug.into(),
+                    display_name: slug.into(),
+                    codec: Some(Protocol::Openai),
+                    base_url: Some(PLUGIN_ORIGIN.into()),
+                    net_hosts: vec![PLUGIN_HOST.into()],
+                    models: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "prefixes": [LISTED_MODEL],
+                            "tier": ModelTier::Strong,
+                        }))
+                        .unwrap(),
+                    ],
+                    ..ProviderDecl::default()
+                },
+                hooks: ProviderHooks {
+                    list_models: Some(Arc::new(CalledListing { called, listing })),
+                    ..ProviderHooks::default()
+                },
+            },
+            DeclAuthority::Config,
+            &[],
+        )
+        .unwrap();
+        calls
+    }
+
+    fn plugin_model(slug: &str) -> Model {
+        Model::from_spec(&format!("{slug}/{LISTED_MODEL}")).unwrap()
+    }
+
+    async fn next_done(events: &mut SessionEvents) {
+        loop {
+            let envelope = timeout(RELAY_WAIT, events.next())
+                .await
+                .expect(TURN_ENDS)
+                .expect(TURN_ENDS);
+            if matches!(envelope.event, AgentEvent::Done { .. }) {
+                return;
+            }
+        }
+    }
+
+    /// A `max_turns` of zero ends every run before it would reach the provider.
+    fn spawn_listing_session(
+        tmp: &TempDir,
+        model: Model,
+        background: BackgroundMode,
+    ) -> (InteractiveHandle, SessionEvents) {
+        let id = MakiId::generate();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        spawn_interactive(InteractiveParams {
+            model,
+            config: AgentConfig {
+                max_turns: Some(0),
+                ..AgentConfig::default()
+            },
+            permissions_config: PermissionsConfig::default(),
+            timeouts: Timeouts::default(),
+            prompt_slots: Arc::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: tmp.path().to_path_buf(),
+            resumed: Resumed::empty(SessionRef::from(id)),
+            claim: SessionClaim::acquire(id, &dir).expect("nothing else holds it"),
+            storage: dir,
+            yolo: false,
+            unattended: true,
+            host_prompt: HostPrompt::default(),
+            defaults: SessionDefaults::default(),
+            model_policy: Arc::default(),
+            plugin_rules: Arc::default(),
+            project_config: project::resolve_noninteractive(tmp.path(), TrustMode::Session)
+                .project_config,
+            local_tools: LocalTools::default(),
+            background,
+            stop: CancelToken::none(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_session_lists_per_model_and_a_cancel_ends_the_wait() {
+        plugin::begin_load();
+        let answered = register_listed(ANSWERING_SLUG, lists_window);
+        let mut hung = register_listed(HANGING_SLUG, hangs);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) =
+            spawn_listing_session(&tmp, plugin_model(ANSWERING_SLUG), BackgroundMode::Blocking);
+
+        for _ in 0..2 {
+            handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            next_done(&mut events).await;
+        }
+        assert_eq!(answered.len(), 1, "{LISTED_ONCE}");
+
+        handle.model_tx.send(plugin_model(HANGING_SLUG)).unwrap();
+        for _ in 0..2 {
+            handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            timeout(RELAY_WAIT, hung.recv())
+                .await
+                .expect(LISTING_DUE)
+                .unwrap();
+            handle.cancel_tx.send(()).unwrap();
+            next_done(&mut events).await;
+        }
+    }
+
+    /// #1264: ACP's own discovery often lands seconds after the session's
+    /// listing gave up. The next turn must pick it up instead of keeping the
+    /// fallback window for good.
+    #[tokio::test]
+    async fn a_failed_listing_heals_when_discovery_lands() {
+        plugin::begin_load();
+        let listed = register_listed(FAILING_SLUG, fails);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) =
+            spawn_listing_session(&tmp, plugin_model(FAILING_SLUG), BackgroundMode::Detached);
+        let slot_window = || {
+            AgentSeed::live(handle.session_id.id())
+                .expect(SEED_PUBLISHED)
+                .model_slot
+                .load()
+                .model
+                .context_window
+        };
+
+        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        next_done(&mut events).await;
+        assert_ne!(slot_window(), LISTED_WINDOW);
+
+        model_registry::set_known_models(
+            FAILING_SLUG,
+            vec![ModelInfo {
+                context_window: Some(LISTED_WINDOW),
+                ..ModelInfo::id_only(LISTED_MODEL.into())
+            }],
+        );
+        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        next_done(&mut events).await;
+        assert_eq!(slot_window(), LISTED_WINDOW, "{DISCOVERY_HEALS}");
+        assert_eq!(listed.len(), 1, "{LISTED_ONCE}");
+    }
 
     /// A host-written prompt never had maki's facts in it. If the frame
     /// claimed it did, a later edit would be announced to a model that never
@@ -799,7 +1072,7 @@ mod tests {
             ..Default::default()
         };
         let spec = ContextSpec {
-            system_override: system_override.map(String::from),
+            host_prompt: HostPrompt::new(system_override, None),
             ..ContextSpec::new(
                 template::Vars::new(),
                 &instructions,
@@ -828,7 +1101,7 @@ mod tests {
         let mut prompts = ResolvedPrompts::default();
         prompts.set_template(PromptId::System, PLUGIN_SYSTEM.into());
         let spec = ContextSpec {
-            system_override: explicit.map(String::from),
+            host_prompt: HostPrompt::new(explicit, None),
             ..ContextSpec::new(
                 template::Vars::new(),
                 &agent::Instructions {
@@ -896,7 +1169,7 @@ mod tests {
         let (guard, mut events) = event_stream();
         let retained = guard.sender(RUN_ID);
         let event_tx = retained.clone();
-        let (cmd_tx, cmd_rx) = flume::unbounded();
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
 
         let ended = run_session(guard, Some(McpHandle::for_test(cmd_tx)), async move {
             let _ = event_tx.send(AgentEvent::Error {
@@ -934,14 +1207,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancel_sent_between_turns_does_not_end_the_next_one() {
-        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
-        cancel_tx.try_send(()).unwrap();
+        let (cancel_tx, cancel_rx) = watch::channel(());
+        cancel_tx.send(()).unwrap();
         let (trigger, cancel) = CancelToken::none().child();
         let relay = relay_cancel(&cancel_rx, trigger);
-        assert!(cancel_rx.is_empty(), "{STALE_CANCEL_IGNORED}");
+        yield_now().await;
         assert!(!cancel.is_cancelled(), "{STALE_CANCEL_IGNORED}");
 
-        cancel_tx.send_async(()).await.unwrap();
+        cancel_tx.send(()).unwrap();
         relay.await.unwrap();
         assert!(cancel.is_cancelled(), "{LIVE_CANCEL_ENDS_TURN}");
     }
@@ -949,13 +1222,13 @@ mod tests {
     /// A turn skipped by a failed model switch drops its relay unawaited.
     #[tokio::test]
     async fn a_dropped_relay_does_not_take_the_next_turns_cancel() {
-        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
+        let (cancel_tx, cancel_rx) = watch::channel(());
         let (stale_trigger, _stale) = CancelToken::none().child();
         drop(relay_cancel(&cancel_rx, stale_trigger));
         let (trigger, cancel) = CancelToken::none().child();
         let relay = relay_cancel(&cancel_rx, trigger);
 
-        cancel_tx.send_async(()).await.unwrap();
+        cancel_tx.send(()).unwrap();
         assert!(
             timeout(RELAY_WAIT, relay).await.is_ok(),
             "{DROPPED_RELAY_FREES_CHANNEL}"
@@ -985,6 +1258,7 @@ mod tests {
         mailbox.settle(
             TASK_ID,
             Some(BackgroundNotice {
+                markdown: false,
                 text: NOTICE_BODY.into(),
                 display: None,
                 wake: true,
@@ -997,9 +1271,13 @@ mod tests {
         mailbox: &SessionMailbox,
         background: BackgroundMode,
         stop: CancelToken,
-    ) -> (Inputs, Sender<AgentInput>, Sender<AgentMode>) {
-        let (prompt_tx, prompts) = flume::unbounded();
-        let (mode_tx, modes) = flume::unbounded();
+    ) -> (
+        Inputs,
+        UnboundedSender<AgentInput>,
+        UnboundedSender<AgentMode>,
+    ) {
+        let (prompt_tx, prompts) = unbounded_channel();
+        let (mode_tx, modes) = unbounded_channel();
         let inputs = Inputs {
             prompts,
             modes,
@@ -1234,12 +1512,12 @@ mod tests {
     /// queued.
     #[tokio::test]
     async fn await_shutdown_waits_for_a_task_that_still_works() {
-        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        let (release_tx, release_rx) = oneshot::channel::<()>();
         let finished = Arc::new(AtomicBool::new(false));
         let task = AbortOnDropHandle::new(tokio::spawn({
             let finished = Arc::clone(&finished);
             async move {
-                let _ = release_rx.recv_async().await;
+                let _ = release_rx.await;
                 finished.store(true, Ordering::SeqCst);
                 SessionEnd::default()
             }

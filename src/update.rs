@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use maki_storage::paths::canonicalize_clean;
+use maki_storage::stdin;
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
@@ -116,9 +117,16 @@ fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
+    // Close our handle before spawning: on Windows, powershell -File refuses to
+    // open the script while we still hold it open for write ("The process
+    // cannot access the file ... it is being used by another process"), so
+    // every `maki update` on Windows fails. TempPath still deletes the file
+    // when dropped.
+    let tmp_path = tmp.into_temp_path();
+
     let status = std::process::Command::new(INSTALLER.program)
         .args(INSTALLER.args)
-        .arg(tmp.path())
+        .arg(tmp_path.as_os_str())
         .env(INSTALL_DIR_ENV, install_dir)
         .status()
         .map_err(UpdateError::ExecScript)?;
@@ -202,14 +210,13 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
     Ok(())
 }
 
-fn prompt_yes(install_dir: &Path) -> bool {
+async fn prompt_yes(install_dir: &Path) -> bool {
     eprint!(
         "Install to {} and run this script? [y/N] ",
         install_dir.display()
     );
     let _ = std::io::stderr().flush();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
+    matches!(stdin::read_line().await, Ok(Some(answer)) if answer.trim().eq_ignore_ascii_case("y"))
 }
 
 pub async fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
@@ -245,7 +252,7 @@ pub async fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateErro
         println!("{}", maki_ui::highlight_ansi(INSTALLER.lang, &script));
     }
 
-    if !skip_confirm && !prompt_yes(&install_dir) {
+    if !skip_confirm && !prompt_yes(&install_dir).await {
         println!("Aborted.");
         return Ok(());
     }

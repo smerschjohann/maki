@@ -17,7 +17,7 @@ use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use crate::cli::Cli;
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
@@ -100,20 +100,10 @@ fn load_config(
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
-    if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
-    }
+    cli.apply_tool_flags(&mut config.agent)?;
+    // A turn cap would cut an interactive session short, so
+    // `Cli::check_run_path_flags` already refused it outside `-p` and SDK mode.
+    config.agent.max_turns = cli.max_turns;
     config.validate()?;
     Ok(config)
 }
@@ -291,9 +281,9 @@ async fn rebuild(
     Ok((stack, warnings, pack_report))
 }
 
-pub async fn run(mut cli: Cli) -> Result<()> {
+pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    maki_providers::model_registry::load(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
@@ -333,20 +323,19 @@ pub async fn run(mut cli: Cli) -> Result<()> {
     // in the UI's first frame. A headless run returns before the UI exists and
     // drops it; its grant is already visible through `maki trust list`.
     let mut notice = None;
-    // `unanswered` rather than `question`: a recorded `Never` is an answer, and
-    // neither the card nor the policy may overturn one.
-    let answer = trust.state.unanswered().and_then(|question| {
-        policy_grant(question, &stack.config.trust)
-            .map(|pattern| {
-                notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
-                TrustAnswer::Trust
-            })
-            // `prompt = false` silences the card only: a `paths` match is an
-            // answer given in advance, not a prompt.
-            .or_else(|| {
-                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
-            })
-    });
+    let answer = match policy_grant(&trust.state, &stack.config.trust) {
+        Some(pattern) => {
+            notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
+            Some(TrustAnswer::Trust)
+        }
+        // `prompt = false` silences the card only: a `paths` match is an
+        // answer given in advance, not a prompt.
+        None => trust
+            .state
+            .unanswered()
+            .filter(|_| can_ask && stack.config.trust.prompt)
+            .map(maki_ui::ask_trust),
+    };
     match answer {
         Some(answer) => {
             let was_trusted = trust.project_config.is_trusted();
@@ -398,8 +387,12 @@ pub async fn run(mut cli: Cli) -> Result<()> {
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
 
     if cli.is_sdk_mode() {
+        let prompt_slots = stack
+            .plugin_host
+            .event_handle()
+            .collect_prompt_slots(Some(resolved.id.as_str()))
+            .await;
         let (resumed, claim) = resolved.into_resumed();
-        let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
@@ -429,6 +422,7 @@ pub async fn run(mut cli: Cli) -> Result<()> {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         let background_wait = cli.background_wait();
+        let host_prompt = cli.host_prompt();
         let interrupt = crate::print::run(crate::print::PrintParams {
             model: stack.model,
             prompt: cli.initial_prompt,
@@ -443,6 +437,7 @@ pub async fn run(mut cli: Cli) -> Result<()> {
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
+            host_prompt,
             resumed,
             claim,
             storage: storage.clone(),
@@ -493,9 +488,14 @@ pub async fn run(mut cli: Cli) -> Result<()> {
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 startup_notice: notice.take(),
-                // Read per run: plugins have just (re)loaded, and a script one
-                // of them now replaces is no longer worth a word.
-                startup_alert: provider_scripts::startup_warning(),
+                // The scripts are read per run: plugins have just (re)loaded,
+                // and a script one of them now replaces is no longer worth a
+                // word. An alert, not a status-bar flash: both say where the
+                // user's files are, and a 1.5s flash is too short to read.
+                startup_alert: [legacy_notice.take(), provider_scripts::startup_warning()]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|shown, next| format!("{shown}\n\n{next}")),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -513,14 +513,17 @@ pub async fn run(mut cli: Cli) -> Result<()> {
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
                 input_rules_reader: stack.plugin_host.input_rules_reader(),
-                ui_action_rx: stack.plugin_host.ui_action_rx(),
-                ui_wake_rx: stack.plugin_host.ui_wake_rx(),
-                ui_attachment: stack.plugin_host.ui_attachment(),
+                ui_action_rx: stack
+                    .plugin_host
+                    .take_ui_action_rx()
+                    .expect("the UI takes the plugin action queue once"),
+                ui_waker: stack.plugin_host.ui_waker(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
-                trust_question: trust.state.question().cloned(),
+                trust: trust.state.clone(),
                 handed_over: std::mem::take(&mut handed_over),
+                host_prompt: cli.host_prompt(),
             },
             initial_prompt.take(),
         )
@@ -727,7 +730,7 @@ mod tests {
             &plugin_host,
             &cli,
             InitFiles::Disabled,
-            &ProjectConfig::for_project(dir.path()),
+            &project::resolve_noninteractive(dir.path(), TrustMode::Session).project_config,
             &no_names,
             &mut Vec::new(),
         )
@@ -768,7 +771,7 @@ mod tests {
             &plugin_host,
             &cli,
             InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
-            &ProjectConfig::for_project(dir.path()),
+            &project::resolve_noninteractive(dir.path(), TrustMode::Session).project_config,
             &no_names,
             &mut Vec::new(),
         ) {

@@ -6,13 +6,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flume::Sender;
 use maki_agent::agent::{AgentCall, AgentHook, AgentSlot};
 use maki_agent::permissions::LayerAnswer;
 use maki_agent::tools::ToolContext;
 use maki_agent::tools::hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 use crate::api::slot::{ANY_TOOL, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
 use crate::api::util::ctx::LuaCtx;
@@ -53,7 +54,7 @@ fn tool_layer_cost(authority: Authority) -> LayerCost<'static> {
 }
 
 pub(crate) struct SlotHook {
-    pub(crate) tx: Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     pub(crate) layered: Arc<LayeredTools>,
 }
 
@@ -68,13 +69,13 @@ impl SlotHook {
     /// down, leaves the value as it found it. A missing opinion is not a
     /// failure of whatever asked for it.
     fn send(&self, run: HookRun) -> BoxFuture<'_, Verdict> {
-        let (reply, answer) = flume::bounded(1);
+        let (reply, answer) = oneshot::channel();
         let request = Request::RunHook { run, reply };
         Box::pin(async move {
-            if self.tx.send_async(request).await.is_err() {
+            if self.tx.send(request).is_err() {
                 return Verdict::Unchanged;
             }
-            answer.recv_async().await.unwrap_or(Verdict::Unchanged)
+            answer.await.unwrap_or(Verdict::Unchanged)
         })
     }
 }
@@ -130,7 +131,7 @@ impl ToolHook for SlotHook {
             if !self.layered.layers_surface(PERMISSION_PROMPT_SLOT) {
                 return None;
             }
-            let (reply, answer) = flume::bounded(1);
+            let (reply, answer) = oneshot::channel();
             let run = PromptRun {
                 cost: tool_layer_cost(call.authority),
                 cancel: call.cancel.clone(),
@@ -143,11 +144,8 @@ impl ToolHook for SlotHook {
                 }),
                 ctx: Box::new(LuaCtx::handler(ctx)),
             };
-            self.tx
-                .send_async(Request::RunPrompt { run, reply })
-                .await
-                .ok()?;
-            answer.recv_async().await.ok().flatten()
+            self.tx.send(Request::RunPrompt { run, reply }).ok()?;
+            answer.await.ok().flatten()
         })
     }
 }

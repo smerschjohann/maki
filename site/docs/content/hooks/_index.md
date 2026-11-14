@@ -186,13 +186,15 @@ call, and the first skip shows a warning naming every missing key.
 
 | Tool | A layer needs |
 | --- | --- |
-| declares a permission, like `bash` | that permission, `session_read` and `session_write` |
-| declares none: `read`, `batch`, MCP tools, ACP client tools, `tool_search` | every permission |
+| declares a permission, like `bash` (`run`) | that permission, `session_read` and `session_write` |
+| declares `permission = {}`, like `todo_write` | `session_read` and `session_write` |
+| declares nothing, like `batch`, and any MCP tool, ACP client tool or `tool_search` | every permission except `agent` and `input` |
 
-Declaring no capability does not mean a tool uses none. `batch`,
-`code_execution` and `task` declare nothing while invoking any other tool, so
-reading undeclared as free would hand a plugin everything. Undeclared costs the
-maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
+The [Tools](/docs/tools/) page lists what each built-in declares. A tool that
+declares nothing may still reach anything: `batch`, `code_execution` and `task`
+call other tools. A tool author who sets `permission = {}` promises the tool
+reaches nothing past the conversation. See
+[plugin permissions](/docs/lua-api/#plugin-permissions).
 
 **A layer may wait, within a window.** Chains are async, so a layer can read a
 file or run a job before it decides. It runs inside the call it is filtering, so
@@ -252,9 +254,9 @@ A bare `return` in a `tool.*` layer skips the tool's own layers too, which can
 switch off another plugin's block. Hand the tools you do not care about to
 `prev` instead.
 
-Each call charges the layer what that tool charges. A plugin granted only `run`
-has its `tool.*` layer run for `bash` and skipped for `read`, which declares no
-capability.
+Each call charges the layer what that tool charges. A plugin granted `run`,
+`session_read` and `session_write` has its `tool.*` layer run for `bash` and
+skipped for `read`, which declares `fs_read`.
 
 ## Agent slots
 
@@ -273,6 +275,13 @@ inside a subagent), `model`, `context_size`, `context_window`, and
 
 A layer on any of them needs every permission, because it steers what the agent
 does next. The chain gets 30 seconds, then the loop carries on without it.
+
+Every layer shares the same `continue` and `instructions` strings, so assigning
+one erases what another layer wrote. Append instead, and allow for `nil`:
+
+```lua
+value.continue = (value.continue and value.continue .. "\n" or "") .. "Re-read PLAN.md."
+```
 
 ### agent.user_message
 
@@ -297,14 +306,15 @@ end)
 ### agent.stop
 
 `reason` is `"finished"` or `"max_tokens"`, and `last_message` is the text of
-the final answer. Return `{ continue = text }` to send `text` as the next
-message and keep going:
+the final answer. Append to `continue` to send the text as the next message
+and keep going:
 
 ```lua
 maki.api.set_slot("agent.stop", function(prev, stop, ctx)
   local todo = maki.fs.read("TODO.md")
   if todo and todo:find("%- %[ %]") then
-    return { continue = "TODO.md still has open items. Keep going." }
+    stop.continue = (stop.continue and stop.continue .. "\n" or "")
+      .. "TODO.md still has open items. Keep going."
   end
   return prev(stop, ctx)
 end)
@@ -326,7 +336,7 @@ Return a table with any of:
   cannot be skipped, because the run cannot go on without compacting.
 - `instructions`: appended to the summary prompt, after the configured and
   requested ones.
-- `continue`: appended to the message the agent resumes with.
+- `continue`: text appended to the message the agent resumes with.
 
 ### agent.compact.prepare
 
@@ -479,11 +489,10 @@ end)
 -- render("hi") now returns "[HI]"
 ```
 
-`capability` is a list of permission names, and a layer needs all of them at
-once. An empty list is free for anyone. Leaving `capability` out charges every
-permission, which is what a tool declaring no capability charges: a slot that
-named no price has not promised its default exercises none, only that nobody
-asked. You can only name permissions your own plugin holds.
+`capability` is a list of permission names, and a layer needs all of them. An
+empty list is free for anyone. Leaving `capability` out charges every
+permission, because the owner made no promise about what its default does. You
+can only name permissions your own plugin holds.
 
 The rule is the one the `tool.*` slots use, and it is read the same way: every
 call re-reads what each layer's plugin holds, so a layer registered by a plugin

@@ -1,10 +1,10 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::agent::SessionExport;
@@ -12,6 +12,9 @@ use maki_agent::{Envelope, SharedBuf, SubagentInfo, TaskEnd, Transcript};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 use crate::api::ui::marks::Mark;
 use crate::api::util::convert::json_to_lua;
@@ -609,9 +612,9 @@ pub enum PlanActionOutcome {
     /// all.
     Failed,
 }
-/// The menu one draft's chain answered with. The form echoes `generation`
-/// back on a pick, so a chain that resumes late and installs its handlers
-/// over a menu already on screen cannot have a pick routed to it.
+/// The menu one draft's chain answered with. `generation` is the request
+/// number the UI asked with, and the form echoes it back on a pick, so a pick
+/// from a menu a newer draft replaced cannot reach that draft's handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanMenu {
     pub generation: u64,
@@ -779,18 +782,18 @@ pub enum UiAction {
         buf: Arc<SharedBuf>,
         config: FloatConfig,
         focus: bool,
-        event_tx: flume::Sender<WinEvent>,
-        cmd_rx: flume::Receiver<WinCommand>,
+        event_tx: UnboundedSender<WinEvent>,
+        cmd_rx: UnboundedReceiver<WinCommand>,
     },
     Flash(String),
     SetWindowTitle(String),
     OpenEditor {
         path: PathBuf,
-        reply_tx: flume::Sender<i32>,
+        reply_tx: oneshot::Sender<i32>,
     },
     Session {
         req: SessionRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     /// `maki.session.export` and `messages`: a live tab answers from memory,
     /// unsaved messages included, any other id from disk. Typed rather than
@@ -798,26 +801,26 @@ pub enum UiAction {
     /// thread copies them.
     ExportSession {
         id: MakiId,
-        reply_tx: flume::Sender<Result<SessionExport, String>>,
+        reply_tx: oneshot::Sender<Result<SessionExport, String>>,
     },
     Model {
         req: ModelRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     Plan {
         req: PlanRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     Input {
         req: InputRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     Task {
         req: TaskRequest,
-        reply_tx: flume::Sender<UiReply>,
+        reply_tx: oneshot::Sender<UiReply>,
     },
     WinSaveView {
-        reply_tx: flume::Sender<WinView>,
+        reply_tx: oneshot::Sender<WinView>,
     },
     WinRestView {
         scroll_top: u32,
@@ -827,7 +830,7 @@ pub enum UiAction {
     Builtin {
         action: BuiltinAction,
         caller: PluginReach,
-        reply_tx: flume::Sender<bool>,
+        reply_tx: oneshot::Sender<bool>,
     },
     /// The handler of the keystroke with this ticket id returned. It comes
     /// after everything the handler asked of the UI, so the keys typed after
@@ -849,7 +852,7 @@ pub enum UiAction {
         /// Checked on the UI side, since only the UI knows what each command
         /// can reach.
         caller: PluginReach,
-        reply_tx: flume::Sender<Result<(), String>>,
+        reply_tx: oneshot::Sender<Result<(), String>>,
     },
     /// An event from a subagent session a plugin opened on a chat session,
     /// which shows it as a task. A tab keeps its channels across `/new`, so
@@ -875,72 +878,26 @@ pub enum UiAction {
     },
 }
 
-/// Whether an event loop is draining `UiAction`. The channel cannot answer
-/// that, because the runtime keeps a receiver of its own alive for the whole
-/// process and `try_send` would go on succeeding long after the loop that
-/// sends the replies is gone.
-#[derive(Clone)]
-pub struct UiAttachment(Arc<AtomicBool>);
-
-impl Default for UiAttachment {
-    /// Starts attached, so what a TUI host sends before its loop is up gets
-    /// answered once it is. A headless host has no sender at all, so this bit
-    /// only ever tells of a loop that went away.
-    fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
-    }
-}
-
-impl UiAttachment {
-    /// Called by every event loop generation, so the UI comes back after a
-    /// `/reload` rebuilt the stack around the same handles.
-    pub fn attach(&self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-
-    pub fn detach(&self) {
-        self.0.store(false, Ordering::Relaxed);
-    }
-
-    fn is_attached(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
-// Lives on the Lua thread so `ui_send` can consult it without threading a
-// handle through every `#[ctx]` sender.
+// Lives on the Lua thread so `ui_roundtrip` can consult it without threading
+// a handle through every `#[ctx]` sender.
 thread_local! {
-    static UI_ATTACHMENT: RefCell<Option<UiAttachment>> = const { RefCell::new(None) };
     static PLUGIN_LOADING: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(crate) fn install_ui_attachment(attachment: UiAttachment) {
-    UI_ATTACHMENT.with_borrow_mut(|slot| *slot = Some(attachment));
-}
-
-/// A thread with no handle installed (unit tests, embedders driving Lua
-/// themselves) counts as attached: only a host that detached knows better.
-fn ui_attached() -> bool {
-    UI_ATTACHMENT.with_borrow(|slot| slot.as_ref().is_none_or(UiAttachment::is_attached))
-}
-
-/// Hand an action to the UI event loop. A detached UI, a full or closed
-/// channel and a missing sender all mean the same thing: nobody is there to
-/// run it.
+/// Hand an action to the UI event loop. A closed channel and a missing sender
+/// mean the same thing: nobody is there to run it. The loop closes the
+/// channel once it stops draining, before its teardown runs `SessionEnd`.
 pub(crate) fn ui_send(
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
     action: UiAction,
 ) -> Result<(), &'static str> {
-    if !ui_attached() {
-        return Err(NO_UI_ERR);
-    }
-    tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
+    tx.ok_or(NO_UI_ERR)?.send(action).map_err(|_| NO_UI_ERR)
 }
 
 /// Whether an action sent now would reach an event loop, for a call that must
 /// refuse before doing anything a missing UI would leave half done.
-pub(crate) fn ui_reachable(tx: Option<&flume::Sender<UiAction>>) -> bool {
-    ui_attached() && tx.is_some_and(|tx| !tx.is_disconnected())
+pub(crate) fn ui_reachable(tx: Option<&UnboundedSender<UiAction>>) -> bool {
+    tx.is_some_and(|tx| !tx.is_closed())
 }
 
 /// Runs a plugin's top level, where every [`ui_roundtrip`] fails at once.
@@ -967,15 +924,15 @@ pub(crate) async fn as_plugin_load<F: Future>(load: F) -> F::Output {
 /// time (`open_editor` holds it for as long as the editor is up). Teardown
 /// detaches the UI instead, which fails the send outright.
 pub(crate) async fn ui_roundtrip<T>(
-    tx: Option<&flume::Sender<UiAction>>,
-    action: impl FnOnce(flume::Sender<T>) -> UiAction,
+    tx: Option<&UnboundedSender<UiAction>>,
+    action: impl FnOnce(oneshot::Sender<T>) -> UiAction,
 ) -> Result<T, &'static str> {
     if PLUGIN_LOADING.get() {
         return Err(PLUGIN_LOADING_ERR);
     }
-    let (reply_tx, reply_rx) = flume::bounded(1);
+    let (reply_tx, reply_rx) = oneshot::channel();
     ui_send(tx, action(reply_tx))?;
-    reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
+    reply_rx.await.map_err(|_| UI_DROPPED_ERR)
 }
 
 /// `ui_roundtrip` for JSON replies, shaped into the `(value, err)` pair Lua
@@ -983,8 +940,8 @@ pub(crate) async fn ui_roundtrip<T>(
 /// slot.
 pub(crate) async fn ui_json_roundtrip(
     lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
-    action: impl FnOnce(flume::Sender<UiReply>) -> UiAction,
+    tx: Option<&UnboundedSender<UiAction>>,
+    action: impl FnOnce(oneshot::Sender<UiReply>) -> UiAction,
 ) -> LuaResult<Pair<Value>> {
     let reply = try_pair!(ui_roundtrip(tx, action).await);
     let value = try_pair!(reply);
@@ -998,6 +955,7 @@ mod tests {
     use futures::FutureExt;
     use mlua::Lua;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     fn make_entry(lua: &Lua, desc: &str) -> CommandEntry {
         let f = lua.create_function(|_, ()| Ok(())).unwrap();
@@ -1063,39 +1021,30 @@ mod tests {
         assert_eq!(reader.load().generation, 2);
     }
 
-    /// The loop's receiver is a clone and the runtime keeps another one for
-    /// the whole process, so the channel never disconnects: without the bit a
-    /// roundtrip would park on a reply nobody is left to send.
+    /// The receiver lives through the loop's teardown, so only closing it
+    /// keeps a roundtrip from parking on a reply nobody is left to send.
     #[tokio::test]
-    async fn ui_roundtrip_fails_once_the_loop_detaches() {
-        let (tx, rx) = flume::unbounded();
-        let attachment = UiAttachment::default();
-        install_ui_attachment(attachment.clone());
+    async fn ui_roundtrip_fails_once_the_loop_closed_the_channel() {
+        let (tx, mut rx) = unbounded_channel();
+        rx.close();
 
-        attachment.detach();
-        let detached = ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx }).await;
-        assert_eq!(detached.err(), Some(NO_UI_ERR));
-        assert!(
-            !rx.is_disconnected(),
-            "the send has to fail on the bit, not on the channel"
-        );
+        let refused = ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx }).await;
 
-        // `/reload` builds a new loop around the same handles.
-        attachment.attach();
-        assert!(ui_send(Some(&tx), UiAction::WinRestView { scroll_top: 0 }).is_ok());
+        assert_eq!(refused.err(), Some(NO_UI_ERR));
+        assert!(!ui_reachable(Some(&tx)));
     }
 
     /// The load is refused, while a task that runs as the load waits is not.
     #[tokio::test]
     async fn only_the_plugin_load_itself_is_refused_a_roundtrip() {
-        let (tx, rx) = flume::unbounded();
-        let (resume_tx, resume_rx) = flume::bounded::<()>(1);
+        let (tx, mut rx) = unbounded_channel();
+        let (resume_tx, mut resume_rx) = unbounded_channel::<()>();
 
         let (in_load, beside_load) = tokio::join!(
             as_plugin_load(async {
                 let refused =
                     ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx }).await;
-                resume_rx.recv_async().await.ok();
+                resume_rx.recv().await;
                 refused
             }),
             async {

@@ -2,9 +2,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
+use reqwest::header::HeaderMap;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
@@ -46,6 +47,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed(""),
     max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: true,
+    usage_cost: false,
     provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
@@ -60,6 +62,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking,
     thinking_fields_fallback,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
@@ -420,7 +423,7 @@ impl Provider for Aperture {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -452,7 +455,7 @@ impl Provider for Aperture {
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
         })
     }

@@ -3,9 +3,14 @@
 
 mod common;
 
+use maki_lua::test_support::wait_next;
+use std::iter;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 
 use common::{Chat, call_ctx, exec, next_task_done, poll_until, request_move};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
@@ -13,12 +18,14 @@ use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
 use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, BufferSnapshot, Envelope, EventSender, PartStatus,
-    SessionMailbox, SharedBuf, SpanStyle, ToolDoneEvent, ToolOutput,
+    SessionMailbox, SharedBuf, SpanStyle, TaskLabel, ToolDoneEvent, ToolOutput, result_notice,
 };
 use maki_config::ToolOutputLines;
 use maki_lua::test_support::runtime;
 use maki_lua::{KILL_GRACE, MoveOutcome, PluginHost, PluginPermissions, UiAction};
+use maki_providers::{TaskAnswer, TaskSettled};
 use serde_json::{Value, json};
+use test_case::test_case;
 
 const BATCH_PLUGIN_SRC: &str = include_str!("../../plugins/batch/init.lua");
 
@@ -76,12 +83,13 @@ const HOOKED_TOOL: &str = "hooked";
 const RELEASE_CHILD_TOOL: &str = "release_child";
 const IS_PARKED_TOOL: &str = "is_parked";
 const IS_PARKED_TEXT: &str = "true";
-const MOVED_HEADER: &str = "Still running in the background:";
+const MOVED_HEADER: &str = "Still running in the background, each reports back as it finishes:";
 const MOVED_BY_USER: &str = "Moved to the background by the user";
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
 const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
 const FOREGROUND_NOTE_TAIL: &str = "). Ran in the foreground.\n\n";
 const WAITING_ON_EDIT: &str = "batch is waiting on edit";
+const MARKDOWN_FORMAT: &str = "markdown";
 
 const SPINNER_STYLE: &str = "spinner";
 const ERROR_STYLE: &str = "tool_error";
@@ -348,9 +356,9 @@ fn runaway_child_under_cancel_still_terminates() {
 struct RunningBatch {
     trigger: maki_agent::cancel::CancelTrigger,
     body: Arc<SharedBuf>,
-    result: flume::Receiver<Result<String, String>>,
+    result: Receiver<Result<String, String>>,
     /// Kept alive so the handler's later events still have a receiver.
-    _events: flume::Receiver<Envelope>,
+    _events: UnboundedReceiver<Envelope>,
 }
 
 fn start_batch(tool_calls: Value) -> RunningBatch {
@@ -358,10 +366,10 @@ fn start_batch(tool_calls: Value) -> RunningBatch {
 }
 
 fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
-    let (event_tx, events) = flume::unbounded();
+    let (event_tx, mut events) = unbounded_channel();
     let event_tx = EventSender::new(event_tx, 0);
     let (trigger, token) = CancelToken::new();
-    let (result_tx, result) = flume::bounded(1);
+    let (result_tx, result) = sync_channel(1);
     thread::spawn(move || {
         let (reg, _host) = load_batch_host_with(&child_src);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
@@ -373,15 +381,15 @@ fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
     });
     RunningBatch {
         trigger,
-        body: recv_live_buf(&events),
+        body: recv_live_buf(&mut events),
         result,
         _events: events,
     }
 }
 
-fn recv_live_buf(rx: &flume::Receiver<Envelope>) -> Arc<SharedBuf> {
+fn recv_live_buf(rx: &mut UnboundedReceiver<Envelope>) -> Arc<SharedBuf> {
     let deadline = Instant::now() + PAINT_TIMEOUT;
-    while let Ok(env) = rx.recv_deadline(deadline) {
+    while let Some(env) = wait_next(rx, deadline.saturating_duration_since(Instant::now())) {
         if let AgentEvent::LiveToolBuf { id, body } = env.event
             && id == BATCH_ID
         {
@@ -660,7 +668,7 @@ fn restore_snapshot_lines_opts(
     clicks: Vec<usize>,
 ) -> Vec<Vec<(String, SpanStyle)>> {
     let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     handle.request_restore(
         maki_lua::RestoreItem {
             tool: Arc::from(BATCH_TOOL),
@@ -681,7 +689,7 @@ fn restore_snapshot_lines_opts(
     handle.wait_restore_complete_for_test();
     barrier(host);
     snapshot_lines(
-        drain_snapshots(&rx, BATCH_ID)
+        drain_snapshots(&mut rx, BATCH_ID)
             .last()
             .expect("no snapshot emitted"),
     )
@@ -693,8 +701,8 @@ fn barrier(host: &PluginHost) {
     host.load_source("barrier", "").unwrap();
 }
 
-fn drain_snapshots(rx: &flume::Receiver<Envelope>, tool_use_id: &str) -> Vec<BufferSnapshot> {
-    rx.drain()
+fn drain_snapshots(rx: &mut UnboundedReceiver<Envelope>, tool_use_id: &str) -> Vec<BufferSnapshot> {
+    iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|env| match env.event {
             AgentEvent::ToolSnapshot { id, snapshot, .. } => {
                 assert_eq!(id, tool_use_id);
@@ -1255,7 +1263,7 @@ fn exec_live(
     tool: &str,
     input: &Value,
 ) -> (ToolExecResult, Vec<BufferSnapshot>) {
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let event_tx = EventSender::new(tx, 0);
     let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(tool_use_id));
     ctx.registry = Arc::clone(reg);
@@ -1267,7 +1275,7 @@ fn exec_live(
         .expect("parse failed");
     let result = runtime().block_on(inv.execute(&ctx));
     barrier(host);
-    (result, drain_snapshots(&rx, tool_use_id))
+    (result, drain_snapshots(&mut rx, tool_use_id))
 }
 
 fn exec_batch_live(
@@ -1450,7 +1458,7 @@ do
       end
       park(input.tag)
       -- A batch hands a background ask over, so it never reaches the child.
-      return name .. ":" .. input.tag .. (input.background and "+background" or "")
+      return name .. ":" .. input.tag .. (input.background and "+background" or ""), nil, input.format
     end
     return stubbed(ctx, name, input, opts)
   end
@@ -1459,6 +1467,7 @@ do
     type = "object",
     properties = {
       tag = { type = "string" },
+      format = { type = "string" },
       background = { type = "boolean", needs_background = true },
     },
   }
@@ -1498,12 +1507,12 @@ end
 struct MovableBatch {
     reg: Arc<ToolRegistry>,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
+    ui: UnboundedReceiver<UiAction>,
     mailbox: SessionMailbox,
     body: Arc<SharedBuf>,
     _seed: Arc<AgentSeed>,
     run: Option<CancelTrigger>,
-    events: flume::Receiver<Envelope>,
+    events: UnboundedReceiver<Envelope>,
 }
 
 impl MovableBatch {
@@ -1516,16 +1525,15 @@ impl MovableBatch {
         permissions: PluginPermissions,
     ) -> (Self, JoinHandle<ToolDoneEvent>) {
         let (reg, host) = load_batch_host_as(MOVABLE_CHILD_SRC, permissions);
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
+        let ui = host.take_ui_action_rx().unwrap();
         let Chat { id, mailbox, seed } = Chat::live();
         let (run, run_token) = CancelToken::new();
-        let (ctx, events) = call_ctx(&reg, id, &run_token, BATCH_ID);
+        let (ctx, mut events) = call_ctx(&reg, id, &run_token, BATCH_ID);
         let call = thread::spawn({
             let reg = Arc::clone(&reg);
             move || exec(&reg, BATCH_TOOL, batch_input(tool_calls), &ctx)
         });
-        let body = recv_live_buf(&events);
+        let body = recv_live_buf(&mut events);
         let batch = Self {
             reg,
             host,
@@ -1563,10 +1571,9 @@ impl MovableBatch {
     }
 
     /// Waits for the batch to say it is made of {want}, as `(id, name, status)`.
-    fn wait_parts(&self, want: &[(&str, &str, PartStatus)]) {
+    fn wait_parts(&mut self, want: &[(&str, &str, PartStatus)]) {
         poll_until(&format!("parts never became {want:?}"), || {
-            self.events
-                .try_iter()
+            iter::from_fn(|| self.events.try_recv().ok())
                 .any(|envelope| match &envelope.event {
                     AgentEvent::ToolParts { id, parts } if id == BATCH_ID => parts
                         .iter()
@@ -1579,8 +1586,8 @@ impl MovableBatch {
     }
 
     /// The final reply of a moved batch, as its task tab gets it.
-    fn task_done(&self) -> ToolDoneEvent {
-        next_task_done(&self.ui)
+    fn task_done(&mut self) -> ToolDoneEvent {
+        next_task_done(&mut self.ui)
     }
 }
 
@@ -1589,7 +1596,7 @@ impl MovableBatch {
 /// result is the whole final reply.
 #[test]
 fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children() {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": OK_TOOL, "parameters": { "tag": "a" } },
         { "tool": HOOKED_TOOL, "parameters": { "tag": "early" } },
         { "tool": HOOKED_TOOL, "parameters": { "tag": "late" } },
@@ -1629,12 +1636,65 @@ fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children()
     assert_eq!(batch.mailbox.drain().len(), 1);
 }
 
+/// An early child reads just like a call that moved alone, so the model and
+/// the transcript need nothing new to make sense of it. A markdown reply,
+/// like a `task` child's, keeps its format for the transcript, and so does
+/// the final reply when all of it is markdown.
+#[test_case(Some(MARKDOWN_FORMAT), true ; "markdown_last_child")]
+#[test_case(None, false ; "plain_last_child")]
+fn a_moved_batch_reports_each_child_as_it_lands(last_format: Option<&str>, markdown_reply: bool) {
+    let (mut batch, call) = MovableBatch::start(json!([
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "a", "format": MARKDOWN_FORMAT } },
+        { "tool": HOOKED_TOOL, "parameters": { "tag": "b", "format": last_format } },
+    ]));
+    batch.wait_parked("a");
+    batch.wait_parked("b");
+    assert_eq!(batch.press(), MoveOutcome::Moved);
+    assert!(call.join().expect("batch thread").backgrounded);
+
+    batch.release("a");
+    let notices = poll_until("the first child never woke the model", || {
+        Some(batch.mailbox.claim_wake()).filter(|notices| !notices.is_empty())
+    });
+    let (text, display, end) = result_notice(
+        &TaskLabel::new(HOOKED_TOOL, Some("a")),
+        BATCH_ID,
+        false,
+        false,
+        "hooked:a",
+    );
+    let [notice] = notices.as_slice() else {
+        panic!("one notice per child: {notices:?}");
+    };
+    assert_eq!(notice.first_text_content(), Some(text.as_str()));
+    assert_eq!(notice.display_text.as_deref(), Some(display.as_str()));
+    assert!(notice.markdown);
+    assert_eq!(
+        notice.answers,
+        Some(TaskAnswer::Part(TaskSettled {
+            task: BATCH_ID.into(),
+            end
+        }))
+    );
+
+    batch.release("b");
+    assert_eq!(
+        batch.task_done().output.as_text(),
+        format!("{}{}", section(HOOKED_TOOL, "hooked:b"), summary_all_ok(1))
+    );
+    let rest = batch.mailbox.drain();
+    assert!(
+        matches!(rest.as_slice(), [last] if last.settles().is_some() && last.markdown == markdown_reply),
+        "{rest:?}"
+    );
+}
+
 /// A decline names the child that cannot move and leaves the batch untouched:
 /// once that child finishes, the same press moves, and its result rides in
 /// the receipt.
 #[test]
 fn batch_declines_while_a_child_without_a_hook_runs_and_moves_once_it_finished() {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": HOOKED_TOOL, "parameters": { "tag": "a" } },
         { "tool": EDIT_TOOL, "parameters": { "tag": "b" } },
     ]));
@@ -1670,7 +1730,7 @@ fn batch_declines_while_a_child_without_a_hook_runs_and_moves_once_it_finished()
 /// results, and the ask never reaches the child, which cannot move inside it.
 #[test]
 fn a_background_child_moves_the_batch_once_the_rest_finished() {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": HOOKED_TOOL, "parameters": { "tag": "slow", "background": true } },
         { "tool": EDIT_TOOL, "parameters": { "tag": "quick" } },
     ]));
@@ -1704,7 +1764,7 @@ fn a_background_child_moves_the_batch_once_the_rest_finished() {
 /// is a task of its own and no part, leaves the other ids alone.
 #[test]
 fn batch_parts_keep_their_place_and_leave_subagents_out() {
-    let (batch, call) = MovableBatch::start(json!([
+    let (mut batch, call) = MovableBatch::start(json!([
         { "tool": HOOKED_TOOL, "parameters": { "tag": "agent", "subagent": true } },
         { "tool": EDIT_TOOL, "parameters": { "tag": "quick" } },
         { "tool": HOOKED_TOOL, "parameters": { "tag": "slow" } },

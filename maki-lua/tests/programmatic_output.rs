@@ -2,6 +2,7 @@
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+use std::iter;
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -10,7 +11,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use maki_agent::agent::tool_dispatch;
 use maki_agent::permissions::PermissionManager;
@@ -25,6 +26,7 @@ use maki_config::{
 use maki_lua::test_support::runtime;
 use maki_lua::{PluginHost, set_allowed_private_hosts};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::unbounded_channel;
 
 const TOOLS: &[&str] = &[
     "bash",
@@ -42,6 +44,14 @@ const MODEL_LINES: usize = 8;
 const COMPACT_GLOB_LIMIT: usize = 100;
 const TEST_TIMEOUT_SECS: u64 = 60;
 const LAST_ITEM: &str = "final-item";
+const LATIN1_HTML: &[u8] = b"<h1>caf\xe9</h1>";
+const LOSSY_TEXT: &str = "caf\u{fffd}";
+const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
+const LEGACY_HTML_TYPE: &str = "text/html; charset=ISO-8859-1";
+const LATIN1_E_ACUTE: u8 = 0xe9;
+const BINARY_TYPE: &str = "application/pdf";
+const BINARY_PAYLOAD: &[u8] = b"%PDF-1.7\n\0\x01\x02";
+const BINARY_ERROR: &str = "error: binary content (application/pdf) cannot be displayed as text";
 const CALL_ID: &str = "output-test";
 const PROMPT_PLUGIN: &str = "guard";
 const ALLOW_EVERY_PROMPT: &str =
@@ -439,7 +449,7 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
         ProjectConfig::discover(project.path()),
         Arc::default(),
     ));
-    let (event_tx, events) = flume::unbounded();
+    let (event_tx, mut events) = unbounded_channel();
     ctx.event_tx = EventSender::new(event_tx, 0);
     ctx.tool_use_id = Some(CALL_ID.to_owned());
     let path = outside.path().join("allowed.txt");
@@ -454,8 +464,7 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
     .expect("the plugin allowed the write");
 
     assert_eq!(fs::read_to_string(&path).unwrap(), LAST_ITEM);
-    let marked: Vec<(String, String)> = events
-        .try_iter()
+    let marked: Vec<(String, String)> = iter::from_fn(|| events.try_recv().ok())
         .filter_map(|envelope| match envelope.event {
             AgentEvent::AllowedByPlugin { id, plugin } => Some((id, plugin)),
             _ => None,
@@ -464,13 +473,16 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
     assert_eq!(marked, [(CALL_ID.to_owned(), PROMPT_PLUGIN.to_owned())]);
 }
 
-#[test]
-fn python_webfetch_parses_complete_response_text() {
-    let (_registry, _host, ctx) = setup();
+fn serve_once(content_type: &str, payload: &[u8]) -> (String, JoinHandle<()>) {
     set_allowed_private_hosts(&["127.0.0.1".to_owned()]);
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let url = format!("http://{}/payload", listener.local_addr().unwrap());
-    let payload = json!({ "padding": "x".repeat(MODEL_BYTES * 2), "last": LAST_ITEM }).to_string();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        payload.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(payload);
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = Vec::new();
@@ -479,18 +491,52 @@ fn python_webfetch_parses_complete_response_text() {
             stream.read_exact(&mut byte).unwrap();
             request.push(byte[0]);
         }
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-            payload.len()
-        );
-        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(&response).unwrap();
     });
+    (url, server)
+}
+
+#[test]
+fn python_webfetch_parses_complete_response_text() {
+    let (_registry, _host, ctx) = setup();
+    let payload = json!({ "padding": "x".repeat(MODEL_BYTES * 2), "last": LAST_ITEM }).to_string();
+    let (url, server) = serve_once("application/json", payload.as_bytes());
     let code = format!(
         "data = json.loads(await webfetch(url={url:?}, format='text'))\nprint(data['last'])"
     );
     let output = python(&ctx, &code).unwrap();
     server.join().unwrap();
     assert_eq!(output.trim(), LAST_ITEM);
+}
+
+#[test_case::test_case("markdown", LEGACY_HTML_TYPE, LATIN1_HTML, Ok(LOSSY_MARKDOWN) ; "legacy_html_to_markdown")]
+#[test_case::test_case("text", LEGACY_HTML_TYPE, LATIN1_HTML, Ok(LOSSY_TEXT) ; "legacy_html_to_text")]
+#[test_case::test_case("text", BINARY_TYPE, BINARY_PAYLOAD, Err(BINARY_ERROR) ; "binary_rejected")]
+fn webfetch_decodes_legacy_bytes_for_display(
+    format: &str,
+    content_type: &str,
+    payload: &[u8],
+    expected: Result<&str, &str>,
+) {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(content_type, payload);
+    let output = run(&ctx, "webfetch", json!({ "url": url, "format": format }));
+    server.join().unwrap();
+    assert_eq!(
+        output.as_deref().map(str::trim).map_err(String::as_str),
+        expected
+    );
+}
+
+#[test_case::test_case("text" ; "stripped_html")]
+#[test_case::test_case("html" ; "raw_html")]
+fn webfetch_legacy_bytes_stay_within_the_output_budget(format: &str) {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(LEGACY_HTML_TYPE, &[LATIN1_E_ACUTE; MODEL_BYTES * 2]);
+    let output = run(&ctx, "webfetch", json!({ "url": url, "format": format })).unwrap();
+    server.join().unwrap();
+    assert!(output.contains("[truncated"));
+    assert!(output.len() < MODEL_BYTES * 2);
 }
 
 #[test]

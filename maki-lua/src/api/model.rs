@@ -2,9 +2,12 @@
 //! request options, so most calls round-trip to it; `info` resolves
 //! locally and works without a UI.
 
+use std::fmt::Display;
+
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{Model, ModelTier, model_registry};
 use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::TableExt;
@@ -13,9 +16,15 @@ use crate::plugin_permissions::PluginPermissions;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
 
+/// Shared with `maki.agent.resolve_model`, so a tier assignment that no longer
+/// resolves reads the same wherever it surfaces.
+pub(crate) fn stale_tier_err(tier: ModelTier, spec: &str, cause: impl Display) -> String {
+    format!("tier {tier} points at {spec}: {cause}")
+}
+
 async fn roundtrip(
     lua: Lua,
-    tx: Option<flume::Sender<UiAction>>,
+    tx: Option<UnboundedSender<UiAction>>,
     req: ModelRequest,
 ) -> LuaResult<Pair<Value>> {
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Model {
@@ -95,10 +104,17 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
 }
 
 /// The model maki uses for a tier, the same one a subagent asking for that
-/// tier gets: user's pick from the `/model` picker for that tier (whatever
-/// provider it names), else the curated default within `provider`, else any
-/// provider. `assigned` tells a pick apart from a default. Pass `provider` to
-/// prefer its models, the way subagents prefer the session's provider.
+/// tier gets. The first match wins:
+///
+/// 1. The user's pick for that tier in the `/model` picker, from any provider.
+/// 2. The tier default within `provider`, curated or set in `providers.toml`.
+/// 3. The tier default of any provider.
+///
+/// `assigned` tells a pick apart from a default. Pass `provider` the way
+/// subagents pass the session's provider.
+///
+/// Resolving a models.dev model can wait for that catalog to download, so
+/// like `get`, this cannot run in a callback that must not yield.
 ///
 /// @param name string `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
 /// @param provider string|nil Provider slug to resolve within first.
@@ -110,7 +126,7 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
 /// local m = maki.model.tier("weak", maki.model.get().provider)
 /// if m then maki.model.set(m.spec) end
 #[lua_fn]
-fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Table>> {
+async fn tier(lua: Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Table>> {
     let tier: ModelTier = match name.parse() {
         Ok(tier) => tier,
         Err(e) => return Ok(err_pair(e)),
@@ -119,11 +135,11 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
         Some(spec) => spec,
         None => return Ok((None, None)),
     };
-    let model = match Model::from_spec(&spec) {
+    let model = match Model::from_spec_or_warm_catalog(&spec).await {
         Ok(model) => model,
-        Err(e) => return Ok(err_pair(format!("tier {tier} points at {spec}: {e}"))),
+        Err(e) => return Ok(err_pair(stale_tier_err(tier, &spec, e))),
     };
-    let tbl = model_info_table(lua, &model)?;
+    let tbl = model_info_table(&lua, &model)?;
     tbl.set(
         "assigned",
         model_registry::override_tiers(&spec).contains(&tier),
@@ -163,7 +179,7 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
 ///   print(option.name, option.tokens, option.sends)
 /// end
 #[lua_fn]
-async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn get(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, ModelRequest::Get).await
 }
 
@@ -175,7 +191,10 @@ async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<
 /// @example
 /// local specs = maki.model.available()
 #[lua_fn]
-async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn available(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, ModelRequest::Available).await
 }
 
@@ -196,7 +215,7 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 #[lua_fn(guard = SessionSettings)]
 async fn set(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Value,
 ) -> LuaResult<Pair<Value>> {
     let req = match opts {
@@ -226,7 +245,7 @@ lua_table! {
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.model" => pub(crate) fn create_model_table(
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
     ),
     DOCS [get(tx), available(tx), set(perms, tx), tier(), info()]
@@ -242,6 +261,8 @@ mod tests {
     use serde_json::{Value as Json, json};
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const SPEC: &str = "anthropic/claude-opus-4-6";
     const THINKING: &str = "high";
@@ -263,7 +284,7 @@ mod tests {
         model_registry::unset_and_persist(&spec, tier, &storage);
     }
 
-    fn lua_with_model(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_model(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
         let t = create_model_table(&lua, tx, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("model", t).unwrap();
@@ -272,7 +293,7 @@ mod tests {
 
     /// The receiver is dropped up front, so the request cannot even leave.
     fn closed_ui() -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, rx) = unbounded_channel::<UiAction>();
         drop(rx);
         lua_with_model(Some(tx))
     }
@@ -280,9 +301,9 @@ mod tests {
     /// Answering `None` drops the reply channel, like a UI that took the
     /// request and then vanished.
     fn stub_ui(answer: fn(ModelRequest) -> Option<UiReply>) -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            while let Ok(UiAction::Model { req, reply_tx }) = rx.recv() {
+            while let Some(UiAction::Model { req, reply_tx }) = rx.blocking_recv() {
                 if let Some(reply) = answer(req) {
                     let _ = reply_tx.send(reply);
                 }
@@ -417,9 +438,11 @@ mod tests {
 
     /// An assignment left over from a provider that is gone is an error, not a
     /// silent `nil`: the user did pick something, it just no longer resolves.
+    /// The spec has no provider slug, so it fails before the catalog is
+    /// fetched and the test stays off the network.
     #[tokio::test]
     async fn tier_with_a_stale_assignment_returns_an_error_pair() {
-        let (lua, tier, spec) = assign_tier("no-such-provider/nope", ModelTier::Weak);
+        let (lua, tier, spec) = assign_tier("removed-model", ModelTier::Weak);
         let (val, err) = eval(&lua, "return model.tier('weak')").await;
         clear_tier(tier, spec);
         assert_eq!(val, Json::Null);

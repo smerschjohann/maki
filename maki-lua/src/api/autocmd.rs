@@ -138,12 +138,7 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
                 return;
             }
         };
-        if let Err(e) = run_detached(&lua, async {
-            let thread = lua.create_thread(callback)?;
-            thread.into_async::<()>(ev)?.await
-        })
-        .await
-        {
+        if let Err(e) = run_detached(&lua, callback.call_async::<()>(ev)).await {
             tracing::warn!(
                 event,
                 plugin = &*plugin,
@@ -232,8 +227,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `del_autocmd` later to remove the listener.
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-/// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
-/// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
+/// `"TurnError"`, `"TurnComplete"`, `"ToolStart"`, `"ToolDone"`,
+/// `"AutoCompacting"`, `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 /// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
 /// `"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
@@ -259,6 +254,11 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   turn took). `list_cost` is the un-subsidised list price and `cost` is
 ///   the real bill, so a budget plugin charges against whichever one it
 ///   wants.
+/// - `"TurnComplete"`: `data.context_size` and `data.context_window` after
+///   each model response, before its tool calls run. Use it to act mid-turn,
+///   before `"AutoCompacting"`. `data.context_size` is absent when unknown.
+///   A subagent's response carries its own sizes plus `data.id`, its task id.
+///   To watch only the main context, skip events that have an `id`.
 /// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
 ///   trigger time.
 /// - `"CompactionDone"`: `data.context_size_before`,
@@ -330,9 +330,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `data.text`. Maki warns once per plugin and event, naming what was left
 /// out. Events a plugin fires under its own names arrive as fired.
 ///
-/// `"TurnEnd"` fires once per turn and only for the main session, so
-/// subagent turns never show up. A manual `/compact` ends its run without
-/// ending a turn, so it stays quiet too.
+/// A subagent's run fires only `"TurnComplete"`, never tool or other turn
+/// events. `"TurnEnd"` fires once per turn of the main session. A manual `/compact` fires no `"TurnEnd"`, only the
+/// `"TurnComplete"` of its summary request.
 ///
 /// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
 /// `maki-ui` only. `maki-acp` runs the agent on its own loop and does not

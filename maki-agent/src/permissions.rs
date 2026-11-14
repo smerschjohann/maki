@@ -10,6 +10,7 @@ use maki_config::{
 use maki_storage::id::SessionRef;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 
 use crate::tools::PermissionScopes;
@@ -33,6 +34,8 @@ pub const DECISION_SOURCE_PLUGIN: &str = "plugin";
 
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
+/// The bash plugin's directory under a session's plugin data dir.
+const BASH_PLUGIN_DIR: &str = "bash";
 const READ_TOOL: &str = "read";
 
 /// Splits the ask id from the encoded answer on the answer channel. A control
@@ -379,10 +382,10 @@ pub struct PermissionManager {
     cwd: PathBuf,
     project_config: ProjectConfig,
     plugin_rules: Arc<PluginRuleStore>,
-    /// Canonical root of the background task logs. It usually does not exist
-    /// yet, so a plain canonicalize would keep a symlinked state dir as
-    /// spelled. See [`Self::task_logs_rule`].
-    task_logs: Option<PathBuf>,
+    /// Canonical root of the per-session plugin data dirs. It usually does
+    /// not exist yet, so a plain canonicalize would keep a symlinked state
+    /// dir as spelled. See [`Self::bash_logs_rule`].
+    plugin_data: Option<PathBuf>,
 }
 
 impl PermissionManager {
@@ -430,7 +433,7 @@ impl PermissionManager {
             cwd,
             project_config,
             plugin_rules,
-            task_logs: maki_storage::paths::task_logs_dir()
+            plugin_data: maki_storage::paths::sessions_data_dir()
                 .ok()
                 .map(|dir| maki_storage::paths::canonical_key(&dir)),
         }
@@ -452,15 +455,16 @@ impl PermissionManager {
             cwd: self.cwd.clone(),
             project_config: self.project_config.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
-            task_logs: self.task_logs.clone(),
+            plugin_data: self.plugin_data.clone(),
         }
     }
 
-    /// Lets `read` into the calling session's own background task logs, which
-    /// its receipts point the model at. A subagent shares its parent's session,
-    /// so either side reads what the other started. Other sessions' logs, from
-    /// this project or any other, get the usual outside-project handling.
-    fn task_logs_rule(
+    /// Lets `read` into the calling session's own bash logs, which its
+    /// receipts point the model at. A subagent shares its parent's session,
+    /// so either side reads what the other started. Other sessions' logs,
+    /// from this project or any other, get the usual outside-project
+    /// handling.
+    fn bash_logs_rule(
         &self,
         tool: &ToolKey,
         session: Option<&SessionRef>,
@@ -468,7 +472,11 @@ impl PermissionManager {
         if !matches!(tool, ToolKey::Native(name) if name.as_ref() == READ_TOOL) {
             return None;
         }
-        let dir = self.task_logs.as_ref()?.join(session?.id().to_string());
+        let dir = self
+            .plugin_data
+            .as_ref()?
+            .join(session?.id().to_string())
+            .join(BASH_PLUGIN_DIR);
         Some(PermissionRule {
             tool: tool.clone(),
             scope: Some(format!("{}/**", dir.display())),
@@ -498,7 +506,7 @@ impl PermissionManager {
     ) -> PermissionCheck {
         let session = self.session_rules();
         let plugin = self.plugin_rules.snapshot();
-        let task_logs = self.task_logs_rule(tool, session_id);
+        let bash_logs = self.bash_logs_rule(tool, session_id);
 
         let gate = ApprovalGate::new(tool, plan_path);
 
@@ -520,7 +528,7 @@ impl PermissionManager {
                 .chain(
                     self.builtin_rules
                         .iter()
-                        .chain(&task_logs)
+                        .chain(&bash_logs)
                         .map(|r| (ORIGIN_BUILTIN, r)),
                 )
                 .chain(plugin.iter().map(|r| (ORIGIN_PLUGIN, r)))
@@ -540,12 +548,10 @@ impl PermissionManager {
                 }
             }
 
-            if has_allow {
-                // allow wins for this scope (no deny matched)
-            } else if !force_prompt {
+            // force_prompt: all scopes will be prompted anyway
+            if !has_allow && !force_prompt {
                 unclaimed_scopes.push(scope);
             }
-            // force_prompt: all scopes will be prompted anyway
         }
 
         if self.yolo.load(Ordering::Relaxed) && gate.accepts(Approval::Standing) {
@@ -567,7 +573,7 @@ impl PermissionManager {
         // A single non-plan scope means we must prompt for the rest.
         // Compared the way the write lands: `link/../plan.md` is the plan
         // file lexically but somewhere else once `link` is followed.
-        if !force_prompt && !pending.is_empty() {
+        if !force_prompt {
             let is_plan_write = plan_path.is_some_and(|pp| {
                 matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
                     && {
@@ -802,7 +808,7 @@ impl PermissionManager {
         scopes: &PermissionScopes,
         session: Option<&SessionRef>,
         event_tx: &EventSender,
-        user_response_rx: Option<&AsyncMutex<flume::Receiver<String>>>,
+        user_response_rx: Option<&AsyncMutex<UnboundedReceiver<String>>>,
         request_id: &str,
         cancel: &CancelToken,
         plan_path: Option<&Path>,
@@ -889,7 +895,7 @@ impl PermissionManager {
 
         // A call moved to the background can stay parked on its ask across
         // turns, so waiting for the channel must end with ours.
-        let Ok(guard) = cancel.race(rx.lock()).await else {
+        let Ok(mut guard) = cancel.race(rx.lock()).await else {
             return Err(deny(
                 DECISION_SOURCE_USER_ABORT,
                 PROMPT_UNANSWERED_REASON.to_owned(),
@@ -917,9 +923,9 @@ impl PermissionManager {
         // wait continues: consuming it would approve or deny this tool on a
         // decision the user made about another one.
         let answer = loop {
-            let response = cancel.race(guard.recv_async()).await;
+            let response = cancel.race(guard.recv()).await;
             match response {
-                Ok(Ok(raw)) => match TaggedAnswer::decode(&raw) {
+                Ok(Some(raw)) => match TaggedAnswer::decode(&raw) {
                     Some(tagged) if tagged.request_id == request_id => break tagged.answer,
                     tagged => warn!(
                         tool = %tool,
@@ -929,7 +935,7 @@ impl PermissionManager {
                         "discarding a permission answer that does not name this request"
                     ),
                 },
-                Ok(Err(_)) => {
+                Ok(None) => {
                     drop(guard);
                     warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
                     return Err(deny(
@@ -1166,7 +1172,9 @@ fn write_rule_dir(scope: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_config::project::{self, TrustMode};
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const PLAN_FILE: &str = "/home/user/.local/state/maki/plans/test.md";
     const TEST_CWD: &str = "/tmp";
@@ -1184,8 +1192,8 @@ mod tests {
     const PROMPTS: &str = "prompts";
     const PROJECT_DIR: &str = ".maki";
     const PROJECT_PERMISSIONS: &str = ".maki/permissions.toml";
-    const TASK_LOGS_DIR: &str = "tasks";
-    const TASK_LOG: &str = "call.log";
+    const SESSIONS_DATA_DIR: &str = "sessions/data";
+    const BASH_LOG: &str = "call.log";
     const OWN_SESSION: &str = "{own}";
     const OTHER_SESSION: &str = "{other}";
     #[cfg(unix)]
@@ -1237,8 +1245,13 @@ mod tests {
         }
     }
 
+    /// `--trust`, the grant that reads and writes no state directory.
+    fn session_trusted(cwd: &Path) -> ProjectConfig {
+        project::resolve_noninteractive(cwd, TrustMode::Session).project_config
+    }
+
     fn mgr_with(config: PermissionsConfig, cwd: PathBuf) -> PermissionManager {
-        let project_config = ProjectConfig::for_project(&cwd);
+        let project_config = session_trusted(&cwd);
         PermissionManager::new(config, cwd, project_config, Arc::default())
     }
 
@@ -1248,7 +1261,7 @@ mod tests {
 
     #[tokio::test]
     async fn unattended_denies_prompt_without_parking() {
-        let (event_tx, events) = flume::unbounded();
+        let (event_tx, events) = unbounded_channel();
         let err = default_mgr()
             .enforce(
                 &ToolKey::native(BASH_TOOL),
@@ -1273,8 +1286,8 @@ mod tests {
     /// answers that nobody will, and the call needs an allow rule instead.
     #[tokio::test]
     async fn an_unattended_answer_denies_like_a_missing_channel() {
-        let (event_tx, _events) = flume::unbounded();
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (event_tx, _events) = unbounded_channel();
+        let (answer_tx, answer_rx) = unbounded_channel();
         let answers = AsyncMutex::new(answer_rx);
         answer_tx
             .send(TaggedAnswer::new(TAGGED_REQUEST_ID, PermissionAnswer::Unattended).encode())
@@ -1518,10 +1531,10 @@ mod tests {
         )
     }
 
-    fn mgr_with_task_logs(state: &Path) -> PermissionManager {
+    fn mgr_with_bash_logs(state: &Path) -> PermissionManager {
         let mut mgr = default_mgr();
-        mgr.task_logs = Some(maki_storage::paths::canonical_key(
-            &state.join(TASK_LOGS_DIR),
+        mgr.plugin_data = Some(maki_storage::paths::canonical_key(
+            &state.join(SESSIONS_DATA_DIR),
         ));
         mgr
     }
@@ -1549,31 +1562,33 @@ mod tests {
         .is_ok()
     }
 
-    #[test_case("{own}/call.log" => true ; "own_log")]
-    #[test_case("{own}/call.log.1" => true ; "own_rotated_log")]
-    #[test_case("{other}/call.log" => false ; "another_sessions_log")]
-    #[test_case("{own}/../{other}/call.log" => false ; "dotdot_into_another_session")]
-    #[test_case("{own}_sibling/call.log" => false ; "sibling_of_own_dir")]
-    #[test_case("call.log" => false ; "logs_root")]
+    #[test_case("{own}/bash/call.log" => true ; "own_log")]
+    #[test_case("{own}/bash/call.log.1" => true ; "own_rotated_log")]
+    #[test_case("{own}/notes/scratch.md" => false ; "another_plugin_dir")]
+    #[test_case("{other}/bash/call.log" => false ; "another_sessions_log")]
+    #[test_case("{own}/../{other}/bash/call.log" => false ; "dotdot_into_another_session")]
+    #[test_case("{own}_sibling/bash/call.log" => false ; "sibling_of_own_dir")]
+    #[test_case("call.log" => false ; "data_root")]
     #[tokio::test]
-    async fn read_of_task_logs_is_allowed_only_for_the_calling_session(relative: &str) -> bool {
+    async fn read_of_bash_logs_is_allowed_only_for_the_calling_session(relative: &str) -> bool {
         let tmp = tempfile::tempdir().unwrap();
         let own = SessionRef::generate();
         let other = SessionRef::generate();
         let relative = relative
             .replace(OWN_SESSION, &own.id().to_string())
             .replace(OTHER_SESSION, &other.id().to_string());
-        let path = tmp.path().join(TASK_LOGS_DIR).join(relative);
-        read_allowed(&mgr_with_task_logs(tmp.path()), &path, Some(&own)).await
+        let path = tmp.path().join(SESSIONS_DATA_DIR).join(relative);
+        read_allowed(&mgr_with_bash_logs(tmp.path()), &path, Some(&own)).await
     }
 
     #[tokio::test]
-    async fn read_of_task_logs_without_a_session_is_not_allowed() {
+    async fn read_of_bash_logs_without_a_session_is_not_allowed() {
         let tmp = tempfile::tempdir().unwrap();
         let session = SessionRef::generate();
-        let log =
-            maki_storage::paths::session_task_logs_dir(tmp.path(), session.id()).join(TASK_LOG);
-        let mgr = mgr_with_task_logs(tmp.path());
+        let log = maki_storage::paths::session_data_dir(tmp.path(), session.id())
+            .join(BASH_PLUGIN_DIR)
+            .join(BASH_LOG);
+        let mgr = mgr_with_bash_logs(tmp.path());
         assert!(read_allowed(&mgr, &log, Some(&session)).await);
         assert!(!read_allowed(&mgr, &log, None).await);
     }
@@ -1582,7 +1597,7 @@ mod tests {
     #[test_case(false ; "read_through_the_target")]
     #[cfg(unix)]
     #[tokio::test]
-    async fn task_logs_rule_resolves_a_symlinked_state_dir(through_link: bool) {
+    async fn bash_logs_rule_resolves_a_symlinked_state_dir(through_link: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("state");
         let link = tmp.path().join("state_link");
@@ -1590,9 +1605,11 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let session = SessionRef::generate();
 
-        let mgr = mgr_with_task_logs(&link);
+        let mgr = mgr_with_bash_logs(&link);
         let state = if through_link { link } else { real };
-        let log = maki_storage::paths::session_task_logs_dir(&state, session.id()).join(TASK_LOG);
+        let log = maki_storage::paths::session_data_dir(&state, session.id())
+            .join(BASH_PLUGIN_DIR)
+            .join(BASH_LOG);
         assert!(read_allowed(&mgr, &log, Some(&session)).await, "{log:?}");
     }
 
@@ -1749,7 +1766,7 @@ mod tests {
             PermissionsConfig::default(),
             project.path().to_path_buf(),
             if trusted {
-                ProjectConfig::for_project(project.path())
+                session_trusted(project.path())
             } else {
                 ProjectConfig::discover(project.path())
             },
@@ -2481,7 +2498,7 @@ mod tests {
         let mgr = PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            session_trusted(Path::new("/tmp")),
             Arc::clone(&store),
         );
         let fork = mgr.fork();
@@ -2501,7 +2518,7 @@ mod tests {
         let mgr = PermissionManager::new(
             make_config(vec![plugin_edit_rule("/x/**", Effect::Deny)]),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            session_trusted(Path::new("/tmp")),
             store,
         );
         assert!(matches!(
@@ -2617,7 +2634,7 @@ mod tests {
         let mgr = PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
+            session_trusted(Path::new("/tmp")),
             store,
         );
         let reason = denied_reason(&mgr, &ToolKey::native("edit"), "/x/f");

@@ -2,27 +2,33 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::iter;
+use std::pin::Pin;
+use std::str::from_utf8;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use futures::TryStreamExt;
+use bytes::Buf;
+use futures::stream::try_unfold;
+use futures::{Stream, TryStreamExt};
+use reqwest::header::{HeaderMap, HeaderName};
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, Lines};
-use tokio::runtime::Handle;
-use tokio::task::{block_in_place, spawn_blocking};
+use sse_stream::{Error as SseError, Sse, SseByteStream};
+use tokio::task::spawn_blocking;
 use tokio::time::timeout;
-use tokio_util::io::StreamReader;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
-use crate::http::{Lookup, error_chain, proxy_env};
+use crate::headers::{
+    HeaderError, header_name, header_pairs, header_value, overlay, parse_headers,
+};
+use crate::http::{error_chain, proxy_env};
 use crate::retry::RetryPolicy;
 
 pub(crate) mod anthropic;
@@ -34,6 +40,7 @@ pub mod custom;
 pub(crate) mod google;
 pub(crate) mod llama_cpp;
 pub(crate) mod local;
+pub(crate) mod managed_auth;
 pub(crate) mod oauth_loopback;
 pub(crate) mod ollama;
 pub(crate) mod openai;
@@ -49,6 +56,11 @@ pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+#[cfg(test)]
+const TEST_HEADERS_INVALID: &str = "a test's auth headers must parse";
+
+/// Boxed so [`ok_sse`] can name the events its parse closure takes.
+pub(crate) type SseBody = Pin<Box<dyn Stream<Item = Result<Sse, AgentError>> + Send>>;
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
@@ -171,14 +183,18 @@ pub(crate) fn needs_refresh(dir: &StateDir, provider: &str, held: Option<&OAuthT
     }
 }
 
+/// The credentials and the headers that ride with them: what a plugin's
+/// `auth` hook or a provider's own login produced, with `[<slug>.headers]`
+/// over the top. Kept by name in a [`HeaderMap`], so nothing can append a
+/// second copy of a header (see [`crate::headers`]).
 #[derive(Clone)]
 pub struct ResolvedAuth {
     pub base_url: Option<String>,
-    pub headers: Vec<(String, String)>,
+    headers: HeaderMap,
     /// Header names that came from `[<slug>.headers]`. They win over anything
     /// the provider sets afterwards, so a key rotation cannot drop a gateway
     /// credential that replaced the built-in auth header.
-    config_headers: Vec<String>,
+    config_headers: Vec<HeaderName>,
     /// `[<slug>] top_p`, carried with the auth so whoever the slug's
     /// credentials reach (aperture routes, catalog sub-providers) sends it.
     pub top_p: Option<f64>,
@@ -192,7 +208,7 @@ impl ResolvedAuth {
     pub fn new(slug: &str, headers: Vec<(String, String)>) -> Result<Self, AgentError> {
         let mut auth = Self {
             base_url: None,
-            headers,
+            headers: parse_headers(headers).map_err(|e| header_error(slug, &e))?,
             config_headers: Vec::new(),
             top_p: None,
         };
@@ -211,27 +227,36 @@ impl ResolvedAuth {
         slug: &str,
         headers: &BTreeMap<String, String>,
     ) -> Result<(), AgentError> {
+        let mut expanded = Vec::with_capacity(headers.len());
         for (name, value) in headers {
-            let expanded = maki_config::expand_env(value).map_err(|var| {
+            let value = maki_config::expand_env(value).map_err(|var| {
                 AgentError::Config {
                     message: format!(
                         "provider '{slug}' header '{name}': environment variable '{var}' is unset or empty"
                     ),
                 }
             })?;
-            self.set_header(name, expanded);
-            self.config_headers.push(name.clone());
+            expanded.push((name, value));
         }
+        let configured = parse_headers(expanded).map_err(|e| header_error(slug, &e))?;
+        overlay(&mut self.headers, &configured);
+        self.config_headers.extend(configured.keys().cloned());
         Ok(())
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        from_utf8(self.headers.get(name)?.as_bytes()).ok()
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        header_pairs(&self.headers)
     }
 
     /// The access token behind the bearer header, so a 401 retry can say which
     /// token it was using.
     pub(crate) fn access_token(&self) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(AUTHORIZATION_HEADER))
-            .and_then(|(_, value)| value.strip_prefix(BEARER_PREFIX))
+        self.header(AUTHORIZATION_HEADER)?
+            .strip_prefix(BEARER_PREFIX)
     }
 
     /// No credentials, not even `[<slug>.headers]`: what an auth cell holds
@@ -240,7 +265,7 @@ impl ResolvedAuth {
     pub(crate) fn withheld() -> Self {
         Self {
             base_url: None,
-            headers: Vec::new(),
+            headers: HeaderMap::new(),
             config_headers: Vec::new(),
             top_p: None,
         }
@@ -260,46 +285,53 @@ impl ResolvedAuth {
 
     /// Set the header carrying the API key, unless `[<slug>.headers]` already
     /// owns that name: the config value is the one the gateway expects.
-    fn set_key_header(&mut self, name: &str, value: String) {
-        if self
-            .config_headers
-            .iter()
-            .any(|configured| configured.eq_ignore_ascii_case(name))
-        {
-            return;
+    fn set_key_header(&mut self, name: &str, value: &str) -> Result<(), HeaderError> {
+        let name = header_name(name)?;
+        if self.config_headers.contains(&name) {
+            return Ok(());
         }
-        self.set_header(name, value);
+        let value = header_value(name.as_str(), value)?;
+        self.headers.insert(name, value);
+        Ok(())
     }
 
-    /// Replace a same-name header (case-insensitive) instead of appending a
-    /// second one: `RequestBuilder::header` appends, so a configured
-    /// `Authorization` next to the built-in bearer would send two credentials.
-    pub(crate) fn set_header(&mut self, name: &str, value: String) {
-        match self
-            .headers
-            .iter_mut()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        {
-            Some(slot) => slot.1 = value,
-            None => self.headers.push((name.to_string(), value)),
-        }
+    /// Replace a same-name header (case-insensitive), never add a second one.
+    pub(crate) fn set_header(&mut self, name: &str, value: &str) -> Result<(), HeaderError> {
+        let value = header_value(name, value)?;
+        self.headers.insert(header_name(name)?, value);
+        Ok(())
     }
 
-    /// Apply all auth headers to a request builder.
-    pub fn configure_request(&self, builder: RequestBuilder) -> RequestBuilder {
-        self.headers.iter().fold(builder, |b, (key, value)| {
-            b.header(key.as_str(), value.as_str())
-        })
+    /// The request with these headers laid over everything the provider put
+    /// on it. Last, and it hands back a built [`Request`], so nothing the
+    /// provider adds can land on top of the user's value or beside it.
+    pub fn finish(&self, builder: RequestBuilder) -> Result<Request, AgentError> {
+        let mut request = builder.build()?;
+        overlay(request.headers_mut(), &self.headers);
+        Ok(request)
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(base_url: Option<String>, headers: Vec<(String, String)>) -> Self {
         Self {
             base_url,
-            headers,
+            headers: parse_headers(headers).expect(TEST_HEADERS_INVALID),
             config_headers: Vec::new(),
             top_p: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header_list(&self) -> Vec<(String, String)> {
+        self.headers()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()
+    }
+}
+
+fn header_error(slug: &str, error: &HeaderError) -> AgentError {
+    AgentError::Config {
+        message: format!("provider '{slug}': {error}"),
     }
 }
 
@@ -408,24 +440,6 @@ impl SseErrorPayload {
     }
 }
 
-pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
-    lines: &mut Lines<R>,
-    deadline: &mut Instant,
-    stream_timeout: Duration,
-) -> Result<Option<String>, AgentError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let result = match timeout(remaining, lines.next_line()).await {
-        Ok(line) => line.map_err(AgentError::from),
-        Err(_) => Err(AgentError::Timeout {
-            secs: stream_timeout.as_secs(),
-        }),
-    };
-    if let Ok(Some(_)) = &result {
-        *deadline = Instant::now() + stream_timeout;
-    }
-    result
-}
-
 impl Timeouts {
     /// The connect and stall bounds every request to a provider runs under.
     /// No total cap: a slow but moving download is not a dead one. The read
@@ -441,18 +455,18 @@ impl Timeouts {
 }
 
 /// Where every client in the crate starts, so a side request (OAuth, the
-/// catalogs, container credentials) shares the providers' redirect, proxy,
-/// DNS and trust rules. Redirects stay off: a 3xx reaches
-/// [`AgentError::from_response`] and a key header is never replayed
-/// cross-origin. HTTP/1.1 stays pinned in case a dependency turns on reqwest's
-/// http2 feature.
+/// catalogs) shares the providers' redirect, proxy and trust rules. Redirects
+/// stay off: a 3xx reaches [`AgentError::from_response`] and a key header is
+/// never replayed cross-origin. HTTP/1.1 stays pinned in case a dependency
+/// turns on reqwest's http2 feature. The user agent is the client's default,
+/// which reqwest only adds to a request that names none, so a user agent anyone
+/// else sets replaces maki's instead of going out beside it.
 pub fn client_builder() -> ClientBuilder {
     Client::builder()
         .redirect(Policy::none())
         .http1_only()
         .user_agent(user_agent())
         .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
-        .dns_resolver(Arc::new(Lookup))
 }
 
 /// Trust comes from the platform verifier, which on Linux reads
@@ -472,13 +486,6 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Client {
                 .build()
                 .expect("an HTTP client without trust roots always builds")
         })
-}
-
-/// For a flow that still blocks on one request. Works from a worker, from the main thread's
-/// `block_on` and from the blocking pool alike; panics on a current_thread
-/// runtime (every `#[tokio::test]`) and inside a `LocalSet` (the Lua thread).
-pub(crate) fn wait<T>(future: impl Future<Output = T>) -> T {
-    block_in_place(|| Handle::current().block_on(future))
 }
 
 /// `Client::execute` arms the timeouts as it is called, so the send and the
@@ -520,18 +527,68 @@ pub(crate) async fn ok_text(client: &Client, request: Request) -> Result<String,
     .await
 }
 
-/// The body as the line reader the SSE parsers take. A stall is an io timeout,
-/// so it retries as transient and never as the stream deadline, and the URL is
-/// left out before the error is worded.
-pub(crate) fn body_reader(response: Response) -> impl AsyncBufRead + Unpin {
-    StreamReader::new(response.bytes_stream().map_err(|e| {
+/// A 200 handed to the SSE parser, anything else read as an API error.
+pub(crate) async fn ok_sse<T, F, Fut>(
+    client: &Client,
+    request: Request,
+    stream_timeout: Duration,
+    parse: F,
+) -> Result<T, AgentError>
+where
+    F: FnOnce(SseBody) -> Fut,
+    Fut: Future<Output = Result<T, AgentError>>,
+{
+    send_request(client, request, |response| async move {
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        parse(sse_events(body_chunks(response), stream_timeout)).await
+    })
+    .await
+}
+
+/// The body in the chunks it arrives in. A stall is an io timeout, so it
+/// retries as transient and never as the stream deadline, and the URL is left
+/// out before the error is worded.
+fn body_chunks(
+    response: Response,
+) -> impl Stream<Item = Result<impl Buf + Send, AgentError>> + Send {
+    response.bytes_stream().map_err(|e| {
         let kind = if e.is_timeout() {
             io::ErrorKind::TimedOut
         } else {
             io::ErrorKind::Other
         };
-        io::Error::new(kind, error_chain(&e.without_url()))
-    }))
+        io::Error::new(kind, error_chain(&e.without_url())).into()
+    })
+}
+
+/// The events the SSE parsers take. Every chunk re-arms `stream_timeout`, also
+/// one that completes no event, so a server's keep-alive comments hold a slow
+/// stream open.
+pub(crate) fn sse_events<S, B>(chunks: S, stream_timeout: Duration) -> SseBody
+where
+    S: Stream<Item = Result<B, AgentError>> + Send + 'static,
+    B: Buf + Send + 'static,
+{
+    let chunks = try_unfold(Box::pin(chunks), move |mut chunks| async move {
+        match timeout(stream_timeout, chunks.try_next()).await {
+            Ok(chunk) => Ok(chunk?.map(|chunk| (chunk, chunks))),
+            Err(_) => Err(AgentError::Timeout {
+                secs: stream_timeout.as_secs(),
+            }),
+        }
+    });
+    Box::pin(SseByteStream::new(chunks).map_err(sse_error))
+}
+
+fn sse_error(error: SseError) -> AgentError {
+    match error {
+        SseError::Body(source) => source
+            .downcast()
+            .map_or_else(|other| io::Error::other(other).into(), |error| *error),
+        malformed => io::Error::new(io::ErrorKind::InvalidData, malformed).into(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -667,6 +724,16 @@ impl<'a> KeyRotation<'a> {
         Self { pool, auth, header }
     }
 
+    /// The rotation for a provider whose pool is only there when it resolved
+    /// its own keys.
+    pub(crate) fn over(
+        pool: &'a Option<KeyPool>,
+        auth: &'a Mutex<ResolvedAuth>,
+        header: KeyHeader,
+    ) -> Option<Self> {
+        Some(Self::new(pool.as_ref()?, auth, header))
+    }
+
     /// How many keys a walk can try before it is back where it started.
     pub fn key_count(&self) -> usize {
         self.pool.len()
@@ -678,10 +745,16 @@ impl<'a> KeyRotation<'a> {
         if !self.pool.rotate() {
             return false;
         }
-        self.auth
+        let name = self.header.name();
+        if let Err(error) = self
+            .auth
             .lock()
             .unwrap()
-            .set_key_header(self.header.name(), self.header.value(self.pool.current()));
+            .set_key_header(name, &self.header.value(self.pool.current()))
+        {
+            warn!(header = name, %error, "the next key cannot be sent, keeping the current one");
+            return false;
+        }
         true
     }
 }
@@ -698,12 +771,15 @@ mod tests {
 
     use super::*;
     use crate::retry::RetryKind;
+    use futures::{StreamExt, stream};
     use test_case::test_case;
-    use tokio::io::{AsyncBufReadExt, AsyncRead, ReadBuf};
     use tokio::time::sleep;
 
-    use crate::test_support::{Canned, serve, transport::LOOPBACK_HOST};
+    use crate::test_support::{Canned, serve, sse_body, transport::LOOPBACK_HOST};
 
+    const KEEP_ALIVE: &[u8] = b": keep-alive\n\n";
+    const LAST_EVENT: &[u8] = b"data: done\n\n";
+    const LAST_DATA: &str = "done";
     const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
     const UNAVAILABLE_STATUS: u16 = 502;
@@ -900,38 +976,31 @@ mod tests {
         assert_eq!(urlenc(input), expected);
     }
 
-    struct NeverReader;
-
-    impl AsyncRead for NeverReader {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Pending
-        }
+    #[tokio::test(start_paused = true)]
+    async fn a_keep_alive_comment_re_arms_the_stream_deadline() {
+        let chunks = stream::iter([KEEP_ALIVE, KEEP_ALIVE, LAST_EVENT]).then(|chunk| async move {
+            sleep(SHORT * 2 / 3).await;
+            Ok(chunk)
+        });
+        let event = sse_events(chunks, SHORT).try_next().await.unwrap();
+        assert_eq!(
+            event.and_then(|event| event.data).as_deref(),
+            Some(LAST_DATA)
+        );
     }
 
-    impl AsyncBufRead for NeverReader {
-        fn poll_fill_buf(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<&[u8]>> {
-            std::task::Poll::Pending
-        }
-
-        fn consume(self: std::pin::Pin<&mut Self>, _amt: usize) {}
-    }
-
+    #[test_case("retry: 5\nmade-up: field\nno colon\ndata: a\n\n", &["a"] ; "fields_no_parser_reads_are_skipped")]
+    #[test_case("data: a\ndata: b\n\n", &["a\nb"]                         ; "data_lines_of_one_event_are_joined")]
+    #[test_case("data: a\r\n\r\ndata: b\r\r", &["a", "b"]                 ; "every_line_ending_ends_an_event")]
+    #[test_case("data: a\n\ndata: b\n", &["a"]                             ; "an_event_cut_before_its_blank_line_is_dropped")]
     #[tokio::test]
-    async fn next_sse_line_expired_deadline_returns_timeout() {
-        let mut lines = NeverReader.lines();
-        let mut past = Instant::now() - Duration::from_secs(1);
-        let stream_timeout = Duration::from_secs(300);
-        let err = next_sse_line(&mut lines, &mut past, stream_timeout)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AgentError::Timeout { .. }));
+    async fn events_follow_the_sse_framing_rules(body: &str, expected: &[&str]) {
+        let events: Vec<Sse> = sse_body(body).try_collect().await.unwrap();
+        let data: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.data.as_deref())
+            .collect();
+        assert_eq!(data, expected);
     }
 
     /// Reads the request head, answers `head` and then sends nothing until
@@ -961,16 +1030,14 @@ mod tests {
         timeouts.bound(builder).build().unwrap()
     }
 
-    async fn first_sse_line(
+    async fn first_sse_event(
         client: &Client,
         url: &str,
         stream: Duration,
-    ) -> Result<Option<String>, AgentError> {
+    ) -> Result<Option<Sse>, AgentError> {
         let request = client.get(url).build()?;
         send_request(client, request, |response| async move {
-            let mut lines = body_reader(response).lines();
-            let mut deadline = Instant::now() + stream;
-            next_sse_line(&mut lines, &mut deadline, stream).await
+            sse_events(body_chunks(response), stream).try_next().await
         })
         .await
     }
@@ -998,7 +1065,7 @@ mod tests {
             stream,
             ..Timeouts::default()
         });
-        let error = first_sse_line(&client, &url, stream).await.unwrap_err();
+        let error = first_sse_event(&client, &url, stream).await.unwrap_err();
         assert!(expected(&error), "{error}");
         assert_eq!(error.retry_kind(), Some(kind));
     }
@@ -1008,7 +1075,7 @@ mod tests {
         let (url, hold) = stalled_sse_server(CHUNKED_HEAD);
         drop(hold);
         let client = direct_client(Timeouts::default());
-        let error = first_sse_line(&client, &url, LONG).await.unwrap_err();
+        let error = first_sse_event(&client, &url, LONG).await.unwrap_err();
         assert!(
             matches!(&error, AgentError::Io(e) if e.kind() == io::ErrorKind::Other),
             "{error}"
@@ -1115,10 +1182,7 @@ mod tests {
     }
 
     fn header_value(auth: &ResolvedAuth, name: &str) -> Option<String> {
-        auth.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.clone())
+        auth.header(name).map(str::to_owned)
     }
 
     fn test_bearer(key: &str) -> ResolvedAuth {
@@ -1138,7 +1202,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert_eq!(auth.headers.len(), 2);
+        assert_eq!(auth.header_list().len(), 2);
         assert_eq!(
             header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
             Some("Basic other")
@@ -1215,7 +1279,7 @@ mod tests {
         // The gateway credential replaced the built-in bearer, so rotating the
         // key must not put `Bearer sk-2` back and lock the user out.
         let auth = auth.lock().unwrap();
-        assert_eq!(auth.headers.len(), 1);
+        assert_eq!(auth.header_list().len(), 1);
         assert_eq!(
             header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
             Some(GATEWAY_CRED)

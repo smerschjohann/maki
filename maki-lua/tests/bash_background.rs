@@ -6,11 +6,13 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
-use common::{Chat, Gate, WAIT, done_result, isolated_state, poll_until, request_move};
+use common::{Chat, Gate, WAIT, done_result, poll_until, request_move};
 use maki_agent::agent::tool_dispatch;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
@@ -23,14 +25,18 @@ use maki_agent::{
 use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::test_support::runtime;
 use maki_lua::{EventHandle, MoveOutcome, PluginHost};
+use maki_providers::test_support::isolated_home;
 use maki_storage::id::MakiId;
-use maki_storage::paths::{session_task_logs_dir, state_dir};
+use maki_storage::paths::{session_data_dir, state_dir};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 
 const RECEIPT_HEAD: &str = "Running in the background.";
 const LOG_LABEL: &str = "Full output: ";
+const BASH_DIR: &str = "bash";
 /// The runtime's move note follows the plugin's receipt after a blank line.
 const MOVE_NOTE_SEPARATOR: &str = "\n\n";
 const ROTATED_SUFFIX: &str = ".1";
@@ -89,15 +95,15 @@ struct Run {
     call_id: String,
     session: MakiId,
     mailbox: SessionMailbox,
-    events: flume::Receiver<Envelope>,
-    result: flume::Receiver<Result<String, String>>,
+    events: UnboundedReceiver<Envelope>,
+    result: Receiver<Result<String, String>>,
     live: Option<Arc<SharedBuf>>,
     gate: Gate,
-    finish: flume::Sender<()>,
+    finish: SyncSender<()>,
     thread: Option<JoinHandle<()>>,
     _seed: Arc<AgentSeed>,
     _run_trigger: CancelTrigger,
-    _state: TempDir,
+    _home: TempDir,
 }
 
 impl Run {
@@ -121,20 +127,20 @@ impl Run {
         Self::launch(json!({}), BATCH_TOOL, input, gate)
     }
 
-    /// Isolates the state directory before the call's thread starts.
+    /// Isolates the home before the call's thread starts.
     fn launch(opts: Value, tool: &str, input: Value, gate: Gate) -> Self {
-        let state = isolated_state();
+        let home = isolated_home();
         let Chat {
             id: session,
             mailbox,
             seed,
         } = Chat::live();
         let call_id = format!("toolu_{}", MakiId::generate());
-        let (events_tx, events) = flume::unbounded();
+        let (events_tx, events) = unbounded_channel();
         let (run_trigger, run_token) = CancelToken::new();
-        let (handle_tx, handle_rx) = flume::bounded(1);
-        let (result_tx, result) = flume::bounded(1);
-        let (finish, finished) = flume::bounded::<()>(1);
+        let (handle_tx, handle_rx) = sync_channel(1);
+        let (result_tx, result) = sync_channel(1);
+        let (finish, finished) = sync_channel::<()>(1);
 
         let tool = tool.to_owned();
         let thread = thread::spawn({
@@ -186,12 +192,13 @@ impl Run {
             thread: Some(thread),
             _seed: seed,
             _run_trigger: run_trigger,
-            _state: state,
+            _home: home,
         }
     }
 
     fn log_path(&self) -> PathBuf {
-        session_task_logs_dir(&state_dir().unwrap(), self.session)
+        session_data_dir(&state_dir().unwrap(), self.session)
+            .join(BASH_DIR)
             .join(format!("{}.log", self.call_id))
     }
 
@@ -204,10 +211,11 @@ impl Run {
     fn wait_for_output(&mut self, needle: &str) {
         poll_until("bash never showed the expected output", || {
             if self.live.is_none() {
-                self.live = self.events.drain().find_map(|env| match env.event {
-                    AgentEvent::LiveToolBuf { id, body } if id == self.call_id => Some(body),
-                    _ => None,
-                });
+                self.live =
+                    iter::from_fn(|| self.events.try_recv().ok()).find_map(|env| match env.event {
+                        AgentEvent::LiveToolBuf { id, body } if id == self.call_id => Some(body),
+                        _ => None,
+                    });
             }
             self.live
                 .as_ref()
@@ -515,7 +523,7 @@ fn a_bash_in_a_moved_batch_logs_the_output_it_prints_after_the_move() {
     run.release();
     let notice = run.final_notice();
 
-    let logs = session_task_logs_dir(&state_dir().unwrap(), run.session);
+    let logs = session_data_dir(&state_dir().unwrap(), run.session).join(BASH_DIR);
     let log_path = notice
         .split_once(LOG_LABEL)
         .and_then(|(_, rest)| rest.lines().next())
@@ -565,10 +573,10 @@ fn a_timeout_moves_the_command_when_background_on_timeout_is_set() {
 #[test]
 fn the_timeout_annotates_the_header_and_stays_out_of_the_summary() {
     let input = json!({ "command": "true", "description": DESCRIPTION, "timeout": TIMEOUT_SECS });
-    let run = Run::launch(json!({}), BASH_TOOL, input, Gate::closed());
+    let mut run = Run::launch(json!({}), BASH_TOOL, input, Gate::closed());
 
     let start = poll_until("bash never started", || {
-        run.events.try_iter().find_map(|env| match env.event {
+        iter::from_fn(|| run.events.try_recv().ok()).find_map(|env| match env.event {
             AgentEvent::ToolStart(start) => Some(start),
             _ => None,
         })

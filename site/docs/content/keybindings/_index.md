@@ -42,6 +42,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+Q` | Pop queue |
 | `Esc Esc` | Rewind |
 | `Alt+O` | Edit input in external editor |
+| `Ctrl+V` | Paste clipboard image or text |
 | `Alt+Z` | Undo typing / paste |
 
 ### macOS-specific
@@ -89,6 +90,7 @@ Some pickers add extra bindings on top of the defaults:
 | Commands | `Tab` | Complete command |
 | Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
 | Model Picker | `%` | Fold or unfold provider |
+| Model Picker | `*` | Fold or unfold all providers |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
@@ -107,6 +109,8 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 | `Ctrl+P` | Browse sessions |
 | `Ctrl+X` | Open tasks |
 | `Alt+T` | Thinking effort |
+| `Alt+,` | Less thinking |
+| `Alt+.` | More thinking |
 
 ## Context Inheritance
 
@@ -191,5 +195,6 @@ The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
 These are input conventions, not remappable key rows:
 
 - Prefix a line with `!` to run a shell command yourself (5 minute timeout). Use `!!` to hide the command and its output from the agent.
-- `Ctrl+V` pastes an image from the clipboard into the prompt when the model supports vision. You can also paste image file paths.
+- Pasting image file paths attaches the images.
+- Right-click pastes clipboard text on Windows.
 - Middle-click inserts the PRIMARY selection, the same text middle-click pastes in a shell. Linux only, since other platforms have no PRIMARY selection. On Wayland the compositor must support it.

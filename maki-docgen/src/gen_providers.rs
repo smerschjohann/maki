@@ -21,6 +21,13 @@ const PLUGIN_PROVIDER_MANIFEST: &str =
 
 const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions."#;
 
+const COMPACTION_ORDER: &str = r#"Compaction uses the first model it finds:
+
+1. Your `/model` compaction pick.
+2. A `tier = "compaction"` model of the session's provider.
+3. A `tier = "compaction"` model of any other provider, in slug order.
+4. The session model, also used when the chosen model is unavailable."#;
+
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
@@ -51,7 +58,7 @@ You can also set `base_url` for a built-in provider in `~/.config/maki/providers
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
+The built-in provider still owns the slug, so `api_key_env`, `discover_models`, `models` and `protocol` are ignored with a warning. Use a custom slug if you need those. `ollama` and `llama-cpp` read `protocol` values `openai` and `openai-responses` to pick the chat or Responses API."#;
 
 const MODEL_IDENTIFIERS: &str = r#"## Model Identifiers
 
@@ -188,7 +195,7 @@ supports_vision = false
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
-| `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${{VAR}}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
+| `headers` | table | Extra HTTP headers for every request to this provider. Values expand `${{VAR}}` from the environment, and an unset or empty variable fails the provider. A header with the same name (case-insensitive) replaces the one maki would send, auth included, and survives key rotation. `anthropic-beta` values add to the betas maki sends |
 | `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
 | `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body for OpenAI-compatible, Anthropic, Bedrock and Google providers. Claude and GPT models reject it while thinking is on, and Claude Opus 4.7, Claude 5 and later always do, so it is dropped there. Never sent to Copilot or over the OpenAI responses path. Only sent when set, so the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
@@ -203,7 +210,7 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction`. With `discover_models = true`, a declared tier counts only for models the server lists |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | protocol default | |
@@ -453,7 +460,7 @@ local function credentials()
   if stored then
     return stored
   end
-  local text = maki.fs.read(maki.fs.normalize("~/.maki/auth/acme.json"))
+  local text = maki.fs.read(maki.fs.normalize("~/.local/state/maki/auth/acme.json"))
   if not text then
     return nil
   end
@@ -619,9 +626,10 @@ fn render() -> String {
         "Maki talks to LLM providers over their HTTP APIs. \
          Models are split into three tiers: **weak** (cheap and fast), \
          **medium** (balanced), and **strong** (highest capability, highest cost). \
-         There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.\n"
+         A fourth tier, **compaction**, picks the model that summarizes the conversation when it grows long.\n"
     );
     let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
+    let _ = writeln!(out, "{COMPACTION_ORDER}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");

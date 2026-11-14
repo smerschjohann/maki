@@ -7,9 +7,16 @@ group = "Reference"
 
 # Providers
 
-Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.
+Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). A fourth tier, **compaction**, picks the model that summarizes the conversation when it grows long.
 
 Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions.
+
+Compaction uses the first model it finds:
+
+1. Your `/model` compaction pick.
+2. A `tier = "compaction"` model of the session's provider.
+3. A `tier = "compaction"` model of any other provider, in slug order.
+4. The session model, also used when the chosen model is unavailable.
 
 ## Auth Reloading
 
@@ -41,7 +48,7 @@ You can also set `base_url` for a built-in provider in `~/.config/maki/providers
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+The built-in provider still owns the slug, so `api_key_env`, `discover_models`, `models` and `protocol` are ignored with a warning. Use a custom slug if you need those. `ollama` and `llama-cpp` read `protocol` values `openai` and `openai-responses` to pick the chat or Responses API.
 
 ## Built-in Providers
 
@@ -76,14 +83,15 @@ Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token 
 
 If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
 
-You will need `AWS_REGION` and one of the following for auth:
+The region comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`, then your AWS profile, and falls back to `us-east-1`. Auth uses the first of these that is set:
 
 | Method | Env vars |
 |--------|----------|
-| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
-| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
 | Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
 | Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
+| AWS credentials | The AWS SDK's default chain: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE` (static keys, SSO, `credential_process`, assumed roles, `aws login`), web identity, container and instance credentials |
+
+Temporary AWS credentials are refreshed 5 minutes before they expire. After `aws sso login`, the next request picks up the new session.
 
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here.
 
@@ -102,6 +110,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
 | Medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-6.1-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
+| Medium | gpt-6.1-terra | $1.00 / $5.00 | 1050K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
@@ -290,6 +299,7 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 - **Env var**: `MISTRAL_API_KEY`
 - **API**: `https://api.mistral.ai/v1`
+- **Features**: `/usage` shows the plan and the monthly Vibe Code allowance. The allowance shows only when the key has the `see_org_inference_usage` permission
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
@@ -337,7 +347,7 @@ Models are listed live from the API. Managed policies come first, with short ids
 
 - **Env var**: `SYNTHETIC_API_KEY`
 - **API**: `https://api.synthetic.new/openai/v1`
-- **Features**: Reasoning effort (low, medium, high), open-weight models
+- **Features**: Reasoning effort (minimal, low, medium, high, xhigh, max), open-weight models
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
@@ -434,7 +444,7 @@ supports_vision = false
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
-| `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${VAR}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
+| `headers` | table | Extra HTTP headers for every request to this provider. Values expand `${VAR}` from the environment, and an unset or empty variable fails the provider. A header with the same name (case-insensitive) replaces the one maki would send, auth included, and survives key rotation. `anthropic-beta` values add to the betas maki sends |
 | `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
 | `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body for OpenAI-compatible, Anthropic, Bedrock and Google providers. Claude and GPT models reject it while thinking is on, and Claude Opus 4.7, Claude 5 and later always do, so it is dropped there. Never sent to Copilot or over the OpenAI responses path. Only sent when set, so the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
@@ -449,7 +459,7 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{slug}/{id}` |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction`. With `discover_models = true`, a declared tier counts only for models the server lists |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | protocol default | |
@@ -711,7 +721,7 @@ local function credentials()
   if stored then
     return stored
   end
-  local text = maki.fs.read(maki.fs.normalize("~/.maki/auth/acme.json"))
+  local text = maki.fs.read(maki.fs.normalize("~/.local/state/maki/auth/acme.json"))
   if not text then
     return nil
   end

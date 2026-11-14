@@ -7,11 +7,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[features]
-# The raw `EventHandle::fire_autocmd`, for suites that fire payloads no
-# `HostEvent` carries.
-test-support = []
-
 [dependencies]
 arc-swap = { workspace = true }
 base64 = { workspace = true }
@@ -37,9 +32,8 @@ semver = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 strum = { workspace = true }
-event-listener = { workspace = true }
-flume = { workspace = true }
 futures = { workspace = true }
 pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }
@@ -98,11 +92,10 @@ fastrand = { workspace = true }
 image = { workspace = true }
 jiff = { workspace = true }
 maki-agent = { workspace = true }
-maki-lua = { workspace = true, features = ["test-support"] }
-maki-providers = { workspace = true, features = ["test-support"] }
 rcgen = { workspace = true, features = ["pem"] }
 tempfile = { workspace = true }
 test-case = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "luau_perf"
