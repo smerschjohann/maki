@@ -23,7 +23,6 @@ env:
   TARGET_BRANCH: 'masu'
   FEATURE_BRANCHES: >-
     feat/model-in-prompt
-    feature/cost-from-upstream
     feat/clipboard-cmd
     feat/net-mtls-client-certs
   BINARY_NAME: 'maki'
