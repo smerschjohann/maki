@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::ThinkingConfig;
 use crate::headers::HeaderError;
-use crate::model::{FastSupport, Model, ModelInfo};
+use crate::model::{FactSource, FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::{EffortDialect, ThinkingFallback};
@@ -190,7 +190,7 @@ impl PlanModel {
         };
         ModelInfo {
             id: self.slug,
-            context_window: self.context_window,
+            context_window: self.context_window.filter(|&window| window > 0),
             max_output_tokens: None,
             pricing: None,
             supports_thinking: Some(!info.efforts.is_empty()),
@@ -506,8 +506,14 @@ impl Provider for OpenAi {
                     .auth
                     .with_retry(|| async {
                         let mut codex_auth = self.codex_auth().await?;
-                        let mut body =
-                            super::responses::build_body(model, messages, system, tools, false);
+                        let mut body = super::responses::build_body(
+                            model,
+                            messages,
+                            system,
+                            tools,
+                            false,
+                            super::responses::SystemChannel::DeveloperMessage,
+                        );
                         if let Some(session) = session_id {
                             apply_session_affinity(&mut body, &mut codex_auth, session)?;
                         }
@@ -547,6 +553,10 @@ impl Provider for OpenAi {
                 })
                 .await
         })
+    }
+
+    fn needs_model_discovery(&self) -> bool {
+        self.auth.held_tokens().is_some()
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -602,8 +612,10 @@ impl Provider for OpenAi {
         ));
         let declared_window = model_registry::discovered(&CONFIG.slug, &model.id)
             .and_then(|discovered| discovered.context_window);
-        if declared_window.is_none() {
-            model.context_window = model.context_window.min(plan_context_window(&model.id));
+        let plan_window = plan_context_window(&model.id);
+        if declared_window.is_none() && plan_window < model.context_window {
+            model.context_window = plan_window;
+            model.sources.context_window = FactSource::Default;
         }
     }
 }
@@ -822,6 +834,22 @@ mod tests {
         assert_eq!(plan_info(&models[0]).supports_fast, expected);
     }
 
+    /// A zero would become the session's window and compact every turn, so it
+    /// counts as undeclared and `adjust_model` falls back to the plan window.
+    #[test_case(json!(300_000), Some(300_000) ; "declared")]
+    #[test_case(json!(0), None ; "zero_is_undeclared")]
+    #[test_case(Value::Null, None ; "null_is_undeclared")]
+    fn plan_models_parse_context_window(window: Value, expected: Option<u32>) {
+        let model = json!({
+            "slug": "gpt-7-nova",
+            "visibility": LISTED_VISIBILITY,
+            "context_window": window,
+        });
+        let response = json!({"models": [model]}).to_string();
+        let models = parse_plan_models(&response, Some(ACCOUNT_ID)).unwrap();
+        assert_eq!(models[0].context_window, expected);
+    }
+
     fn plan_model_info(supports_fast: bool) -> PlanModelInfo {
         PlanModelInfo {
             efforts: vec![Effort::High],
@@ -950,7 +978,14 @@ mod tests {
             fast,
         };
         assert_eq!(opts.clamped(&model).fast, expected);
-        let mut body = responses::build_body(&model, &[], "", &json!([]), false);
+        let mut body = responses::build_body(
+            &model,
+            &[],
+            "",
+            &json!([]),
+            false,
+            responses::SystemChannel::DeveloperMessage,
+        );
         responses::apply_responses_reasoning(
             &mut body,
             opts.thinking,

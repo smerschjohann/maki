@@ -45,9 +45,12 @@ use crate::{
 
 const MESSAGES_PATH: &str = "/messages";
 
-/// Priced per subscription, so every model in it reads as free. The `zai` entry
-/// carries the pay as you go rates for the same models.
-const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai-coding-plan"];
+/// models.dev ids for a subscription route to a provider we ship, keyed to its
+/// slug. The plan prepaid every model, so its zero rates are never read, and it
+/// is never served on its own. Its limits and modalities still describe a model
+/// the route serves first (glm-5.4 launched on the coding plan alone), until
+/// the provider's own entry lists it.
+const PLAN_CATALOG_IDS: &[(&str, &str)] = &[("zai-coding-plan", "zai")];
 
 /// models.dev ids for providers we ship a client for under another name, so
 /// their metadata lands under the slug a model spec is written with.
@@ -285,27 +288,56 @@ impl ProviderData {
         let Ok(auth) = self.build_auth(state_dir) else {
             return Vec::new();
         };
+        let unlocks = Unlocks::from_authentication(&auth);
         let mut models: Vec<ModelInfo> = self
             .models
             .iter()
-            .filter_map(|(model_id, meta)| {
-                let is_free = is_free_model(meta);
-                if is_free && !enable_free_models {
-                    return None;
-                }
-                let allow_model = match &auth {
-                    Authentication::KeyBased(_) => true,
-                    Authentication::FreeKey(..) => is_free,
-                    Authentication::NoAuth => false,
-                };
-                if !allow_model {
-                    return None;
-                }
-                Some(meta.model_info(model_id))
-            })
+            .filter(|(_, meta)| self.lists_model(meta, unlocks, enable_free_models))
+            .map(|(model_id, meta)| meta.model_info(model_id))
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
+    }
+
+    /// The one listing rule both wires read: a provider with a free tier treats
+    /// zero-priced rows as opt-in, a freemium catalog shows them either way,
+    /// and the public key unlocks only the free ones.
+    fn lists_model(&self, meta: &CatalogMeta, unlocks: Unlocks, enable_free_models: bool) -> bool {
+        let free = is_free_model(meta);
+        let shows_free = self.quirks.free_tier.is_none() || enable_free_models;
+        (shows_free || !free)
+            && match unlocks {
+                Unlocks::All => true,
+                Unlocks::FreeOnly => free,
+                Unlocks::Nothing => false,
+            }
+    }
+}
+
+/// What a resolved credential lets a listing show, so both wires spell the auth
+/// rule once.
+#[derive(Clone, Copy)]
+enum Unlocks {
+    All,
+    FreeOnly,
+    Nothing,
+}
+
+impl Unlocks {
+    fn from_authentication(auth: &Authentication) -> Self {
+        match auth {
+            Authentication::KeyBased(_) => Self::All,
+            Authentication::FreeKey(..) => Self::FreeOnly,
+            Authentication::NoAuth => Self::Nothing,
+        }
+    }
+
+    fn from_catalog_auth(auth: &CatalogAuth) -> Self {
+        match auth {
+            CatalogAuth::Keyed(_) => Self::All,
+            CatalogAuth::FreeOnly(_) => Self::FreeOnly,
+            CatalogAuth::Gated(_) => Self::Nothing,
+        }
     }
 }
 
@@ -365,6 +397,9 @@ pub(crate) struct CatalogData {
     /// still the only source that keeps up with what they release, so a model
     /// missing from our static tables can read its rates and limits here.
     builtin_models: HashMap<String, HashMap<String, CatalogMeta>>,
+    /// [`PLAN_CATALOG_IDS`] rows under their provider's slug, rates dropped.
+    /// Read only for a model the provider's own entry misses.
+    plan_models: HashMap<String, HashMap<String, CatalogMeta>>,
     pub(crate) state_dir: StateDir,
 }
 
@@ -373,6 +408,7 @@ impl CatalogData {
         Self {
             providers: HashMap::new(),
             builtin_models: HashMap::new(),
+            plan_models: HashMap::new(),
             state_dir,
         }
     }
@@ -380,8 +416,25 @@ impl CatalogData {
     fn from_index(index: schema::CatalogIndex, state_dir: &StateDir) -> Self {
         let mut providers = HashMap::new();
         let mut builtin_models = HashMap::new();
+        let mut plan_models = HashMap::new();
 
         for (provider_id, provider) in index {
+            if let Some(slug) = plan_slug(&provider_id) {
+                let models = parse_models(&provider.models)
+                    .into_iter()
+                    .map(|(id, meta)| {
+                        (
+                            id,
+                            CatalogMeta {
+                                pricing: None,
+                                ..meta
+                            },
+                        )
+                    })
+                    .collect();
+                plan_models.insert(slug.to_string(), models);
+                continue;
+            }
             let slug = builtin_slug(&provider_id);
             // maki brings its own client for these, so the catalog only lends
             // metadata, like the limits that keep requests inside the context.
@@ -421,6 +474,7 @@ impl CatalogData {
         Self {
             providers,
             builtin_models,
+            plan_models,
             state_dir: state_dir.clone(),
         }
     }
@@ -434,6 +488,7 @@ impl CatalogData {
             .get(slug)
             .and_then(|data| data.models.get(model_id))
             .or_else(|| self.builtin_models.get(slug)?.get(model_id))
+            .or_else(|| self.plan_models.get(slug)?.get(model_id))
     }
 
     pub(crate) fn lookup(
@@ -651,6 +706,13 @@ fn determine_catalog_format(npm: &str) -> EndpointType {
     }
 }
 
+fn plan_slug(catalog_id: &str) -> Option<&'static str> {
+    PLAN_CATALOG_IDS
+        .iter()
+        .find(|(id, _)| *id == catalog_id)
+        .map(|(_, slug)| *slug)
+}
+
 fn builtin_slug(catalog_id: &str) -> &str {
     BUILTIN_CATALOG_IDS
         .iter()
@@ -666,8 +728,8 @@ fn is_servable(provider_id: &str, npm: &str, has_api: bool) -> bool {
         debug!(provider = %provider_id, npm, "skipping provider: unsupported npm package");
         return false;
     }
-    if BLOCKED_PROVIDER_IN_CATALOG.contains(&provider_id) {
-        debug!(provider = %provider_id, "skipping provider: blocked");
+    if plan_slug(provider_id).is_some() {
+        debug!(provider = %provider_id, "skipping provider: prepaid plan route");
         return false;
     }
     if !has_api {
@@ -832,14 +894,17 @@ impl CatalogTransport {
 pub struct CatalogProvider {
     data: &'static ProviderData,
     auth: CatalogAuth,
+    /// Read once so a listing and the auth it resolved against agree.
+    free_models_enabled: bool,
     transport: CatalogTransport,
 }
 
-/// Which models the resolved auth unlocks: a real key unlocks all, the
-/// no-key `enable_free_models` opt-in unlocks free models only, and `Gated`
-/// unlocks nothing. `Gated` holds no credentials at all, so it can never send
-/// the public token by accident: discovery lists nothing, and only an actual
-/// attempt to stream tells the user to log in or opt in.
+/// Which models the resolved auth unlocks: a real key unlocks every row the
+/// free-model policy allows, the no-key `enable_free_models` opt-in unlocks
+/// free models only, and `Gated` unlocks nothing. `Gated` holds no credentials
+/// at all, so it can never send the public token by accident: discovery lists
+/// nothing, and only an actual attempt to stream tells the user to log in or
+/// opt in.
 pub(crate) enum CatalogAuth {
     Keyed(ResolvedAuth),
     FreeOnly(ResolvedAuth),
@@ -863,10 +928,11 @@ impl CatalogProvider {
         data: &'static ProviderData,
         state_dir: &StateDir,
         timeouts: Timeouts,
-        allow_free_fallback: bool,
+        free_models_enabled: bool,
     ) -> Result<Self, AgentError> {
         Ok(Self {
-            auth: data.catalog_auth(state_dir, allow_free_fallback)?,
+            auth: data.catalog_auth(state_dir, free_models_enabled)?,
+            free_models_enabled,
             data,
             transport: CatalogTransport::new(timeouts),
         })
@@ -923,14 +989,14 @@ impl Provider for CatalogProvider {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
+            let unlocks = Unlocks::from_catalog_auth(&self.auth);
             Ok(self
                 .data
                 .models
                 .iter()
-                .filter(|(_, meta)| match &self.auth {
-                    CatalogAuth::Keyed(_) => true,
-                    CatalogAuth::FreeOnly(_) => is_free_model(meta),
-                    CatalogAuth::Gated(_) => false,
+                .filter(|(_, meta)| {
+                    self.data
+                        .lists_model(meta, unlocks, self.free_models_enabled)
                 })
                 .map(|(model_id, meta)| meta.model_info(model_id))
                 .collect())
@@ -1088,7 +1154,7 @@ mod tests {
         ProviderQuirks, SessionRef, StateDir, available_if_warm, determine_catalog_format,
         parse_model, quirks_for,
     };
-    use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
+    use crate::model::{FactSources, Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::{ResolvedAuth, Timeouts, opencode};
     use crate::spec::ProviderRegistry;
@@ -1119,6 +1185,7 @@ mod tests {
     /// Nothing like any real rate, so whichever source a model read is obvious.
     const STALE_CATALOG_PRICE: f64 = 99.0;
     const ZAI_PLAN_ID: &str = "zai-coding-plan";
+    const ZAI_SLUG: &str = "zai";
     const PAID_INPUT_PRICE: f64 = 1.0;
     const PAID_CONTEXT: u32 = 128_000;
     const PAID_OUTPUT: u32 = 64_000;
@@ -1207,6 +1274,18 @@ mod tests {
         Box::leak(Box::new(opencode_go_provider_data(env_key)))
     }
 
+    async fn listed_ids(provider: &super::CatalogProvider) -> Vec<String> {
+        let mut ids: Vec<String> = provider
+            .list_models()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// The free tier authenticates with the public key, which the quota
     /// endpoint answers with a 401. There is no quota to show, so it is
     /// `Ok(None)`, while a missing key stays an error.
@@ -1261,6 +1340,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: None,
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 0,
             thinking_fields: None,
         };
@@ -1322,17 +1402,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_provider_list_models_with_key_shows_all() {
+    async fn catalog_provider_hides_free_models_without_opt_in() {
         let (_tmp, state_dir) = temp_state_dir();
         unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_KEY_41827", "real-key") };
         let data = leaked_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
-        let models = provider.list_models().await.unwrap();
-        let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        ids.sort_unstable();
-        assert_eq!(ids, ["free-model", "paid-model"]);
+        assert_eq!(listed_ids(&provider).await, ["paid-model"]);
+
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
+        assert_eq!(listed_ids(&provider).await, ["free-model", "paid-model"]);
         unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_GO_KEY_41827") };
+    }
+
+    /// A freemium catalog (openrouter) has no free tier to opt in to, so its
+    /// zero-priced rows always show.
+    #[tokio::test]
+    async fn catalog_provider_keeps_free_models_without_a_free_tier() {
+        let (_tmp, state_dir) = temp_state_dir();
+        unsafe { std::env::set_var("MAKI_TEST_FREEMIUM_KEY_20163", "real-key") };
+        let data = Box::leak(Box::new(ProviderData {
+            slug: "freemium".into(),
+            quirks: ProviderQuirks::default(),
+            ..opencode_go_provider_data("MAKI_TEST_FREEMIUM_KEY_20163")
+        }));
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert_eq!(listed_ids(&provider).await, ["free-model", "paid-model"]);
+        unsafe { std::env::remove_var("MAKI_TEST_FREEMIUM_KEY_20163") };
     }
 
     fn temp_state_dir() -> (tempfile::TempDir, StateDir) {
@@ -1829,6 +1927,31 @@ mod tests {
         assert_eq!(Some(listed.context_window), curated.context_window);
     }
 
+    /// An exact row that states no price hands the field to models.dev, so a
+    /// model launched before the provider published a rate (glm-5.4 shipped
+    /// coding-plan-only) picks the catalog's up the day it lists one, while
+    /// everything the row does state stays authoritative.
+    #[test]
+    fn an_exact_row_without_pricing_reads_the_catalog() {
+        let (_tmp, state_dir) = temp_state_dir();
+        const CATALOG_INPUT: f64 = 1.4;
+        const CATALOG_OUTPUT: f64 = 4.4;
+        let models = HashMap::from([("glm-5.4".into(), priced_row(CATALOG_INPUT, CATALOG_OUTPUT))]);
+        let index = catalog_index(
+            "zai",
+            "@ai-sdk/openai-compatible",
+            Some("https://api.z.ai/api/paas/v4"),
+            models,
+        );
+        super::seed_catalog_for_tests(index, state_dir);
+
+        let model = Model::from_spec("zai/glm-5.4").unwrap();
+        assert_eq!(model.pricing.input, CATALOG_INPUT);
+        assert_eq!(model.pricing.output, CATALOG_OUTPUT);
+        assert_eq!(model.context_window, 1_000_000, "the row keeps its word");
+        assert!(model.supports_vision());
+    }
+
     /// Curated rows match by prefix, so `grok-4.6` answers for every id
     /// starting with it. That guess loses to models.dev naming the exact model,
     /// or the next release in an existing family bills at its predecessor's
@@ -1942,21 +2065,41 @@ mod tests {
         assert!(data.provider(catalog_id).is_none());
     }
 
-    /// Its models are covered by the pay as you go `zai` entry, and are priced
-    /// at zero here because the plan already paid for them.
+    /// The plan prepaid its models, so it is never served and its zeros never
+    /// price anything. Its limits still describe a model only the plan lists,
+    /// and the provider's own entry wins wherever it has the model.
     #[test]
-    fn plan_priced_provider_is_dropped_entirely() {
+    fn plan_route_lends_limits_but_never_rates() {
         let (_tmp, state_dir) = temp_state_dir();
-        let index = single_provider_catalog(
-            ZAI_PLAN_ID,
-            "@ai-sdk/openai-compatible",
-            Some("https://api.z.ai/api/coding/paas/v4"),
-        );
+        let plan_rows = HashMap::from([
+            (UNLISTED_MODEL.into(), documented_row(true)),
+            (LISTED_MODEL.into(), documented_row(true)),
+        ]);
+        let own_rows = HashMap::from([(
+            LISTED_MODEL.into(),
+            priced_row(PAID_INPUT_PRICE, UNLISTED_OUTPUT_PRICE),
+        )]);
+        let mut index = catalog_index(ZAI_PLAN_ID, CHAT_NPM, Some(CATALOG_API_URL), plan_rows);
+        index.extend(catalog_index(
+            ZAI_SLUG,
+            CHAT_NPM,
+            Some(CATALOG_API_URL),
+            own_rows,
+        ));
         let data = CatalogData::from_index(index, &state_dir);
 
         assert!(data.provider(ZAI_PLAN_ID).is_none());
         assert!(data.model_meta(ZAI_PLAN_ID, UNLISTED_MODEL).is_none());
-        assert!(data.model_meta("zai", UNLISTED_MODEL).is_none());
+        let lent = data.model_meta(ZAI_SLUG, UNLISTED_MODEL).unwrap();
+        assert_eq!(lent.context, Some(UNLISTED_CONTEXT));
+        assert_eq!(lent.supports_vision, Some(true));
+        assert!(lent.pricing.is_none());
+        let own = data.model_meta(ZAI_SLUG, LISTED_MODEL).unwrap();
+        assert_eq!(
+            own.pricing.as_ref().map(|pricing| pricing.input),
+            Some(PAID_INPUT_PRICE)
+        );
+        assert_eq!(own.context, None, "the provider's own row is the answer");
     }
 
     /// A rename only helps when the catalog id is not a slug we ship.

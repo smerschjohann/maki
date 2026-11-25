@@ -120,6 +120,20 @@ pub enum HostEvent<'a> {
     TaskFocusChanged {
         id: &'a str,
     },
+    JobStart {
+        id: u32,
+        plugin: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
+        command: &'a str,
+        shared: bool,
+    },
+    JobExit {
+        id: u32,
+        plugin: &'a str,
+        exit_code: i32,
+        shared: bool,
+    },
     ModelChanged {
         model: Value,
         previous_spec: String,
@@ -231,6 +245,8 @@ impl HostEventKind {
             Self::TaskStatusChanged => (&[], &["id", "name", "status", "plugin"]),
             Self::TaskStopped => (&[], &["id", "plugin"]),
             Self::TaskFocusChanged => (&[], &["id"]),
+            Self::JobStart => (&["command"], &["id", "plugin", "name", "shared"]),
+            Self::JobExit => (&[], &["id", "plugin", "exit_code", "shared"]),
             Self::ModelChanged => (&[], &["model", "previous_spec"]),
             Self::InputChanged => (
                 &["text"],
@@ -343,6 +359,7 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
         DoneReason::EndTurn => Some("finished"),
         DoneReason::MaxTokens => Some("max_tokens"),
         DoneReason::MaxTurns => Some("max_turns"),
+        DoneReason::MaxBudget => Some("max_budget"),
         DoneReason::Cancelled => Some("cancelled"),
         DoneReason::Dropped => Some("dropped"),
         DoneReason::Compact => None,
@@ -463,6 +480,7 @@ mod tests {
     #[test_case(DoneReason::EndTurn, Some("finished") ; "finished")]
     #[test_case(DoneReason::MaxTokens, Some("max_tokens") ; "max_tokens")]
     #[test_case(DoneReason::MaxTurns, Some("max_turns") ; "max_turns")]
+    #[test_case(DoneReason::MaxBudget, Some("max_budget") ; "max_budget")]
     #[test_case(DoneReason::Cancelled, Some("cancelled") ; "cancelled")]
     #[test_case(DoneReason::Dropped, Some("dropped") ; "dropped")]
     #[test_case(DoneReason::Compact, None ; "manual_compact_is_not_a_turn")]
@@ -591,6 +609,19 @@ mod tests {
                 plugin: Some(SAMPLE_TEXT),
             },
             HostEventKind::TaskFocusChanged => HostEvent::TaskFocusChanged { id: SAMPLE_TEXT },
+            HostEventKind::JobStart => HostEvent::JobStart {
+                id: 0,
+                plugin: SAMPLE_TEXT,
+                name: Some(SAMPLE_TEXT),
+                command: SAMPLE_TEXT,
+                shared: true,
+            },
+            HostEventKind::JobExit => HostEvent::JobExit {
+                id: 0,
+                plugin: SAMPLE_TEXT,
+                exit_code: 0,
+                shared: true,
+            },
             HostEventKind::ModelChanged => HostEvent::ModelChanged {
                 model: json!({}),
                 previous_spec: SAMPLE_TEXT.into(),

@@ -70,7 +70,7 @@ use crate::api::tool::{
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::ui::marks::{InputRuleStore, InputRulesReader};
-use crate::api::ui::{HintStore, WinStore, clear_session_hints};
+use crate::api::ui::{HintStore, WinStore, clear_session_hints, publish_hint_snapshot};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
@@ -2700,7 +2700,7 @@ fn try_active_task(lua: &Lua) -> mlua::Result<TaskHandle> {
 
 pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
     if lua.app_data_ref::<JobStore>().is_none() {
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
     }
     let mut store = lua
         .app_data_mut::<JobStore>()
@@ -3815,6 +3815,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(JobStore::new(Some(EventHandle::from_tx(tx.clone()))));
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(SpawnedTasks::default());
@@ -4431,11 +4432,8 @@ impl LuaRuntime {
         }
         if let Some(mut store) = self.lua.app_data_mut::<HintStore>() {
             store.clear_plugin(plugin);
-            let entries = store.snapshot_entries();
             drop(store);
-            if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
-                writer.publish(entries);
-            }
+            publish_hint_snapshot(&self.lua);
         }
         if let Some(mut store) = self.lua.app_data_mut::<InputRuleStore>() {
             store.clear_plugin(plugin);
@@ -7494,18 +7492,19 @@ mod tests {
 
     /// `while true do end` only stops if the watchdog kills it, so run it on
     /// a helper thread with a bounded wait: a broken watchdog then fails the
-    /// test with a reason instead of hanging the harness. The clock starts
-    /// before the loop can, so the reported time is a lower bound.
-    fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Duration) {
+    /// test with a reason instead of hanging the harness. Returns when the
+    /// kill reached the test: callers time it from before they arm the kill,
+    /// as compiling the loop (with the JIT, slowly) already counts against a
+    /// deadline.
+    fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Instant) {
         let f = lua.load("while true do end").into_function().unwrap();
         let (tx, rx) = sync_channel(1);
-        let start = Instant::now();
         thread::spawn(move || drop(tx.send(f.call::<bool>(()))));
         let err = rx
             .recv_timeout(WATCHDOG_TEST_TIMEOUT)
             .expect("watchdog never killed the hot loop")
             .unwrap_err();
-        (err, start.elapsed())
+        (err, Instant::now())
     }
 
     /// Runs long enough (50ms) to guarantee several watchdog pokes.
@@ -7531,12 +7530,16 @@ mod tests {
     #[test]
     fn stale_cancelled_handle_aborts_callback_after_the_grace() {
         let (lua, _watchdog) = watchdog_lua(false);
+        let armed = Instant::now();
         lua.set_app_data::<TaskHandle>(cancelled_handle());
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, killed) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_CANCELLED_MSG));
-        assert!(elapsed >= KILL_GRACE, "kill skipped the cleanup grace");
+        assert!(
+            killed - armed >= KILL_GRACE,
+            "kill skipped the cleanup grace"
+        );
     }
 
     /// A healthy poke must leave nothing armed, or the first poke after esc
@@ -8548,13 +8551,14 @@ mod tests {
     #[test]
     fn shutdown_outranks_the_cleanup_grace() {
         let (lua, _watchdog) = watchdog_lua(true);
+        let armed = Instant::now();
         lua.set_app_data::<TaskHandle>(cancelled_handle());
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, killed) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
         assert!(
-            elapsed < KILL_GRACE,
+            killed - armed < KILL_GRACE,
             "shutdown waited out the cleanup grace"
         );
     }
@@ -8567,15 +8571,15 @@ mod tests {
         let (lua, _watchdog) = watchdog_lua(false);
         install_compiler(&lua, true);
 
-        let deadline = Instant::now() + JIT_DEADLINE;
-        let cell = TaskCell::new(CancelToken::none(), Some(deadline), None);
+        let armed = Instant::now();
+        let cell = TaskCell::new(CancelToken::none(), Some(armed + JIT_DEADLINE), None);
         lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, killed) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_DEADLINE_MSG));
         assert!(
-            elapsed >= JIT_DEADLINE + KILL_GRACE,
+            killed - armed >= JIT_DEADLINE + KILL_GRACE,
             "kill skipped the cleanup grace"
         );
     }

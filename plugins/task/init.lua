@@ -4,6 +4,7 @@
 
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+require("jobs")
 require("picker")
 require("stop")
 
@@ -17,7 +18,7 @@ end
 local DEFAULT_OUTPUT_LINES = 3
 local WAITING_FOR_SLOT = "waiting for a free subagent slot"
 local MOVED_RECEIPT = "Subagent %s"
-local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground."
+local FOREGROUND_NOTE = "[Could not start in the background (%s). Ran in the foreground.]"
 
 local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 

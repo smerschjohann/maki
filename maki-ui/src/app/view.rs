@@ -55,7 +55,9 @@ impl App {
         match owner {
             KeyboardOwner::Chat => input,
             KeyboardOwner::Permission => prompt,
-            KeyboardOwner::FocusedWindow => self.float_mgr.focused_caret(),
+            KeyboardOwner::FocusedFloat | KeyboardOwner::FocusedSplit => {
+                self.float_mgr.focused_caret()
+            }
             KeyboardOwner::Search
             | KeyboardOwner::FilePicker
             | KeyboardOwner::RewindPicker
@@ -455,6 +457,11 @@ impl App {
             workflow: self.state.workflow,
             restricted: self.trust.question().is_some(),
             yolo: self.permissions.is_yolo(),
+            plugin_segments: self.hints.get().map_or_else(Vec::new, |snap| {
+                snap.visible_segments(self.state.session.id)
+                    .map(|segment| (segment.text.clone(), segment.style.clone()))
+                    .collect()
+            }),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

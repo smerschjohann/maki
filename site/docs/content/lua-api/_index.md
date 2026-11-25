@@ -487,6 +487,11 @@ only in compact mode.
   - `name` (`string`) Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
   - `description` (`string`) Required. Non-empty description shown to the model.
   - `schema` (`table`) Required. JSON Schema object describing the tool's input parameters.
+    A property can also carry keys the model never sees:
+    - `alias` (`string|string[]`) Other names the model may send for this property, with the real name winning when both arrive.
+    - `hint` (`string`) Appended to the error when this required property is missing or its enum value does not match.
+    - `value_alias` (`table`) Enum values the model may send in place of a variant, e.g. `{ done = "completed" }`. Each target must be a variant.
+    - `accept_single` (`boolean`) When this required array of objects is missing, accept its item's fields sent at the parent level and wrap them into a one-item array.
   - `handler` (`function`) Required. Called with `(input, ctx)` when the tool is invoked.
     Must return a string or a table with any of these fields:
     - `llm_output` (`string`) Result text for the model or the calling code.
@@ -901,7 +906,7 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"AutoCompacting"`, `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-`"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
+`"ModeChanged"`, `"FileIndexReady"`, `"JobStart"` and `"JobExit"`. Plugins can also fire their own
 events with `exec_autocmds`.
 
 Every host event carries `data.session_id` except `"FileIndexReady"`,
@@ -917,7 +922,7 @@ name the session now running or focused. What each event adds:
   that never ran, like a cancelled one, has neither.
 - `"TurnStart"`: `data.text`, the message that started the turn.
 - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
-  `"max_turns"`, `"cancelled"`, or `"dropped"` when an
+  `"max_turns"`, `"max_budget"`, `"cancelled"`, or `"dropped"` when an
   `agent.user_message` layer refused the message), `data.usage` (four
   token fields, cache included), `data.cost`, `data.list_cost`, `data.context_size`,
   `data.context_window`, and `data.num_turns` (model round-trips the
@@ -971,6 +976,12 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"JobStart"`, `"JobExit"`: session-owned jobs (`scope = { session =
+  ... }`) only. Both carry `data.id`, `data.plugin` and `data.shared`,
+  true only for jobs other plugins may list. `"JobStart"` adds
+  `data.name` and `data.command`; `"JobExit"` adds `data.exit_code` and
+  fires when a job ends on its own as well as when it is killed.
+  A killed job exits with `-1`, and an unnamed job has no `data.name`.
 - `"InputChanged"`: `data.text`, `data.cursor`, `data.anchor`,
   `data.version` and `data.session_id`, as
   [`maki.ui.input`](#maki-ui-input) reports them. `data.cursor_only` is
@@ -2634,6 +2645,11 @@ Requires the `run` [plugin permission](#plugin-permissions).
     with the current call. `"plugin"` keeps it alive until the plugin
     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
     session ends, and survives plugin reload.
+  - `shared` (`boolean?`) session jobs only: let other plugins list and stop
+    this job. Defaults to false, which keeps the job private to the
+    plugin that started it. `JobStart` fires for every session job, shared
+    or not; its `data.shared` tells listeners which ones are visible to
+    other plugins.
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo` and
     `jobwait` (default 20, 0 disables, max 1024).
   - `max_line_bytes` (`integer?`) longest line delivered, in bytes. A longer
@@ -2663,22 +2679,27 @@ end
 ### `maki.fn.jobstop()` {#maki-fn-jobstop}
 
 ```lua
-maki.fn.jobstop({job_id})
+maki.fn.jobstop({job_id}, {session?})
 ```
 
 Kill a running job immediately (SIGKILL on Unix). Safe to call on
-jobs that already exited or on unknown ids.
+jobs that already exited or on unknown ids. To stop a session job another
+plugin started with `shared = true`, name the job's session as well; the
+call does nothing for any other session. Jobs this plugin started need no
+session, which is how a job picker stops only the jobs it lists.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
+- `{session?}` (`string?`) Session the job must belong to when another plugin started it.
 
 **Example:**
 
 ```lua
 maki.fn.jobstop(id)
+maki.fn.jobstop(row.id, session)
 ```
 
 ---
@@ -2784,8 +2805,11 @@ maki.fn.joblist({session?})
 
 List jobs this plugin can see, including exited session-owned jobs (so an
 id started before a reload stays findable). Rows identify the job; call
-`jobinfo` for tails. Pass a session id to list only that session's jobs.
-Plugin and task jobs carry no session, so a filter never matches them.
+`jobinfo` for tails. Pass a session id to list only that session's jobs:
+its shared jobs from other plugins come with it, while their private ones
+stay out. Plugin and task jobs carry no session, so a filter never matches
+them. Exited jobs stay in the list too, so filter on `status` when only
+the running ones matter.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -3584,12 +3608,12 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 - `{pattern}` (`string`) Regular expression to search for.
 - `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 
-**Returns:** (`table?`, `string?`) Array of `{path, groups}` tables, or nil plus an error message.
+**Returns:** (`table?`, `string?`, `table?`) Array of `{path, groups}` tables, or nil plus an error message. When `limit` cut results, a third value `{ groups, files }` counts the match groups left out and the files they came from.
 
 **Example:**
 
 ```lua
-local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+local hits, err, omitted = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
 if err then return end
 for _, file in ipairs(hits) do
   for _, g in ipairs(file.groups) do
@@ -3598,6 +3622,35 @@ for _, file in ipairs(hits) do
     end
   end
 end
+if omitted then print(omitted.groups .. " more not shown") end
+```
+
+---
+
+### `maki.fs.grep_count()` {#maki-fs-grep_count}
+
+```lua
+maki.fs.grep_count({pattern}, {opts?})
+```
+
+Count the lines matching a regex {pattern} in each file, without
+returning the lines.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{pattern}` (`string`) Regular expression to search for.
+- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`).
+
+**Returns:** (`table?`, `string?`) Array of `{path, matches}` tables for the files with a match, newest first, or nil plus an error message.
+
+**Example:**
+
+```lua
+local counts, err = maki.fs.grep_count("TODO", { path = "src" })
+if err then return end
+for _, file in ipairs(counts) do print(file.path .. ": " .. file.matches) end
 ```
 
 ---
@@ -4121,11 +4174,15 @@ Each key runs one handler: the first match in this list, for the
 current mode.
 
 1. `<C-c>` and `<C-z>`, which no binding can take. `<C-z>` suspends
-   here, and `<C-c>` still goes to step 2 first.
-2. Maki's modals and prompts, then the focused window, then Maki's
-   pickers. They take every key, except the plan form and the `/`
-   command list, which pass on the keys they do not use. The focused
-   window runs its buffer's bindings, then its `win:recv`.
+   here, and `<C-c>` still goes to step 2 first. An open permission
+   prompt takes `<C-c>` even under the focused floating window, so it
+   can always be denied.
+2. Maki's alerts, then the focused floating window, then Maki's
+   prompts and modals, then the focused split, then Maki's pickers.
+   They take every key, except the plan form and the `/` command list,
+   which pass on the keys they do not use. The focused window runs its
+   buffer's bindings, then its `win:recv`. A hidden focused window, or
+   one sized to nothing, takes no keys here.
 3. Windows on screen, front first: each one's buffer bindings, then
    the keys it claimed with the `keys` option of `maki.ui.open_win`.
 4. `<Esc>` while the agent runs, in either mode. Maki takes it, and a
@@ -4588,19 +4645,31 @@ maki.model.info({spec})
 ```
 
 Resolve a model spec to everything maki knows about it: identity, tier,
-context window, and the price table the session would be billed by --
+limits, capabilities, and the price table the session would be billed by --
 including rates resolved from provider config or the bundled catalog
 (e.g. subsidised custom providers), which the provider's own /v1/models
-endpoint may never report. Purely local -- no UI round-trip, no network
--- so it also works from slash commands and headless embeddings.
+endpoint may never report. The provider's own adjustments apply, as they do
+for a session. Purely local -- no UI round-trip, no network -- so it also
+works from slash commands and headless embeddings.
 
 **Parameters:**
 
 - `{spec}` (`string`) `"provider/id"`, as listed by `available()`.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, provider_display,
-  tier, subsidised_by?, context_window, max_output_tokens?, free?,
-  pricing?}`, or nil and an error.
+  tier, family, subsidised_by?, context_window, max_output_tokens?, free?,
+  supports_thinking, supports_vision, pricing?, sources}`, or nil and an
+  error.
+
+  `family` is `"generic"`, `"claude"`, `"gpt"`, `"gemini"`, `"glm"` or
+  `"synthetic"`.
+
+  `sources` names what decided each fact, as
+  `{context_window, max_output_tokens, pricing, thinking, vision}`. Each is
+  `"config"` (`providers.toml`), `"discovery"` (the provider's live model
+  list), `"table"` (a curated or plugin model row), `"like"` (the row a
+  `like` names), `"catalog"` (models.dev) or `"default"` (nothing described
+  the model, so a provider or family default applies).
 
   `free` has three states: `true` when the model is known to cost nothing,
   `false` when it is metered, and nil when no source ever quoted a rate.
@@ -5182,6 +5251,45 @@ select; it now answers from the same list.
 - `{slug}` (`string`) Provider name.
 
 **Returns:** boolean
+
+---
+
+### `maki.provider.usage()` {#maki-provider-usage}
+
+```lua
+maki.provider.usage({slug})
+```
+
+The provider's own usage limits, the data behind `/usage`. A limit carries
+a provider label, a used percentage, its reset time in epoch milliseconds
+and a free-form detail. `plan` and `by_model_today` come back when the
+provider reports them.
+
+With a UI attached the answer comes from a live session using that slug,
+the instance `/usage` reads, so a key rotated after a 429 is the one
+reported. Headless drivers build a fresh provider from the slug instead,
+which starts at the first key.
+
+A provider with no usage endpoint answers nil and an error, as does a
+failed fetch. The call fetches live data, so a plugin that polls should
+space its calls out.
+
+**Parameters:**
+
+- `{slug}` (`string`) Provider name, such as `"zai"`.
+
+**Returns:** (`table|nil`, `string|nil`) Usage, or nil and an error string.
+
+**Example:**
+
+```lua
+local usage, err = maki.provider.usage("zai")
+if usage then
+  for _, limit in ipairs(usage.limits or {}) do
+    maki.log.info(limit.label .. " " .. tostring(limit.percentage) .. "%")
+  end
+end
+```
 
 ---
 
@@ -6201,6 +6309,7 @@ the built-in pickers use.
 
 ```lua
 local md = maki.text.html_to_markdown(html)
+local plain = maki.text.html_to_text(html)
 local text = maki.text.to_utf8(bytes)
 local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ```
@@ -6210,7 +6319,7 @@ local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ### `maki.text.html_to_markdown()` {#maki-text-html_to_markdown}
 
 ```lua
-maki.text.html_to_markdown({html})
+maki.text.html_to_markdown({html}, {opts?})
 ```
 
 Convert an HTML string to Markdown.
@@ -6220,6 +6329,7 @@ Invalid UTF-8 becomes U+FFFD.
 **Parameters:**
 
 - `{html}` (`string`) HTML source text.
+- `{opts?}` (`table?`) `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
 
 **Returns:** (`string?`, `string?`) Markdown text on success, or nil plus an error message.
 
@@ -6229,6 +6339,36 @@ Invalid UTF-8 becomes U+FFFD.
 local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
+
+local article = maki.text.html_to_markdown(page, { skip_tags = { "script", "style", "nav" } })
+```
+
+---
+
+### `maki.text.html_to_text()` {#maki-text-html_to_text}
+
+```lua
+maki.text.html_to_text({html}, {opts?})
+```
+
+Convert an HTML string to plain text.
+Entities are decoded and whitespace is collapsed outside `pre`. Inline elements such as
+`b` or `a` leave no trace, and every other element starts a new line.
+Invalid UTF-8 becomes U+FFFD.
+
+**Parameters:**
+
+- `{html}` (`string`) HTML source text.
+- `{opts?}` (`table?`) `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
+
+**Returns:** (`string?`, `string?`) Plain text on success, or nil plus an error message.
+
+**Example:**
+
+```lua
+local text, err = maki.text.html_to_text("<h1>Fish &amp; chips</h1><p>to <b>go</b></p>")
+if err then return end
+print(text) -- "Fish & chips\nto go"
 ```
 
 ---
@@ -8542,6 +8682,93 @@ maki.keymap.set("i", "<CR>", function(ev)
 end)
 ```
 
+---
+
+### `maki.ui.chat_item()` {#maki-ui-chat_item}
+
+```lua
+maki.ui.chat_item({opts})
+```
+
+Adds or updates a plugin-owned item in the transcript of one chat
+session. Call with `status = "running"` to create it, then with a
+terminal status to close it. A terminal call for an id the transcript has
+not seen creates the item already closed, so no update is lost when the
+running call never reached the transcript.
+
+Every call must pass `id`, `session` and `title`. Ids only need to be
+unique within the plugin, so a plugin need not prefix them with its own
+name. `title` replaces the row's text on every call, including updates;
+`detail` is extra text shown only on a terminal status, and omitting it
+leaves the title as the row text.
+
+The item lands in the transcript of the session `session` names,
+whichever tab that session is in; a session with no tab left drops the
+update quietly. Without a UI there is no transcript, so the call does
+nothing in headless modes.
+
+The item is not a tool call: it outlives the turn that started it, so the
+turn ending and Esc leave it alone. Unlike status segments, items stay in
+the transcript when the plugin unloads, until the chat itself goes away.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `id` (`string`) unique within this plugin, no plugin-name prefix needed.
+  - `session` (`string`) the session whose transcript owns the item, e.g. the `data.session_id` an autocmd hands you or `maki.ui.input` reports.
+  - `title` (`string`) headline on the item's row, required on every call.
+  - `label` (`string`) item kind shown next to the status, e.g. `"monitor"`. Default `"item"`; omitting it on an update resets it to `"item"`.
+  - `status` (`string`) `"running"` (the default), `"done"`, `"failed"`, or `"cancelled"`.
+  - `detail` (`string`) terminal text for `done` / `failed` / `cancelled`, e.g. `"exited (code 0)"`. Omitting it keeps the title.
+
+**Example:**
+
+```lua
+maki.ui.chat_item({ id = id, session = sid, label = "monitor", title = cmd, status = "running" })
+maki.ui.chat_item({ id = id, session = sid, title = cmd, status = "done", detail = "exited (code 0)" })
+```
+
+---
+
+### `maki.ui.status_segment()` {#maki-ui-status_segment}
+
+```lua
+maki.ui.status_segment({opts?})
+```
+
+Adds, updates, or removes one of the plugin's status bar segments, the
+short text spans shown on the right side of the bar in every tab.
+
+Ids only need to be unique within the plugin, so no plugin-name prefix is
+needed. With `session` the segment shows only in that session's tab;
+there it replaces the every-tab segment of the same id, and removing it
+reveals the every-tab one again.
+
+Every set must pass `text`, though an empty string is allowed. Pass
+`remove = true` to drop one id, or `status_segment(nil)` to drop all of
+the plugin's segments. Omitting `style` on a set resets it to
+`"status_dim"` rather than keeping the previous style.
+
+Segments go away when the plugin unloads. Without a UI there is no status
+bar, so the call does nothing in headless modes.
+
+**Parameters:**
+
+- `{opts?}` (`table|nil`) Options:
+  - `id` (`string`) unique within this plugin, no prefix needed.
+  - `text` (`string`) segment text, rendered as `[ text ]`. Required unless `remove` is true; empty is allowed.
+  - `style` (`string`) theme style name. Default `"status_dim"` on every set.
+  - `session` (`string?`) the session whose tab shows the segment. Default: every tab.
+  - `remove` (`boolean?`) drop this id instead of setting it. Default false.
+
+**Example:**
+
+```lua
+maki.ui.status_segment({ id = "jobs", text = "3 running" })
+maki.ui.status_segment({ id = "jobs", remove = true })
+maki.ui.status_segment(nil) -- remove all of this plugin's
+```
+
 
 ## maki.ui.Win {#maki-ui-Win}
 
@@ -9314,26 +9541,27 @@ shown as full source, larger ones as their public interface.
 ### `require("maki.color")`
 
 ```lua
+--!strict
 local M = {}
 
-function M.lerp(from, to, t)
+function M.lerp(from: string, to: string, t: number): string?
   local fr, fg, fb = from:match("^#(%x%x)(%x%x)(%x%x)$")
   local tr, tg, tb = to:match("^#(%x%x)(%x%x)(%x%x)$")
   if not fr or not tr then
     return nil
   end
-  fr, fg, fb = tonumber(fr, 16), tonumber(fg, 16), tonumber(fb, 16)
-  tr, tg, tb = tonumber(tr, 16), tonumber(tg, 16), tonumber(tb, 16)
-  local r = math.floor(fr + (tr - fr) * t + 0.5)
-  local g = math.floor(fg + (tg - fg) * t + 0.5)
-  local b = math.floor(fb + (tb - fb) * t + 0.5)
-  return string.format("#%02x%02x%02x", r, g, b)
+  -- The pattern matched, so every capture is two hex digits.
+  local function channel(from_hex: string?, to_hex: string?): number
+    local a, b = tonumber(from_hex, 16) :: number, tonumber(to_hex, 16) :: number
+    return math.floor(a + (b - a) * t + 0.5)
+  end
+  return string.format("#%02x%02x%02x", channel(fr, tr), channel(fg, tg), channel(fb, tb))
 end
 
-function M.dim(color, factor)
+function M.dim(color: string, factor: number): string?
   local background = maki.ui.theme_style("background")
   local bg = background and background.bg
-  return bg and M.lerp(color, bg, factor)
+  return if bg then M.lerp(color, bg, factor) else nil
 end
 
 return M
@@ -9358,13 +9586,17 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
--- one of the error constants above.
+-- one of the error constants above. The third result is true when the
+-- replaced span was matched by `context_aware`, the only fallback that
+-- forgives differing lines, so callers can warn about an edit made
+-- against a file the model no longer saw correctly.
 function M.replace(content, old_string, new_string, replace_all)
 ```
 
 ### `require("maki.list_nav")`
 
 ```lua
+--!strict
 -- Moves a cursor through a list, so every picker answers the same keys. It
 -- keeps no state: you pass the key, the cursor row and a function that moves
 -- the cursor. The list and the drawing stay yours.
@@ -9384,7 +9616,7 @@ ListNav.KEYS = table.freeze({
   ["<Down>"] = "down",
   ["<PageUp>"] = "page_up",
   ["<PageDown>"] = "page_down",
-})
+} :: Keys)
 
 -- Adds j and k, for a list without a text input.
 ListNav.VIM_KEYS = table.freeze({
@@ -9394,7 +9626,7 @@ ListNav.VIM_KEYS = table.freeze({
   ["<PageDown>"] = "page_down",
   j = "down",
   k = "up",
-})
+} :: Keys)
 
 -- Calls {move_to}(row) for a navigation {key} and returns whether {key} is
 -- one, so you know when to pass it on. It returns true even when the cursor
@@ -9409,7 +9641,7 @@ ListNav.VIM_KEYS = table.freeze({
 --     spacers or headings
 --   keys: key -> "up"|"down"|"page_up"|"page_down", with keys spelled as
 --     `maki.keymap.normalize` returns them. Defaults to `ListNav.KEYS`
-function ListNav.handle_key(key, cursor, opts, move_to)
+function ListNav.handle_key(key: string, cursor: number, opts: Opts, move_to: (row: number) -> ()): boolean
 ```
 
 ### `require("maki.list_picker")`
@@ -9525,6 +9757,7 @@ function M.cut_middle(text, max_lines, max_bytes)
 ### `require("maki.partial")`
 
 ```lua
+--!strict
 -- When a tool is cut short, it still hands back what it printed. The marker
 -- tells the model that output is real but unfinished. One home for the
 -- wording and the painting, so every tool says it the same way.
@@ -9533,12 +9766,13 @@ function M.cut_middle(text, max_lines, max_bytes)
 --- the tool streamed, already truncated; empty means the view still shows a
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
 --- "timeout" | "stopped"). {started_at} is the `os.time()` the tool began at.
-function M.cut(view, out, reason, timeout_secs, started_at)
+function M.cut(view, out: string, reason: string, timeout_secs: number, started_at: number)
 ```
 
 ### `require("maki.provider_parse")`
 
 ```lua
+--!strict
 -- Typed readers for provider model-list and usage JSON, for use in
 -- `list_models` and `fetch_usage` hooks.
 --
@@ -9546,34 +9780,35 @@ function M.cut(view, out, reason, timeout_secs, started_at)
 -- and in an array it stops `ipairs`. Numbers above 2^53 come back rounded.
 
 --- A whole, non-negative number up to 2^64, or nil.
-function M.as_u64(value)
+function M.as_u64(value: unknown): number?
 
 --- A whole, non-negative number that fits a u32, or nil.
-function M.as_u32(value)
+function M.as_u32(value: unknown): number?
 
 --- A number, or nil.
-function M.as_f64(value)
+function M.as_f64(value: unknown): number?
 
 --- A boolean, or nil.
-function M.as_bool(value)
+function M.as_bool(value: unknown): boolean?
 
 --- A model row's `pricing`, converted from per-token to per-million-token
 --- dollars. Nil unless both `input` and `output` are given, so a partial price
 --- never reads as free. A missing cache price is 0.
-function M.pricing(input, output, cache_write, cache_read)
+function M.pricing(input: number?, output: number?, cache_write: number?, cache_read: number?): Pricing?
 
 --- Maps each `body.data` element through `parse_row`, drops nils, keeps the
 --- first row per id, and sorts by id. Returns an empty list when `data` is
 --- not an array.
-function M.models(body, parse_row)
+function M.models(body: unknown, parse_row: (unknown) -> Row?): { Row }
 ```
 
 ### `require("maki.scroll")`
 
 ```lua
+--!strict
 -- Relative scrolling on top of maki.fn.winsaveview / winrestview.
 -- Positive {delta} scrolls down, negative up. Returns (true, nil) or (nil, err).
-local function scroll(delta)
+local function scroll(delta: number): (boolean?, string?)
   local view, err = maki.fn.winsaveview()
   if not view then
     return nil, err
@@ -9587,11 +9822,12 @@ return scroll
 ### `require("maki.shorten_path")`
 
 ```lua
-local function normalize_sep(s)
-  return s:gsub("\\", "/")
+--!strict
+local function normalize_sep(s: string): string
+  return (s:gsub("\\", "/"))
 end
 
-local function shorten_path(path)
+local function shorten_path(path: string): string
   local p = normalize_sep(path)
   local cwd = maki.uv.cwd()
   if cwd then
@@ -9618,22 +9854,24 @@ return shorten_path
 ### `require("maki.test_helpers")`
 
 ```lua
+--!strict
 -- Shared test helpers for Lua plugin specs.
 --
 -- Provides a lightweight test harness: `case` wraps each block in pcall so a
 -- single failure does not abort the rest of the suite. Failures are collected
 -- and surfaced by `report()` at the end.
-function M.case(name, fn)
-function M.eq(actual, expected, msg)
-function M.has(s, substr, msg)
-function M.mktmpdir(prefix)
-function M.rmtree(dir)
+function M.case(name: string, fn: () -> ())
+function M.eq(actual: unknown, expected: unknown, msg: string?)
+function M.has(s: string, substr: string, msg: string?)
+function M.mktmpdir(prefix: string?): string
+function M.rmtree(dir: string)
 function M.report()
 ```
 
 ### `require("maki.text_input")`
 
 ```lua
+--!strict
 -- TextInput: multi-line editable buffer with a byte-offset cursor.
 --
 -- Invariants enforced everywhere:
@@ -9659,43 +9897,44 @@ function M.report()
 -- Parity cases live in plugins/lib/tests/spec.lua (TRACE_CASES). Add one
 -- whenever you change handle_key semantics.
 TextInput.Result = R
-function TextInput.new()
-function TextInput:value()
-function TextInput:is_empty()
-function TextInput:line_count()
-function TextInput:clear()
+function TextInput.new(): TextInput
+function TextInput.value(self: TextInput): string
+function TextInput.is_empty(self: TextInput): boolean
+function TextInput.line_count(self: TextInput): number
+function TextInput.clear(self: TextInput)
 
 -- Returns the codepoint right before the cursor as a string, or nil at the
 -- start of a line. Lets callers peek backwards (e.g. "is the previous char
 -- a backslash?") without touching internal indices.
-function TextInput:char_before_cursor()
-function TextInput:insert_text(text)
-function TextInput:insert_char(c)
-function TextInput:insert_space()
-function TextInput:split_line()
-function TextInput:remove_char()
-function TextInput:delete_char()
-function TextInput:remove_word_before()
-function TextInput:delete_word_after()
-function TextInput:kill_to_end_of_line()
-function TextInput:move_left()
-function TextInput:move_right()
-function TextInput:move_up()
-function TextInput:move_down()
-function TextInput:move_home()
-function TextInput:move_end()
-function TextInput:move_word_left()
-function TextInput:move_word_right()
-function TextInput:handle_key(key)
+function TextInput.char_before_cursor(self: TextInput): string?
+function TextInput.insert_text(self: TextInput, text: string)
+function TextInput.insert_char(self: TextInput, c: string)
+function TextInput.insert_space(self: TextInput)
+function TextInput.split_line(self: TextInput)
+function TextInput.remove_char(self: TextInput)
+function TextInput.delete_char(self: TextInput)
+function TextInput.remove_word_before(self: TextInput)
+function TextInput.delete_word_after(self: TextInput)
+function TextInput.kill_to_end_of_line(self: TextInput)
+function TextInput.move_left(self: TextInput)
+function TextInput.move_right(self: TextInput)
+function TextInput.move_up(self: TextInput)
+function TextInput.move_down(self: TextInput)
+function TextInput.move_home(self: TextInput)
+function TextInput.move_end(self: TextInput)
+function TextInput.move_word_left(self: TextInput)
+function TextInput.move_word_right(self: TextInput)
+function TextInput.handle_key(self: TextInput, key: string): Result
 
 -- Wrap lines to {width} with {prefix} before the first row. Returns
 -- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
-function TextInput:render(prefix, prefix_width, width)
+function TextInput.render(self: TextInput, prefix: string, prefix_width: number?, width: number?)
 ```
 
 ### `require("maki.toast")`
 
 ```lua
+--!strict
 -- Corner toast notifications built on floating windows. `maki.ui.flash` gives
 -- you one line in the status area. A toast stays up long enough to read, can
 -- carry a title, and stacks under the toasts already on screen.
@@ -9703,12 +9942,13 @@ function TextInput:render(prefix, prefix_width, width)
 -- Show {text} as a toast, up to 5 lines of it. {opts}: title (string),
 -- timeout_secs (integer, default 4). Returns right away and the toast
 -- dismisses itself when the time is up.
-function Toast.show(text, opts)
+function Toast.show(text: unknown, opts: Opts?)
 ```
 
 ### `require("maki.tool_view")`
 
 ```lua
+--!strict
 -- The shared truncate/expand body that tool plugins render through.
 --
 -- Click handlers get `ev.row`, a 1-based line in this buf; 0 means the
@@ -9722,7 +9962,7 @@ function Toast.show(text, opts)
 
 -- Right aligned, so the content column stays put when a number gains a digit.
 -- Formats the number alone, callers add their own separator.
-function ToolView.line_nr_fmt(max_line_nr)
+function ToolView.line_nr_fmt(max_line_nr: number): string
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
@@ -9731,42 +9971,43 @@ function ToolView.line_nr_fmt(max_line_nr)
 -- With max_lines 0 only the set_header lines show until a click expands the
 -- view. The UI puts the line count in the tool header, so the row still says
 -- how much is hidden.
-function ToolView.new(buf, opts)
-function ToolView:set_header(lines)
-function ToolView:clear()
-function ToolView:append(line)
-function ToolView:append_text(text)
+function ToolView.new(buf: Buf, opts: Opts?): ToolView
+function ToolView.set_header(self: ToolView, lines: { Line })
+function ToolView.clear(self: ToolView)
+function ToolView.append(self: ToolView, line: Line)
+function ToolView.append_text(self: ToolView, text: string)
 
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
 -- asynchronously. Returns false when {content} is empty.
-function ToolView:set_highlight(content: string, ext)
+function ToolView.set_highlight(self: ToolView, content: string, ext: string?): boolean
 
 -- Content rows on screen, for callers with their own per-row click targets. A
 -- single hidden line is drawn as itself instead of a notice, so it counts as
 -- content too. Rows line up with `all_lines` under keep = "head"; keep = "tail"
 -- prints its notice first and shifts them.
-function ToolView:visible_count()
-function ToolView:toggle()
-function ToolView:flush()
-function ToolView:update_line(all_idx, line)
+function ToolView.visible_count(self: ToolView): number
+function ToolView.toggle(self: ToolView)
+function ToolView.flush(self: ToolView)
+function ToolView.update_line(self: ToolView, all_idx: number, line: Line)
 
 -- Call once after the last append so the collapsed notice renders.
-function ToolView:finish()
-function ToolView.restore_lines(lines, opts)
+function ToolView.finish(self: ToolView)
+function ToolView.restore_lines(lines: { Line }, opts: Opts?): Buf
 
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
-function ToolView.restore(output, opts)
+function ToolView.restore(output: string, opts: Opts?): Buf
 
 -- Same, for tools whose live output goes through markdown (`format =
 -- "markdown"`). {opts.width} is the wrap width and defaults to the body
 -- column of the current terminal. Errors stay plain, as they do live.
-function ToolView.restore_markdown(output, is_error, opts)
+function ToolView.restore_markdown(output: string, is_error: boolean?, opts: Opts): Buf
 ```
 
 ### `require("maki.truncate")`
 
 ```lua
+--!strict
 --- require("maki.truncate")(text, max_lines, max_bytes)
 --- Cuts {text} to the limits and notes how many bytes it dropped. A nil limit
 --- is unlimited.

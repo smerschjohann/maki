@@ -34,8 +34,9 @@ use maki_lua::{
     INERT_WITH_MUTABLE_PATH_ERR, INERT_WITH_SCOPES_ERR, InitFiles, Interaction, KEY_WARNING,
     MAX_INFLIGHT_TOOLS, MCP_HINT, NO_UI_ERR, PERMISSION_NAME_WARNING, PERMISSION_SHAPE_ERR,
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
-    UNDECLARED_REACH, UNPAID_REACH_ERR, WARM_TOOL_CAP, set_allowed_private_hosts,
+    UNDECLARED_REACH, UNPAID_REACH_ERR, UiAction, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
+use maki_providers::Timeouts;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -3223,6 +3224,116 @@ maki.api.register_tool({{
 
 #[cfg(unix)]
 #[test]
+fn a_shared_session_job_is_listed_and_stopped_by_another_plugin() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let other_sid = maki_storage::id::MakiId::generate().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("job.pid");
+    let owner = format!(
+        r#"
+local shared, private
+maki.api.register_tool({{
+    name = "start_session_jobs",
+    description = "starts a shared and a private session job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        shared = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
+            scope = {{ session = "{sid}" }},
+            shared = true,
+        }})
+        private = maki.fn.jobstart("exec sleep 30", {{
+            scope = {{ session = "{sid}" }},
+        }})
+        return shared .. " " .. private
+    end,
+}})
+"#,
+        pid = pid_path.display(),
+        sid = sid,
+    );
+    host.load_source("job_owner", &owner).unwrap();
+    let ids = exec_tool(&reg, "start_session_jobs", json!({})).unwrap();
+    let (shared, _private) = ids.split_once(' ').expect("two job ids");
+
+    let watcher = format!(
+        r#"
+maki.api.register_tool({{
+    name = "try_stop_shared_with_wrong_session",
+    description = "tries to stop a shared job from another session or with none",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        maki.fn.jobstop({shared}, "{other_sid}")
+        maki.fn.jobstop({shared})
+        return "tried"
+    end,
+}})
+maki.api.register_tool({{
+    name = "list_shared_jobs",
+    description = "lists and stops the session's shared jobs",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local listed = {{}}
+        for _, row in ipairs(maki.fn.joblist("{sid}")) do
+            listed[#listed + 1] = tostring(row.id)
+            maki.fn.jobstop(row.id, "{sid}")
+        end
+        return table.concat(listed, ",")
+    end,
+}})
+"#,
+        shared = shared,
+        sid = sid,
+        other_sid = other_sid,
+    );
+    host.load_source("job_watcher", &watcher).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            .unwrap_or_default()
+            .parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shared job did not publish its process id"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let pid = Pid::from_raw(pid).unwrap();
+    assert!(test_kill_process_group(pid).is_ok());
+    exec_tool(&reg, "try_stop_shared_with_wrong_session", json!({})).unwrap();
+    assert!(
+        test_kill_process_group(pid).is_ok(),
+        "a shared job must survive a stop that names no session or the wrong one"
+    );
+
+    let listed = exec_tool(&reg, "list_shared_jobs", json!({})).unwrap();
+    assert_eq!(
+        listed, shared,
+        "only the shared job crosses the plugin boundary"
+    );
+    while test_kill_process_group(pid).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a shared job must stop for the plugin that listed it"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    end_session(&host, session, SessionEndReason::Shutdown);
+}
+
+#[cfg(unix)]
+#[test]
 fn jobattach_re_arms_session_jobs_a_reload_dropped() {
     const EXIT_CODE: i32 = 3;
     const ATTACHED: &str = "attached";
@@ -4290,8 +4401,8 @@ fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str)
     assert!(description.contains(expected), "got: {description}");
 }
 
-/// Kagi answers a keyless request with a bodiless 401, which would leave the
-/// model guessing, so the missing key is named before anything goes out.
+/// Kagi has no keyless tier, so the missing key is named before anything goes
+/// out.
 #[test]
 fn websearch_kagi_without_key_names_the_env_var() {
     unsafe { std::env::remove_var(KAGI_KEY_ENV) };
@@ -7190,24 +7301,26 @@ fn job_callbacks_fire_while_command_handler_parked() {
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
 
-/// read tool requires offset and limit; missing fields should fail schema validation.
-mod read_tool_required_params {
+/// The read tool requires limit. offset defaults to the first line.
+mod read_tool_params {
     use super::*;
 
-    const MISSING_OFFSET_ERR: &str = "invalid parameter 'offset': required";
     const MISSING_LIMIT_ERR: &str = "invalid parameter 'limit': required";
     const MAX_OUTPUT_LINES: i32 = 2000;
 
     #[test]
-    fn missing_offset_fails_parse() {
+    fn missing_offset_reads_from_the_first_line() {
         let (reg, _host) = builtins_host();
-        let entry = reg.get("read").expect("read registered");
-        let err = entry
-            .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }))
-            .err()
-            .expect("missing offset should fail");
-        assert!(err.to_string().contains(MISSING_OFFSET_ERR), "got: {err}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "line 1\nline 2\n").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({ "path": path.to_str().unwrap(), "limit": 2 }),
+        );
+        assert_eq!(out.as_deref(), Ok("1: line 1\n2: line 2"));
     }
 
     #[test]
@@ -7220,6 +7333,11 @@ mod read_tool_required_params {
             .err()
             .expect("missing limit should fail");
         assert!(err.to_string().contains(MISSING_LIMIT_ERR), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("Use limit=0 to read the whole file"),
+            "the hint must say how to read it all: {err}"
+        );
     }
 
     #[test]
@@ -9351,8 +9469,13 @@ maki.api.register_tool({{
 const PAST_BOUND_LINES: usize = 2 * 16 * 1024 * 1024 / PADDED_LINE_BYTES;
 #[cfg(unix)]
 const PADDED_LINE_BYTES: usize = 4096;
+/// Never reached: 32 MiB through a pipe is ~13k thread handoffs, each
+/// waiting for a CPU when CI runs 64 tests on 4 cores, so any real deadline
+/// fails a correct queue under load. A queue that never frees its readers
+/// hangs instead, for nextest's slow-timeout to report. The largest integer
+/// a Luau number holds exactly.
 #[cfg(unix)]
-const PAST_BOUND_WAIT_MS: u64 = 20_000;
+const PAST_BOUND_WAIT_MS: u64 = 1 << 53;
 
 #[cfg(unix)]
 #[test]
@@ -9376,4 +9499,237 @@ fn jobwait_drains_a_job_past_its_queue_bound() {
     let out = exec_tool(&reg, "wait_past_bound", json!({})).unwrap();
     let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
     assert_eq!(out, expected.to_string());
+}
+
+/// Answer the usage roundtrip the way the UI does: from the provider instance
+/// registered for the slug. The host has no event loop, so a plugin calling
+/// `maki.provider.usage` would otherwise wait for a reply nobody sends.
+fn answer_provider_usage(host: &mut PluginHost, slug: &str) {
+    let mut ui = host.take_ui_action_rx().unwrap();
+    let slug = slug.to_owned();
+    std::thread::spawn(move || {
+        let Some(UiAction::ProviderUsage { reply_tx, .. }) = ui.blocking_recv() else {
+            return;
+        };
+        let provider =
+            maki_providers::provider::provider_for_slug(&slug, Timeouts::default()).unwrap();
+        let reply = runtime().block_on(maki_lua::fetch_provider_usage(provider.as_ref(), &slug));
+        let _ = reply_tx.send(reply);
+    });
+}
+
+#[test]
+fn a_plugin_can_read_a_providers_usage() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut perms = PluginPermissions::trusted();
+    perms.set_net_hosts(Some(vec!["api.acme.test".to_owned()].into()));
+    host.load_source_with_permissions(
+        "usage_provider",
+        r#"
+maki.provider.register({
+  slug = "acme-usage",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.test/v1",
+  fetch_usage = function(ctx)
+    return {
+      plan = "lite",
+      limits = { { label = "5-hour", percentage = 42, reset_at = 1800000000000 } },
+    }
+  end,
+})
+maki.api.register_tool({
+  name = "read_usage",
+  description = "reads provider usage",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function()
+    local usage, err = maki.provider.usage("acme-usage")
+    if not usage then return { llm_output = "err: " .. tostring(err), is_error = true } end
+    return { llm_output = usage.plan .. " " .. usage.limits[1].label .. " " .. tostring(usage.limits[1].percentage) }
+  end,
+})
+"#,
+        perms,
+    )
+    .unwrap();
+
+    maki_providers::plugin::commit_load();
+    assert!(
+        maki_providers::plugin::is_registered("acme-usage"),
+        "provider not registered"
+    );
+    answer_provider_usage(&mut host, "acme-usage");
+    let out = exec_tool(&reg, "read_usage", json!({})).unwrap();
+    assert_eq!(out, "lite 5-hour 42");
+}
+
+/// A provider with no usage hook must answer from its own declaration, not
+/// resolve an unknown slug through the network catalog. The registered plugin
+/// provider keeps this test local and covers the "does not report usage" branch.
+#[test]
+fn a_provider_without_a_usage_hook_reports_that_it_has_none() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut perms = PluginPermissions::trusted();
+    perms.set_net_hosts(Some(vec!["api.acme.test".to_owned()].into()));
+    host.load_source_with_permissions(
+        "no_usage_provider",
+        r#"
+maki.provider.register({
+  slug = "acme-no-usage",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.test/v1",
+})
+maki.api.register_tool({
+  name = "read_missing_usage",
+  description = "reads usage from a provider with no usage hook",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function()
+    local usage, err = maki.provider.usage("acme-no-usage")
+    if usage then return { llm_output = "unexpected usage" } end
+    return { llm_output = err }
+  end,
+})
+"#,
+        perms,
+    )
+    .unwrap();
+
+    maki_providers::plugin::commit_load();
+    answer_provider_usage(&mut host, "acme-no-usage");
+    assert_eq!(
+        exec_tool(&reg, "read_missing_usage", json!({})).unwrap(),
+        "acme-no-usage does not report usage"
+    );
+}
+
+/// Without a UI the call builds the provider from the slug and uses the same
+/// fetch helper as the UI path, so the two modes cannot drift apart.
+#[test]
+fn headless_usage_answers_for_any_slug() {
+    let reg = fresh_registry();
+    let host = PluginHost::start(Arc::clone(&reg), Interaction::None, true).unwrap();
+    let mut perms = PluginPermissions::trusted();
+    perms.set_net_hosts(Some(vec!["api.acme.test".to_owned()].into()));
+    host.load_source_with_permissions(
+        "headless_usage_provider",
+        r#"
+maki.provider.register({
+  slug = "acme-headless",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.test/v1",
+  fetch_usage = function(ctx)
+    return { plan = "lite", limits = { { label = "5-hour", percentage = 42 } } }
+  end,
+})
+maki.api.register_tool({
+  name = "read_headless_usage",
+  description = "reads usage with no UI",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function()
+    local usage, err = maki.provider.usage("acme-headless")
+    if not usage then return { llm_output = "err: " .. tostring(err) } end
+    return { llm_output = usage.plan .. " " .. usage.limits[1].label .. " " .. tostring(usage.limits[1].percentage) }
+  end,
+})
+"#,
+        perms,
+    )
+    .unwrap();
+
+    maki_providers::plugin::commit_load();
+    assert_eq!(
+        exec_tool(&reg, "read_headless_usage", json!({})).unwrap(),
+        "lite 5-hour 42"
+    );
+}
+
+const FILE_TOOL_NOTE_HEAD: &str = "[Use dedicated tools for files, not bash: ";
+const FILE_TOOL_NOTE_OPTION: &str = "file_tool_note";
+
+fn bash_reply(command: &str, config: impl FnOnce(&mut maki_config::AgentConfig)) -> String {
+    let mut bash = maki_config::PluginFileConfig::default();
+    bash.opts
+        .insert(FILE_TOOL_NOTE_OPTION.into(), Value::Bool(true));
+    let (reg, _host) = builtins_host_with(&PluginsConfig::from_plugins(HashMap::from([(
+        "bash".to_owned(),
+        bash,
+    )])));
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.rtk = false;
+    config(&mut ctx.config);
+    ctx.tool_filter = Arc::new(ToolFilter::from_config(&ctx.config, &ctx.model, &[]));
+    ctx.registry = Arc::clone(&reg);
+    exec_with_ctx(&reg, "bash", json!({ "command": command }), &ctx).unwrap_or_else(|error| error)
+}
+
+fn file_tool_note(reply: &str) -> Option<&str> {
+    reply
+        .strip_prefix(FILE_TOOL_NOTE_HEAD)
+        .and_then(|rest| rest.split_once(".]"))
+        .map(|(items, _)| items)
+}
+
+#[test_case::test_case("cat /dev/null", Some("the read tool instead of cat") ; "cat_file")]
+#[test_case::test_case("head -n 1 /dev/null && ls /dev", Some("the read tool instead of head, the list tool instead of ls") ; "chained_commands")]
+#[test_case::test_case("head -20 /dev/null", Some("the read tool instead of head") ; "line_count_as_a_flag")]
+#[test_case::test_case("sed -n 1p /dev/null; sed -n 2p /dev/null", Some("the read tool instead of sed") ; "same_command_named_once")]
+#[test_case::test_case("sed -n '2,4p' /dev/null", Some("the read tool instead of sed") ; "sed_line_range")]
+#[test_case::test_case("sed -n '/a/,/b/p' /dev/null", None ; "sed_pattern_range")]
+#[test_case::test_case("cat /dev/null | wc -l", None ; "pipe_source")]
+#[test_case::test_case("grep -rn a /dev/null 2>&1", Some("the grep tool instead of grep") ; "stderr_merged_into_stdout")]
+#[test_case::test_case("cat /dev/null/missing 2>/dev/null", Some("the read tool instead of cat") ; "stderr_discarded")]
+#[test_case::test_case("find /dev/null -type f -name x", Some("the glob tool instead of find") ; "find_files_by_name")]
+#[test_case::test_case("find /dev/null -name x -delete", None ; "find_with_an_action")]
+#[test_case::test_case("find /dev/null -type d", None ; "find_directories")]
+#[test_case::test_case("grep -c a /dev/null", Some("the grep tool instead of grep") ; "counting_grep")]
+#[test_case::test_case("grep -rl a /dev/null", Some("the grep tool instead of grep") ; "grep_listing_the_matching_files")]
+#[test_case::test_case("grep -rvn a /dev/null", None ; "inverted_grep_among_short_flags")]
+#[test_case::test_case("ls -l /dev/null", None ; "long_listing")]
+#[test_case::test_case("tail -n 1 /dev/null", Some("the read tool instead of tail") ; "lines_from_the_end")]
+#[test_case::test_case("tail -f /dev/null/missing", None ; "following_a_file")]
+#[test_case::test_case("sed s/a/b/ /dev/null", None ; "sed_substitution")]
+#[test_case::test_case("sed -i.bak s/a/b/ /dev/null/missing", None ; "sed_in_place")]
+#[test_case::test_case("cat /dev/null >> /dev/stdout", None ; "output_written_to_a_file")]
+#[test_case::test_case("printf 'a\\nb\\n' | tail -n 1", None ; "filtering_piped_output")]
+#[test_case::test_case("cat <<EOF\nhi\nEOF", None ; "here_document")]
+#[test_case::test_case("grep -c a <<< a", None ; "here_string")]
+#[test_case::test_case("echo \"$(cat /dev/null)\"", None ; "command_substitution")]
+#[test_case::test_case("for f in /dev/null; do cat \"$f\"; done", None ; "loop_body")]
+#[test_case::test_case("git grep -c zzz-no-match -- /dev/null", None ; "subcommand_named_grep")]
+fn bash_names_the_file_tool_a_command_stands_in_for(command: &str, expected: Option<&str>) {
+    let reply = bash_reply(command, |_| {});
+    assert_eq!(file_tool_note(&reply), expected, "got: {reply}");
+}
+
+#[test]
+fn bash_adds_no_file_tool_note_unless_the_option_is_on() {
+    let (reg, _host) = builtins_host();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.rtk = false;
+    ctx.tool_filter = Arc::new(ToolFilter::from_config(&ctx.config, &ctx.model, &[]));
+    ctx.registry = Arc::clone(&reg);
+    let reply = exec_with_ctx(&reg, "bash", json!({ "command": "cat /dev/null" }), &ctx)
+        .unwrap_or_else(|error| error);
+    assert_eq!(file_tool_note(&reply), None, "got: {reply}");
+}
+
+#[test_case::test_case(&["read"], &[], Some("the grep tool instead of grep") ; "one_disabled")]
+#[test_case::test_case(&["read", "grep"], &[], None ; "both_disabled")]
+#[test_case::test_case(&[], &["bash", "read"], Some("the read tool instead of cat") ; "one_allowed")]
+#[test_case::test_case(&[], &["bash"], None ; "none_allowed")]
+fn bash_note_names_only_tools_the_model_can_call(
+    disabled: &[&str],
+    allowed: &[&str],
+    expected: Option<&str>,
+) {
+    let owned = |names: &[&str]| names.iter().map(|&name| name.to_owned()).collect();
+    let reply = bash_reply("cat /dev/null; grep -n a /dev/null", |config| {
+        config.disabled_tools = owned(disabled);
+        config.allowed_tools = owned(allowed);
+    });
+    assert_eq!(file_tool_note(&reply), expected, "got: {reply}");
 }

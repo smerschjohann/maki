@@ -371,6 +371,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     name,
                     input,
                     thought_signature,
+                    ..
                 } => {
                     let mut part = json!({
                         "functionCall": {
@@ -646,6 +647,7 @@ async fn parse_sse(
                         name: func_call.name,
                         input,
                         thought_signature,
+                        input_error: None,
                     });
                     stop_reason = Some(StopReason::ToolUse);
                 } else if let Some(text) = part.text {
@@ -671,7 +673,7 @@ async fn parse_sse(
 mod tests {
     use super::*;
     use crate::error::ErrorProjection;
-    use crate::model::{ModelPricing, ModelTier};
+    use crate::model::{FactSources, ModelPricing, ModelTier};
     use crate::test_support::sse_body;
     use std::sync::Arc;
     use test_case::test_case;
@@ -714,6 +716,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 1_048_576,
             thinking_fields: None,
         }
@@ -978,6 +981,7 @@ mod tests {
                 name: "read_file".into(),
                 input: json!({"path": "/tmp/a"}),
                 thought_signature: Some(SIG.into()),
+                input_error: None,
             }],
             ..Default::default()
         }];

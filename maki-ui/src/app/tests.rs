@@ -17,7 +17,8 @@ use crate::components::plan_form::builtin_menu;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{
-    BackgroundOutcome, ExitRequest, NoticeDetail, buffer_text, key, test_model,
+    BackgroundOutcome, DisplayRole, ExitRequest, NoticeDetail, ToolStatus, buffer_text, key,
+    test_model,
 };
 use crate::decor_worker;
 use crate::highlight::TAB_SPACES;
@@ -48,11 +49,11 @@ use maki_lua::test_support::{
     probed_event_handle, runtime, set_mode,
 };
 use maki_lua::{
-    Border, BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest,
-    InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader,
-    Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
-    PlanActionOutcome, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, UiAction,
-    WinCommand, WinEvent,
+    Border, BuiltinAction, ChatItem, ChatItemStatus, Dimension, FloatConfig, HintEntry, HintReader,
+    InputRequest, InputRulesReader, InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo,
+    LuaCommandReader, Missing, PASTE, PackCommand, PackPlan, PackPreparation, PackReport,
+    Permission, PlanActionOutcome, PluginHost, PluginPermissions, SegmentEntry, SessionEndReason,
+    Split, TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_providers::provider::ProviderStatus;
 use maki_providers::{
@@ -3345,7 +3346,7 @@ fn tick_drains_live_bufs_of_background_chats() {
 #[test]
 fn status_hints_published_by_a_plugin_reach_the_screen() {
     let (mut app, plugin) = app_with_hints();
-    plugin.publish(vec![hint_for(None)]);
+    plugin.publish(vec![hint_for(None)], Vec::new());
 
     assert!(
         !rendered(&mut app).contains(HINT_TEXT),
@@ -3354,7 +3355,7 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(rendered(&mut app).contains(HINT_TEXT));
 
-    plugin.publish(vec![]);
+    plugin.publish(Vec::new(), Vec::new());
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
@@ -3376,11 +3377,39 @@ fn session_hint_shows_only_in_its_tab(own: bool) {
     } else {
         MakiId::generate()
     };
-    plugin.publish(vec![hint_for(Some(owner))]);
+    plugin.publish(vec![hint_for(Some(owner))], Vec::new());
 
     let _ = app.tick();
 
     assert_eq!(rendered(&mut app).contains(HINT_TEXT), own);
+}
+
+const SEGMENT_TEXT: &str = "2 running";
+
+fn segment_for(session: Option<MakiId>) -> SegmentEntry {
+    SegmentEntry {
+        plugin: Arc::from(HINT_PLUGIN),
+        id: "jobs".into(),
+        session,
+        text: SEGMENT_TEXT.into(),
+        style: "status_dim".into(),
+    }
+}
+
+#[test_case(true ; "own_session")]
+#[test_case(false ; "other_session")]
+fn session_segment_shows_only_in_its_tab(own: bool) {
+    let (mut app, plugin) = app_with_hints();
+    let owner = if own {
+        app.state.session.id
+    } else {
+        MakiId::generate()
+    };
+    plugin.publish(Vec::new(), vec![segment_for(Some(owner))]);
+
+    let _ = app.tick();
+
+    assert_eq!(rendered(&mut app).contains(SEGMENT_TEXT), own);
 }
 
 const RENDERED_WIDTH: u16 = 80;
@@ -6333,6 +6362,110 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
     assert!(!app.shell.active_ids().contains(&id));
 }
 
+const PLUGIN_ITEM_ID: &str = "monitor:1";
+const PLUGIN_ITEM_LABEL: &str = "monitor";
+const PLUGIN_ITEM_TITLE: &str = "watch tests";
+const AGENT_TOOL_ID: &str = "agent-tool";
+
+fn running_plugin_item() -> ChatItem {
+    ChatItem {
+        id: PLUGIN_ITEM_ID.into(),
+        label: PLUGIN_ITEM_LABEL.into(),
+        title: PLUGIN_ITEM_TITLE.into(),
+        status: ChatItemStatus::Running,
+        detail: None,
+    }
+}
+
+fn tool_message<'a>(
+    chat: &'a crate::chat::Chat,
+    id: &str,
+) -> Option<&'a crate::components::DisplayMessage> {
+    (0..chat.message_count()).find_map(|index| {
+        let msg = chat.message_at(index)?;
+        match &msg.role {
+            DisplayRole::Tool(tool) if tool.id == id => Some(msg),
+            _ => None,
+        }
+    })
+}
+
+fn plugin_item(chat: &crate::chat::Chat) -> Option<&crate::components::DisplayMessage> {
+    (0..chat.message_count()).find_map(|index| {
+        let msg = chat.message_at(index)?;
+        match &msg.role {
+            DisplayRole::PluginItem(_) => Some(msg),
+            _ => None,
+        }
+    })
+}
+
+fn start_running_item_and_agent_tool(app: &mut App) {
+    app.handle_chat_item(&running_plugin_item());
+    app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: AGENT_TOOL_ID.into(),
+        tool: "read".into(),
+        summary: "reading".into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))));
+}
+
+#[test]
+fn a_running_chat_item_survives_the_turn_that_started_it() {
+    let mut app = streaming_app_with_history();
+    start_running_item_and_agent_tool(&mut app);
+
+    app.update(done_event());
+
+    let item = plugin_item(&app.chats[0]).expect("the item stays");
+    let DisplayRole::PluginItem(role) = &item.role else {
+        panic!("a chat item is its own row");
+    };
+    assert_eq!(role.status, ChatItemStatus::Running);
+    assert_eq!(item.text, PLUGIN_ITEM_TITLE);
+    let agent = tool_message(&app.chats[0], AGENT_TOOL_ID).expect("the agent tool stays");
+    assert!(
+        agent.text.contains(MISSING_TOOL_COMPLETION),
+        "the agent's own tool is still settled"
+    );
+}
+
+#[test]
+fn a_running_chat_item_survives_esc() {
+    let mut app = streaming_app_with_history();
+    start_running_item_and_agent_tool(&mut app);
+
+    cancel_app(&mut app);
+
+    let item = plugin_item(&app.chats[0]).expect("the item stays");
+    let DisplayRole::PluginItem(role) = &item.role else {
+        panic!("a chat item is its own row");
+    };
+    assert_eq!(role.status, ChatItemStatus::Running);
+    assert_eq!(item.text, PLUGIN_ITEM_TITLE);
+    let agent = tool_message(&app.chats[0], AGENT_TOOL_ID).expect("the agent tool stays");
+    let DisplayRole::Tool(role) = &agent.role else {
+        panic!("the agent tool stays a tool row");
+    };
+    assert_eq!(role.status, ToolStatus::Error);
+}
+
+/// A plugin item is not a tool call, so it draws its own row: its label, its
+/// title, and a marker of its own.
+#[test]
+fn a_chat_item_draws_its_own_row() {
+    let mut app = streaming_app_with_history();
+    app.handle_chat_item(&running_plugin_item());
+
+    let text = rendered(&mut app);
+    assert!(text.contains(PLUGIN_ITEM_TITLE), "{text}");
+    assert!(text.contains(PLUGIN_ITEM_LABEL), "{text}");
+}
+
 #[test]
 fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
     let mut app = streaming_app_with_history();
@@ -7673,6 +7806,151 @@ fn open_permission_prompt(app: &mut App) {
         ProjectAnswers::Saved,
         None,
     );
+}
+
+#[test_case(true ; "focused")]
+#[test_case(false ; "unfocused")]
+fn permission_waits_for_a_focused_window(focused: bool) {
+    let mut app = test_app();
+    let (mut events, _cmd_tx) =
+        open_window(&mut app, &Arc::new(SharedBuf::new()), focused, WINDOW_Z);
+    open_permission_prompt(&mut app);
+
+    if focused {
+        assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(took_a_key(&mut events));
+        assert!(app.permission_prompt.is_open());
+        app.float_mgr.close_all();
+    }
+
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(!app.permission_prompt.is_open());
+}
+
+/// A float whose plugin stopped reading keys must not leave the tool call
+/// hanging: `<C-c>` still denies the prompt under it, while other keys and
+/// `<C-c>` with no prompt open still go to the float.
+#[test]
+fn ctrl_c_denies_the_permission_prompt_under_a_focused_float() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(took_a_key(&mut events));
+
+    open_permission_prompt(&mut app);
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(took_a_key(&mut events));
+    assert!(app.permission_prompt.is_open());
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(!took_a_key(&mut events));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
+}
+
+#[test]
+fn permission_answers_before_the_plan_form_once_the_float_closes() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    open_plan_form(&mut app);
+    let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    open_permission_prompt(&mut app);
+
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(took_a_key(&mut events));
+    assert!(actions.is_empty());
+    assert!(app.plan_form.is_visible());
+    assert!(app.permission_prompt.is_open());
+
+    app.float_mgr.close_all();
+
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    let actions = app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
+    assert!(actions.is_empty());
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.state.mode, Mode::Plan);
+}
+
+/// A focused side split sits beside the prompt rather than over it, and a
+/// `below` split, like the question form, is taken out of the layout while the
+/// prompt is up (see `permission_prompt_takes_bottom_precedence_over_below_split`),
+/// so either way the prompt still answers `y`.
+#[test]
+fn a_focused_split_does_not_take_keys_from_the_permission_prompt() {
+    for split in [Split::Below, Split::Left] {
+        let mut app = test_app();
+        let mut answer_rx = answer_channel(&mut app);
+        open_split_window(&mut app, split);
+        open_permission_prompt(&mut app);
+
+        assert!(app.holds_keyboard(KeyboardOwner::FocusedSplit), "{split:?}");
+        assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission, "{split:?}");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(!app.permission_prompt.is_open(), "{split:?}");
+        assert!(answer_rx.try_recv().is_ok(), "{split:?}");
+        assert_eq!(
+            app.keyboard_owner(),
+            KeyboardOwner::FocusedSplit,
+            "{split:?}"
+        );
+    }
+}
+
+/// `win:hide()` keeps the focus, but a float nobody can see must not eat the
+/// `y` meant for the prompt that is the only thing on screen.
+#[test]
+fn a_hidden_focused_float_gives_the_keys_back_to_the_permission_prompt() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    let (mut events, cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    open_permission_prompt(&mut app);
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
+
+    cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
+    let _ = app.float_mgr.drain_commands();
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    let _ = draw_to_buffer(&mut app);
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+
+    press(&mut app, KeyCode::Char('y'));
+    assert!(!took_a_key(&mut events));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
+}
+
+/// A visible float sized to nothing paints nothing, so once a frame has gone
+/// by it is not on screen and the prompt keeps the keys.
+#[test]
+fn a_focused_float_sized_to_nothing_leaves_the_keys_to_the_permission_prompt() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    let (event_tx, mut events) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
+    let config = FloatConfig {
+        width: Dimension::Abs(0),
+        height: Dimension::Abs(0),
+        zindex: WINDOW_Z,
+        ..FloatConfig::default()
+    };
+    app.float_mgr
+        .open(Arc::new(SharedBuf::new()), config, true, event_tx, cmd_rx);
+    let _ = draw_to_buffer(&mut app);
+    open_permission_prompt(&mut app);
+
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(!took_a_key(&mut events));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
 }
 
 fn open_alert(app: &mut App) {
@@ -13377,7 +13655,8 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
         KeyboardOwner::Help => open_help(app),
         KeyboardOwner::Usage => open_usage(app),
         KeyboardOwner::Btw => open_btw(app),
-        KeyboardOwner::FocusedWindow => open_cursor_float(app),
+        KeyboardOwner::FocusedFloat => open_cursor_float(app),
+        KeyboardOwner::FocusedSplit => open_split_window(app, Split::Below),
         KeyboardOwner::Search => open_search(app),
         KeyboardOwner::FilePicker => open_file_picker(app),
         KeyboardOwner::Queue => focus_queue(app),
@@ -13391,13 +13670,14 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
 }
 
 #[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::FocusedFloat ; "focused_float")]
 #[test_case(KeyboardOwner::Permission ; "permission")]
 #[test_case(KeyboardOwner::PackReview ; "pack_review")]
 #[test_case(KeyboardOwner::PlanForm ; "plan_form")]
 #[test_case(KeyboardOwner::Help ; "help")]
 #[test_case(KeyboardOwner::Usage ; "usage")]
 #[test_case(KeyboardOwner::Btw ; "btw")]
-#[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
+#[test_case(KeyboardOwner::FocusedSplit ; "focused_split")]
 #[test_case(KeyboardOwner::Search ; "search")]
 #[test_case(KeyboardOwner::FilePicker ; "file_picker")]
 #[test_case(KeyboardOwner::Queue ; "queue")]
@@ -13431,14 +13711,15 @@ fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
     assert!(!app.any_overlay_open(), "{OWNER_NOT_CLOSED}: {owner:?}");
 }
 
-#[test_case(KeyboardOwner::Alert, KeyboardOwner::Permission ; "alert_over_permission")]
+#[test_case(KeyboardOwner::Alert, KeyboardOwner::FocusedFloat ; "alert_over_focused_float")]
+#[test_case(KeyboardOwner::FocusedFloat, KeyboardOwner::Permission ; "focused_float_over_permission")]
 #[test_case(KeyboardOwner::Permission, KeyboardOwner::PackReview ; "permission_over_pack_review")]
 #[test_case(KeyboardOwner::PackReview, KeyboardOwner::PlanForm ; "pack_review_over_plan_form")]
 #[test_case(KeyboardOwner::PlanForm, KeyboardOwner::Help ; "plan_form_over_help")]
 #[test_case(KeyboardOwner::Help, KeyboardOwner::Usage ; "help_over_usage")]
 #[test_case(KeyboardOwner::Usage, KeyboardOwner::Btw ; "usage_over_btw")]
-#[test_case(KeyboardOwner::Btw, KeyboardOwner::FocusedWindow ; "btw_over_focused_window")]
-#[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Search ; "focused_window_over_search")]
+#[test_case(KeyboardOwner::Btw, KeyboardOwner::FocusedSplit ; "btw_over_focused_split")]
+#[test_case(KeyboardOwner::FocusedSplit, KeyboardOwner::Search ; "focused_split_over_search")]
 #[test_case(KeyboardOwner::Search, KeyboardOwner::FilePicker ; "search_over_file_picker")]
 #[test_case(KeyboardOwner::FilePicker, KeyboardOwner::Queue ; "file_picker_over_queue")]
 #[test_case(KeyboardOwner::Queue, KeyboardOwner::RewindPicker ; "queue_over_rewind_picker")]
@@ -13487,12 +13768,13 @@ const OWNER_LEAKED_A_KEY: &str = "a key the holder of the keyboard answers must 
 /// lets the help open. Left out is the help itself, which closes on `<C-h>`,
 /// so a leak would look the same.
 #[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::FocusedFloat ; "focused_float")]
 #[test_case(KeyboardOwner::Permission ; "permission")]
 #[test_case(KeyboardOwner::PackReview ; "pack_review")]
 #[test_case(KeyboardOwner::PlanForm ; "plan_form")]
 #[test_case(KeyboardOwner::Usage ; "usage")]
 #[test_case(KeyboardOwner::Btw ; "btw")]
-#[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
+#[test_case(KeyboardOwner::FocusedSplit ; "focused_split")]
 #[test_case(KeyboardOwner::Search ; "search")]
 #[test_case(KeyboardOwner::FilePicker ; "file_picker")]
 #[test_case(KeyboardOwner::Queue ; "queue")]

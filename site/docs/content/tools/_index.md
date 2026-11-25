@@ -47,7 +47,7 @@ Read a file. Returns contents with line numbers (1-indexed).
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
-| `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. Negative counts from the end: -20 starts at the 20th line from the end. |
+| `offset` | integer | no | Line number to start from (1-indexed, default 1). Negative counts from the end: -20 starts at the 20th line from the end. |
 | `path` | string | yes | Absolute path to the file |
 
 ### `write` {#write}
@@ -89,13 +89,14 @@ Prefer this over edit when making multiple changes to the same file.
 
 ### `edit_lines` {#edit_lines}
 
-Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
+Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. `expect` is the current text of line `start`: line numbers from before your last edit of the file are stale, and a mismatch refuses the edit. Do not use with the batch tool.
 
 **Permission:** `fs_write`
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `end` | integer | yes | Last line, inclusive |
+| `expect` | string | yes | Current text of line `start`, indentation optional |
 | `new_string` | string | yes | Replacement text |
 | `path` | string | yes | Absolute path to the file |
 | `start` | integer | yes | First line (1-indexed) |
@@ -133,6 +134,7 @@ Search file contents using regex.
 |-----------|------|----------|---------|-------------|
 | `context_after` | integer | no |  | Context lines after match |
 | `context_before` | integer | no |  | Context lines before match |
+| `count` | boolean | no |  | Return how many lines match in each file instead of the lines |
 | `include` | string | no |  | File glob filter (e.g. *.c) |
 | `limit` | integer | no |  | Max match groups to return |
 | `path` | string | no | cwd | Directory to search in |

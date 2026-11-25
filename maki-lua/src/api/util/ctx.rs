@@ -185,7 +185,7 @@ enum Caps {
     /// `start` runs before permission checks: it reads config and publishes
     /// previews, but dispatching tools is structurally impossible.
     Start {
-        config: AgentConfig,
+        config: Box<AgentConfig>,
         workflow: bool,
         audience: ToolAudience,
         output_mode: ToolOutputMode,
@@ -232,7 +232,7 @@ impl LuaCtx {
         Self::new(
             ctx,
             Caps::Start {
-                config: ctx.config.clone(),
+                config: Box::new(ctx.config.clone()),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
                 output_mode: ctx.output_mode,
@@ -531,11 +531,20 @@ impl UserData for LuaCtx {
             };
             let tool: String = part.get("tool")?;
             let name: Option<String> = part.opt("name")?;
+            let task: Option<String> = part.opt("task")?;
             let output: String = part.opt("output")?.unwrap_or_default();
             let failed = part.opt_bool("is_error").unwrap_or(false);
             let markdown = extract_format(&part) == LuaOutputFormat::Markdown;
             let label = TaskLabel::new(&tool, name.as_deref());
-            if !BackgroundTasks::of(lua).report_part(&home.id, &label, failed, &output, markdown) {
+            let reported = BackgroundTasks::of(lua).report_part(
+                &home.id,
+                task.as_deref(),
+                &label,
+                failed,
+                &output,
+                markdown,
+            );
+            if !reported {
                 return Ok(err_pair(NO_PART_NOW_MSG));
             }
             Ok((Some(true), None))
@@ -574,13 +583,17 @@ impl UserData for LuaCtx {
         // The matching check before a write is not exposed: the dispatcher
         // runs it under the file lock for every tool declaring `mutable_path`,
         // and a handler-side copy would race its own sibling.
-        methods.add_method("record_read", |_, this, path: String| {
+        //
+        // Off the VM thread, because recording hashes the file and grep
+        // records every file it matched.
+        methods.add_async_method("record_read", |_, this, path: String| async move {
             let Some(agent) = this.agent() else {
                 return Ok(this.cap_err_pair("record_read"));
             };
-            agent
-                .file_access
-                .record_read(&FileKey::new(Path::new(&path)));
+            let file_access = Arc::clone(&agent.file_access);
+            spawn_blocking(move || file_access.record_read(&FileKey::new(Path::new(&path))))
+                .await
+                .map_err(mlua::Error::external)?;
             Ok((Some(true), None))
         });
 

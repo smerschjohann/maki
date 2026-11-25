@@ -59,7 +59,7 @@ declare maki: {
   },
   fn: {
     jobstart: @checked (cmd: any, opts: any) -> (number?, string?),
-    jobstop: @checked (job_id: number) -> (),
+    jobstop: @checked (job_id: number, session: string?) -> (),
     jobforget: @checked (job_id: number) -> (),
     jobwait: @checked (job_id: number, timeout_ms: number?) -> (any, string?),
     jobinfo: @checked (job_id: number) -> (any, string?),
@@ -93,7 +93,8 @@ declare maki: {
     rm: @checked (path: string, opts: any) -> (true?, string?),
     mkdir: @checked (path: string, opts: any) -> (true?, string?),
     glob: @checked (pattern: any, opts: any) -> (any, string?),
-    grep: @checked (pattern: string, opts: any) -> (any, string?),
+    grep: @checked (pattern: string, opts: any) -> (any, string?, any),
+    grep_count: @checked (pattern: string, opts: any) -> (any, string?),
     fuzzy_files: @checked (opts: any) -> (any, string?),
   },
   image: {
@@ -142,6 +143,7 @@ declare maki: {
   provider: {
     register: @checked (spec: any) -> (),
     is_selected: @checked (slug: string) -> (boolean),
+    usage: @checked (slug: string) -> (any, string?),
     http_error: @checked (res: any) -> (any),
     auth: {
       get: @checked (slug: string) -> (any, string?),
@@ -177,7 +179,8 @@ declare maki: {
     messages: @checked (ctx: any, id: string, opts: any) -> (any, string?),
   },
   text: {
-    html_to_markdown: @checked (html: string) -> (string?, string?),
+    html_to_markdown: @checked (html: string, opts: any) -> (string?, string?),
+    html_to_text: @checked (html: string, opts: any) -> (string?, string?),
     to_utf8: @checked (s: string) -> (string),
     fuzzy: @checked (needle: string, haystack: string, opts: any) -> (number?, any),
     fuzzy_list: @checked (needle: string, haystacks: any, opts: any) -> (any),
@@ -227,6 +230,8 @@ declare maki: {
     input_decorate: @checked (opts: any) -> (any, string?),
     input_edit: @checked (opts: any) -> (any, string?),
     input_submit: @checked (opts: any) -> (boolean?, string?),
+    chat_item: @checked (opts: any) -> (),
+    status_segment: @checked (opts: any) -> (),
   },
   uv: {
     cwd: @checked () -> (string?),

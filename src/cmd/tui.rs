@@ -104,6 +104,7 @@ fn load_config(
     // A turn cap would cut an interactive session short, so
     // `Cli::check_run_path_flags` already refused it outside `-p` and SDK mode.
     config.agent.max_turns = cli.max_turns;
+    config.agent.max_budget_usd = cli.max_budget_usd;
     config.validate()?;
     Ok(config)
 }
@@ -398,7 +399,6 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
             cli,
             resumed,
             claim,
-            storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
@@ -440,7 +440,6 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
             host_prompt,
             resumed,
             claim,
-            storage: storage.clone(),
             background_wait,
         })
         .await

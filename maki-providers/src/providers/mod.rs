@@ -76,6 +76,26 @@ pub fn user_agent() -> &'static str {
     )
 }
 
+/// Decode a tool call's JSON arguments. Empty arguments are valid, since a
+/// tool without parameters sends none. `Err` carries why the arguments are
+/// not JSON, which dispatch reports instead of validating an empty object.
+pub(crate) fn parse_tool_input(tool: &str, arguments: &str) -> Result<Value, String> {
+    let arguments = arguments.trim();
+    if arguments.is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+    match serde_json::from_str(arguments) {
+        Ok(input) => {
+            debug!(tool = %tool, json = %arguments, "tool input JSON");
+            Ok(input)
+        }
+        Err(e) => {
+            warn!(error = %e, tool = %tool, json = %arguments, "malformed tool JSON");
+            Err(e.to_string())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     pub connect: Duration,
@@ -464,18 +484,33 @@ impl Timeouts {
 /// which reqwest only adds to a request that names none, so a user agent anyone
 /// else sets replaces maki's instead of going out beside it.
 pub fn client_builder() -> ClientBuilder {
-    Client::builder()
-        .redirect(Policy::none())
-        .http1_only()
-        .user_agent(user_agent())
-        .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
+    with_system_trust(
+        Client::builder()
+            .redirect(Policy::none())
+            .http1_only()
+            .user_agent(user_agent())
+            .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str()))),
+    )
 }
 
 /// Trust comes from the platform verifier, which on Linux reads
-/// `SSL_CERT_FILE` the way curl did. A store it cannot load (a stale
-/// `SSL_CERT_FILE`, a container without CA roots) must not take maki down at
-/// startup, so the client is built without roots instead and every TLS connect
-/// fails with the reason, as under curl.
+/// `SSL_CERT_FILE` the way curl did. There `crate::tls` also accepts a
+/// self-signed CA certificate from the store as the server's own, as curl did.
+/// A store it cannot load leaves the builder as it is, so the build fails the
+/// same way and says why. Root certificates set on the builder afterwards are
+/// ignored, so a client with its own CA bundle (MCP's `ca_file`) skips this.
+pub fn with_system_trust(builder: ClientBuilder) -> ClientBuilder {
+    #[cfg(webpki_store)]
+    if let Some(config) = crate::tls::store_config() {
+        return builder.tls_backend_preconfigured(config);
+    }
+    builder
+}
+
+/// A store that cannot be loaded (a stale `SSL_CERT_FILE`, a container
+/// without CA roots) must not take maki down at startup, so the client is
+/// built without roots instead and every TLS connect fails with the reason,
+/// as under curl.
 pub(crate) fn http_client(timeouts: Timeouts) -> Client {
     timeouts
         .bound(client_builder())
@@ -813,6 +848,19 @@ mod tests {
         body: "",
         path: None,
     }];
+
+    #[test]
+    fn parse_tool_input_treats_empty_arguments_as_no_arguments() {
+        let empty = Value::Object(Default::default());
+        assert_eq!(parse_tool_input("batch", "").unwrap(), empty);
+        assert_eq!(parse_tool_input("batch", "  ").unwrap(), empty);
+    }
+
+    #[test]
+    fn parse_tool_input_returns_the_json_error() {
+        let err = parse_tool_input("bash", "{broken").unwrap_err();
+        assert!(err.contains("line 1"), "err: {err}");
+    }
 
     fn state_with_tokens(access: &str) -> TempDir {
         let dir = TempDir::new().expect("temp dir");

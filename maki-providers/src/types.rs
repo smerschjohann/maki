@@ -477,6 +477,11 @@ pub enum ContentBlock {
         input: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
+        /// Set when the provider could not decode the call's JSON arguments.
+        /// Dispatch reads it before the call reaches history, and providers
+        /// reject it as an unknown wire field, so it never leaves memory.
+        #[serde(skip)]
+        input_error: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
@@ -605,6 +610,19 @@ impl ContentBlock {
             name: name.into(),
             input,
             thought_signature: None,
+            input_error: None,
+        }
+    }
+
+    /// A call whose JSON arguments the provider could not decode. `error` is
+    /// what the dispatcher reports in the tool result.
+    pub fn invalid_tool_use(id: impl Into<String>, name: impl Into<String>, error: String) -> Self {
+        Self::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: Value::Object(Default::default()),
+            thought_signature: None,
+            input_error: Some(error),
         }
     }
 
@@ -975,10 +993,23 @@ impl Message {
     }
 
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
+        self.tool_uses_with_input_errors()
+            .map(|(id, name, input, _)| (id, name, input))
+    }
+
+    /// Like [`Self::tool_uses`], plus the provider's error when it could not
+    /// decode the call's JSON arguments.
+    pub fn tool_uses_with_input_errors(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, &Value, Option<&str>)> {
         self.content.iter().filter_map(|b| match b {
             ContentBlock::ToolUse {
-                id, name, input, ..
-            } => Some((id.as_str(), name.as_str(), input)),
+                id,
+                name,
+                input,
+                input_error,
+                ..
+            } => Some((id.as_str(), name.as_str(), input, input_error.as_deref())),
             _ => None,
         })
     }
@@ -1600,13 +1631,7 @@ impl ThinkingConfig {
         }
         match fallback {
             ThinkingFallback::None => {}
-            ThinkingFallback::Dialect(dialect) => {
-                if model.supports_thinking() {
-                    dialect.as_discovered(model, |dialect| {
-                        self.apply_reasoning_effort(body, dialect, model);
-                    });
-                }
-            }
+            ThinkingFallback::Dialect(dialect) => self.apply_dialect(body, model, dialect),
             // The model has no way to spell this mode, so the budget field
             // takes over: a request must never end up saying nothing.
             ThinkingFallback::BudgetField => {
@@ -1617,6 +1642,16 @@ impl ThinkingConfig {
                 };
                 body[LOCAL_BUDGET_FIELD] = json!(budget);
             }
+        }
+    }
+
+    /// The effort `dialect` spells for this mode, for thinking-capable models
+    /// only.
+    pub(crate) fn apply_dialect(self, body: &mut Value, model: &Model, dialect: &EffortDialect) {
+        if model.supports_thinking() {
+            dialect.as_discovered(model, |dialect| {
+                self.apply_reasoning_effort(body, dialect, model);
+            });
         }
     }
 
@@ -1927,6 +1962,7 @@ mod tests {
     use maki_storage::sessions::generate_title;
 
     use super::*;
+    use crate::model::FactSources;
     use crate::model::ThinkingSupport as Support;
     use test_case::test_case;
 
@@ -3085,6 +3121,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 200_000,
             thinking_fields: None,
         }

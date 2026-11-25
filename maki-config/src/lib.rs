@@ -1458,6 +1458,12 @@ pub struct AgentConfig {
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
+    /// Dollar cap on a session's total spend, subagents and compaction
+    /// included. Checked before each request, so the request that crosses it
+    /// finishes and the next one never starts.
+    #[config(skip, default = "None")]
+    pub max_budget_usd: Option<f64>,
+
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
@@ -1489,6 +1495,7 @@ impl AgentConfig {
             rtk: file.rtk.unwrap_or(true),
             shell: file.shell.unwrap_or_default(),
             max_turns: None,
+            max_budget_usd: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
             instructions: InstructionsConfig::default(),
@@ -4117,10 +4124,10 @@ mod tests {
         )
         .unwrap();
         let config = raw.into_config(&[]).unwrap();
-        assert!(config.plugins.names.contains(&"bash".to_string()));
-        assert!(!config.plugins.names.contains(&"websearch".to_string()));
+        assert!(config.plugins.names.iter().any(|name| name == "bash"));
+        assert!(!config.plugins.names.iter().any(|name| name == "websearch"));
         assert!(
-            config.plugins.names.contains(&"index".to_string()),
+            config.plugins.names.iter().any(|name| name == "index"),
             "untouched builtin stays"
         );
         assert_eq!(
@@ -4151,19 +4158,19 @@ mod tests {
 
         let plugins = PluginsConfig::from_plugins(entries);
         assert!(
-            !plugins.names.contains(&"websearch".to_string()),
+            !plugins.names.iter().any(|name| name == "websearch"),
             "disabled builtin removed"
         );
         assert!(
-            plugins.names.contains(&"index".to_string()),
+            plugins.names.iter().any(|name| name == "index"),
             "untouched builtin stays"
         );
         assert!(
-            plugins.names.contains(&"bash".to_string()),
+            plugins.names.iter().any(|name| name == "bash"),
             "bash is a default builtin"
         );
         assert!(
-            !plugins.names.contains(&"custom_tool".to_string()),
+            !plugins.names.iter().any(|name| name == "custom_tool"),
             "enabled=None non-default ignored"
         );
 
@@ -4300,7 +4307,7 @@ mod tests {
         let raw: RawConfig =
             toml::from_str("[plugins.bash]\nenabled = false\ntimeout_secs = 180\n").unwrap();
         let config = raw.into_config(&[]).unwrap();
-        assert!(!config.plugins.names.contains(&"bash".to_string()));
+        assert!(!config.plugins.names.iter().any(|name| name == "bash"));
         assert_eq!(
             config.plugins.opts["bash"]["timeout_secs"],
             serde_json::json!(180),

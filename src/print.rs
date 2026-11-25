@@ -29,7 +29,6 @@ use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::TokenUsage;
 use maki_providers::model::Model;
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
@@ -198,8 +197,8 @@ impl Totals {
             } => {
                 self.num_turns += *num_turns;
                 self.stop_reason = Some(*reason);
-                // Only a stop cancels a run here, and its answer is cut short.
-                self.is_error |= *reason == DoneReason::Cancelled;
+                // A stop or a spent budget cuts the answer short.
+                self.is_error |= matches!(reason, DoneReason::Cancelled | DoneReason::MaxBudget);
                 let run_text = mem::take(&mut self.run_text);
                 if !run_text.is_empty() {
                     self.result_text = run_text;
@@ -258,7 +257,6 @@ pub struct PrintParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
     /// How long to wait for background work once the prompt's run ends.
     /// `None` runs every call blocking instead.
     pub background_wait: Option<Duration>,
@@ -284,7 +282,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         host_prompt,
         resumed,
         claim,
-        storage,
         background_wait,
     } = params;
 
@@ -324,7 +321,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         initial_wd,
         resumed,
         claim,
-        storage,
         yolo: false,
         unattended: true,
         host_prompt,
@@ -624,11 +620,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_run_cut_short_by_a_stop_is_an_error() {
+    #[test_case(DoneReason::Cancelled ; "stopped")]
+    #[test_case(DoneReason::MaxBudget ; "budget_spent")]
+    fn a_run_cut_short_is_an_error(reason: DoneReason) {
         let mut totals = Totals::default();
         assert!(totals.fold(&text_delta(FIRST_ANSWER), None));
-        assert!(totals.fold(&run_done(DoneReason::Cancelled), None));
+        assert!(totals.fold(&run_done(reason), None));
 
         assert!(totals.is_error);
         assert_eq!(totals.result_text, FIRST_ANSWER);

@@ -297,6 +297,7 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `background_log_bytes` | integer | `33554432` | 1024 | Size at which the output log of a command rotates to `.log.1`. A command gets a log once its output outgrows the reply or it moves to the background. Values above 1 GiB count as 1 GiB. |
 | `background_on_timeout` | boolean | `false` | - | Move a command that hits its timeout to the background instead of killing it. Applies to the main agent while background tasks are on; elsewhere the command is killed. |
+| `file_tool_note` | boolean | `false` | - | Start the reply with a note naming the file tool when a plain `cat`, `head`, `tail`, `sed -n`, `grep`, `rg`, `find` or `ls` did what that tool does, so the model stops using bash to read and search files. The command still runs. The note also shows under the command's output. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
@@ -389,7 +390,7 @@ maki.setup({
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes, at most 64 MiB. |
-| `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi MCP, needs KAGI_API_KEY), or "searxng" (self-hosted). |
+| `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi Search API, needs KAGI_API_KEY), or "searxng" (self-hosted). |
 | `searxng_base_url` | string | `""` | - | SearXNG instance URL; falls back to the `SEARXNG_BASE_URL` env var. A LAN instance also needs its host in `net.allowed_private_hosts`. Only this backend accepts websearch's `time_range` (day, week, month, or year); its `num_results` is capped by the instance page size. |
 
 ## Validation

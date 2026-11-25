@@ -28,7 +28,7 @@ A build, a test run or a subagent can keep the agent waiting for minutes. Press 
 
 A call that can move shows a dim `ctrl+b background` hint in its header. Click the hint to move only that call. When nothing moves, the status bar says why.
 
-Inside tmux, `Ctrl+B` is the prefix, so press it twice, or bind the `background` action to another key:
+Inside tmux or Herdr, `Ctrl+B` is the prefix, so press it twice, or bind the `background` action to another key:
 
 ```lua
 maki.keymap.set("n", "<C-g>", function()
@@ -112,7 +112,7 @@ You can type to a moved subagent in its tab. Other task tabs have no input box, 
 - **You.** The main agent gets it with your next message, without being woken. A subagent waiting on the call gets it right away.
 - **`task_stop`.** The tool waits up to five seconds and returns the output. A task that needs longer returns `stop requested`, and its output arrives later as a message that does not start a turn.
 
-`task_stop` only reaches tasks of its own chat. An unknown or finished id is an error that lists the running ids. A subagent inside a moved batch stops alone and at once, and what it did so far arrives with the batch result.
+`task_stop` only reaches tasks of its own chat. An unknown or finished id is an error that lists the running ids. A subagent inside a moved batch stops alone and at once, and what it did so far arrives later under its own id.
 
 ## Results
 
@@ -140,14 +140,14 @@ maki.setup({
 
 Inside `batch`, a `background = true` call cannot move by itself. Once only such calls are still running, the whole batch moves.
 
-The batch receipt gives each running subagent its own task id:
+The batch receipt gives each running subagent its own task id. Each subagent's result names that id, including the last one, which comes back in the batch result. The table shows what each id reaches:
 
 | Id | `task_message` | `task_stop` |
 |----|----------------|-------------|
 | Subagent id | That subagent | That subagent |
 | Batch id | Every subagent still running in the batch | The whole batch |
 
-If the move fails, for example with background tasks off, the call runs in the foreground and its result starts with `Could not start in the background (<reason>). Ran in the foreground.`
+If the move fails, for example with background tasks off, the call runs in the foreground and its result starts with `[Could not start in the background (<reason>). Ran in the foreground.]`
 
 ### Move a slow command instead of killing it
 
@@ -198,7 +198,7 @@ end
 | `ctx:backgrounded()` | `true` once the call has moved, for example to switch to a bounded buffer. |
 | `ctx:background()` | Move the call from the handler, as `bash(background = true)` does. Answers `true` or `nil, reason`. |
 | `ctx:set_parts(parts)` | List the pieces of the call in `/tasks`. See [Pieces of a call](#pieces-of-a-call). |
-| `ctx:report_part({ tool, name?, output, is_error?, format? })` | After the move, send one piece's result to the model now, worded as if `tool` had moved alone, with `name` as its summary. `format = "markdown"` makes the transcript render `output` as markdown, plain text otherwise. The final result is still due, so leave reported pieces out of it. Answers `true`, or `nil, reason` before the move or after the call ended. |
+| `ctx:report_part({ tool, name?, task?, output, is_error?, format? })` | After the move, send one piece's result to the model now, worded as if `tool` had moved alone, with `name` as its summary. For a piece that ran as a subagent, set `task` to the id the `on_task` callback of [`maki.agent.call_tool`](/docs/lua-api/#maki-agent-call_tool) got. The result then names that id in place of the call's, so the model can tell which subagent ended. `format = "markdown"` makes the transcript render `output` as markdown, plain text otherwise. The final result is still due, so leave reported pieces out of it. Answers `true`, or `nil, reason` before the move or after the call ended. |
 | `ctx:set_deadline(secs, { expire = "background" })` | Move the call at its deadline instead of ending it. |
 
 A move the plugin starts itself, through `ctx:background()` or a deadline, needs the `agent` [plugin permission](/docs/lua-api/#plugin-permissions) and fails inside a subagent.
